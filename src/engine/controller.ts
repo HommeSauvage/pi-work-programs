@@ -55,7 +55,7 @@ import {
 	rearmPausedCards,
 } from "./driver.ts";
 import { createDecision } from "./decisions.ts";
-import { counts, openDecisionFor, openDecisions, phaseSymbol } from "./phases.ts";
+import { counts, isHeld, openDecisionFor, openDecisions, phaseSymbol } from "./phases.ts";
 import { Git } from "../platform/git.ts";
 import { Gates } from "../platform/gates.ts";
 import { SubagentsRpc } from "../platform/runs.ts";
@@ -726,6 +726,9 @@ export class WorkProgramController {
 				parts.push(`merge ${card.merge.state}${card.lane ? ` · lane ${card.lane.branch}` : ""}`);
 			}
 			if (card.fixReason !== undefined && card.phase !== "blocked") parts.push(`pending ${card.fixReason} fix`);
+			if (isHeld(card)) {
+				parts.push(`held until ${new Date(card.holdUntil ?? 0).toISOString().slice(11, 16)} UTC (${oneLine(card.holdReason ?? "provider quota", 80)})`);
+			}
 			if (card.lastError && card.abandoned !== true) parts.push(card.lastError);
 			lines.push(
 				`  ${phaseSymbol(card.phase, card.abandoned === true)} ${id} ${card.abandoned === true ? "abandoned" : card.phase}${deps}${parts.length > 0 ? ` — ${parts.join("; ")}` : ""}`,

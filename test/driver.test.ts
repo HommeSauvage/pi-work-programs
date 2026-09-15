@@ -1026,6 +1026,113 @@ describe("pause blocks new runs", () => {
 	});
 });
 
+describe("quota holds", () => {
+	const QUOTA = "GoUsageLimitError: 5-hour usage limit reached. Resets in 1hr 27min";
+
+	test("a quota failure holds the card instead of raising a decision", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await drive(t.host);
+		const runId = t.fake.dispatched[0]!.runId;
+		t.failRun(runId, QUOTA);
+		await drive(t.host);
+		const card = t.ledger.cards["01"]!;
+		expect(card.phase).toBe("pending");
+		expect(card.holdUntil).toBeGreaterThan(Date.now());
+		expect(card.holdCount).toBe(1);
+		expect(card.holdReason).toContain('1hr 27min');
+		// No decision packet, no supervisor question.
+		expect(t.ledger.decisions.filter((entry) => entry.kind === "blocked")).toHaveLength(0);
+		expect(t.fake.asked.some((message) => message.includes("unblock"))).toBe(false);
+		// The hold line names the delay it parsed and where it came from.
+		const line = t.fake.progress.find((entry) => entry.includes("provider quota"));
+		expect(line).toContain("held until");
+		expect(line).toContain("1hr 27min");
+		expect(line).toContain("GoUsageLimitError");
+	});
+
+	test("a held card is not dispatched, and becomes dispatchable when the hold expires", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await drive(t.host);
+		t.failRun(t.fake.dispatched[0]!.runId, QUOTA);
+		await drive(t.host);
+		const dispatchedWhileHeld = t.fake.dispatched.length;
+		await drive(t.host);
+		await drive(t.host);
+		expect(t.fake.dispatched.length).toBe(dispatchedWhileHeld);
+		// Expire the hold: the next tick re-dispatches without any operator action.
+		t.ledger.cards["01"]!.holdUntil = Date.now() - 1;
+		await drive(t.host);
+		expect(t.fake.dispatched.length).toBe(dispatchedWhileHeld + 1);
+	});
+
+	test("a repeat quota failure extends the hold instead of escalating", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await drive(t.host);
+		t.failRun(t.fake.dispatched[0]!.runId, QUOTA);
+		await drive(t.host);
+		t.ledger.cards["01"]!.holdUntil = Date.now() - 1;
+		await drive(t.host);
+		t.failRun(t.ledger.cards["01"]!.activeRun!.runId, QUOTA);
+		await drive(t.host);
+		const card = t.ledger.cards["01"]!;
+		expect(card.holdCount).toBe(2);
+		expect(card.phase).toBe("pending");
+		expect(t.ledger.decisions.filter((entry) => entry.kind === "blocked")).toHaveLength(0);
+		expect(t.fake.progress.some((line) => line.includes("still exhausted, extended"))).toBe(true);
+	});
+
+	test("past the hold cap the card blocks with the reset time named", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await drive(t.host);
+		const card = t.ledger.cards["01"]!;
+		card.holdCount = 3;
+		t.failRun(t.fake.dispatched[0]!.runId, QUOTA);
+		await drive(t.host);
+		expect(card.phase).toBe("blocked");
+		expect(card.lastError).toContain("Resets in 1hr 27min");
+	});
+
+	test("a quota failure with no parseable reset blocks as before", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await drive(t.host);
+		t.failRun(t.fake.dispatched[0]!.runId, "GoUsageLimitError: 5-hour usage limit reached");
+		await drive(t.host);
+		const card = t.ledger.cards["01"]!;
+		expect(card.phase).toBe("blocked");
+		expect(card.holdUntil).toBeUndefined();
+	});
+
+	test("a successful run clears the hold state", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await drive(t.host);
+		t.failRun(t.fake.dispatched[0]!.runId, QUOTA);
+		await drive(t.host);
+		const card = t.ledger.cards["01"]!;
+		card.holdUntil = Date.now() - 1;
+		await drive(t.host);
+		writeLaneEvidence(t, "01", "evidence");
+		t.completeRun(card.activeRun!.runId, { output: "done" });
+		await drive(t.host);
+		expect(card.holdUntil).toBeUndefined();
+		expect(card.holdCount).toBe(0);
+		expect(card.phase).toBe("reviewing");
+	});
+
+	test("a quota failure in a review also holds rather than blocking", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await drive(t.host);
+		writeLaneEvidence(t, "01", "evidence");
+		t.completeRun(t.fake.dispatched[0]!.runId, { output: "done" });
+		await drive(t.host);
+		const reviewRun = t.ledger.cards["01"]!.activeRun!.runId;
+		t.failRun(reviewRun, QUOTA);
+		await drive(t.host);
+		const card = t.ledger.cards["01"]!;
+		expect(card.phase).toBe("review_pending");
+		expect(card.holdCount).toBe(1);
+	});
+});
+
 describe("dispatch failures", () => {
 	test("a failing dispatch blocks the card instead of retrying silently", async () => {
 		const t = createTestHost({ cards: [{ id: "01" }] });

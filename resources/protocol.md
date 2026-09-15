@@ -118,6 +118,23 @@ plan and card files stay the source of truth; `sync` reconciles.
 - A card is done only when its gate is green (or no gate applies) and its
   review has been triaged.
 
+## Provider quota
+
+- A run that dies on a provider quota/rate-limit error is **held**, not
+  escalated: the card is rearmed and parked until the reset time reported in
+  the error (plus a minute of slack), with a `progress.md` line naming the
+  parsed delay and the error it came from (e.g. `held until 13:42 UTC · quota
+  exhausted — parsed "1hr 27min" from: GoUsageLimitError: 5-hour usage limit
+  reached. Resets in 1hr 27min`). No decision packet, no re-dispatch: one
+  exhausted window no longer asks the supervisor seven times.
+- Held cards show in `status` as `held until HH:MM UTC (…)`. When the hold
+  expires the drive dispatches them again on its own.
+- A repeat quota failure extends the hold (`still exhausted, extended (hold
+  n/3)`) rather than escalating to a decision whose only useful answer is
+  "wait". Past the extension cap the card blocks with the reset time named.
+- An individual hold is capped at 90 minutes; a quota error with **no**
+  parseable reset delay blocks as before, quoting the raw error.
+
 ## Review profiles
 
 Two profiles are available, verbatim from the operator's work-program prompts:

@@ -36,7 +36,7 @@ import {
 	resolveDecision,
 	reviewDecisionMessage,
 } from "./decisions.ts";
-import { describeOpenDecisions, openDecisionFor, openDecisionOfKind, openDecisions, readyCards, writersInFlight } from "./phases.ts";
+import { describeOpenDecisions, isHeld, openDecisionFor, openDecisionOfKind, openDecisions, readyCards, writersInFlight } from "./phases.ts";
 
 const UNKNOWN_RUN_GRACE_MS = 10 * 60_000;
 
@@ -217,6 +217,72 @@ function isInfraError(error: unknown): boolean {
 	);
 }
 
+const QUOTA_PATTERN = /usage limit|usage_limit|rate.?limit|quota|GoUsageLimit|\b429\b/i;
+/** Anchor phrases that introduce a reset delay — never match bare window names
+ *  like "5-hour usage limit", which would read as a five-hour wait. */
+const RESET_ANCHOR = /(?:resets?(?:\s+at|\s+in)?|retry(?:\s+in|\s+after)?|try again(?:\s+in)?|available(?:\s+in|\s+at)?|wait)\s*[:~≈]?\s*([^.;\n]{1,40})/i;
+const HOURS_RE = /(\d+)\s*(?:hours|hour|hrs|hr|h)(?![a-z])/i;
+const MINUTES_RE = /(\d+)\s*(?:minutes|minute|mins|min|m)(?![a-z])/i;
+const SECONDS_RE = /(\d+)\s*(?:seconds|second|secs|sec|s)(?![a-z])/i;
+
+/** Individual hold ceiling; longer reported waits are still held, then extended. */
+export const MAX_QUOTA_HOLD_MS = 90 * 60_000;
+const QUOTA_HOLD_SLACK_MS = 60_000;
+const MAX_QUOTA_HOLDS = 3;
+
+export interface QuotaHold {
+	holdMs: number;
+	/** The parsed reset fragment, quoted back so the operator can judge wait-vs-switch. */
+	hint: string;
+	reason: string;
+}
+
+/**
+ * Classify a provider quota/rate-limit run failure and parse its reset hint.
+ * Returns undefined for non-quota errors and for quota errors with no parseable
+ * delay (those block as before, with the raw error text).
+ */
+export function classifyQuota(error: string): QuotaHold | undefined {
+	const text = error.trim();
+	if (text.length === 0 || !QUOTA_PATTERN.test(text)) return undefined;
+	const anchored = RESET_ANCHOR.exec(text);
+	if (!anchored) return undefined;
+	const fragment = (anchored[1] ?? "").trim();
+	if (fragment.length === 0) return undefined;
+	const hours = Number(HOURS_RE.exec(fragment)?.[1] ?? 0);
+	const minutes = Number(MINUTES_RE.exec(fragment)?.[1] ?? 0);
+	const seconds = Number(SECONDS_RE.exec(fragment)?.[1] ?? 0);
+	const raw = hours * 3_600_000 + minutes * 60_000 + seconds * 1_000;
+	if (raw <= 0) return undefined;
+	const holdMs = Math.min(raw + QUOTA_HOLD_SLACK_MS, MAX_QUOTA_HOLD_MS);
+	return {
+		holdMs,
+		hint: fragment,
+		reason: `quota exhausted — parsed "${fragment}" from: ${oneLine(text, 140)}`,
+	};
+}
+
+/**
+ * Park a card until the provider's quota recovers instead of asking the
+ * supervisor a question only "wait" can answer. Repeats (extending the hold)
+ * up to a cap, then blocks with the reset time named.
+ */
+async function holdForQuota(host: DriverHost, card: CardLedger, quota: QuotaHold, label: string): Promise<boolean> {
+	const attempts = (card.holdCount ?? 0) + 1;
+	if (attempts > MAX_QUOTA_HOLDS) return false;
+	card.holdCount = attempts;
+	card.holdUntil = Date.now() + quota.holdMs;
+	card.holdReason = quota.reason;
+	card.activeRun = undefined;
+	card.lastError = undefined;
+	rearmCard(card);
+	const until = new Date(card.holdUntil).toISOString().slice(11, 16);
+	const extension = attempts > 1 ? `still exhausted, extended (hold ${attempts}/${MAX_QUOTA_HOLDS}) to ${until} UTC` : `held until ${until} UTC`;
+	await progress(host, `${card.id} ${label} hit provider quota — ${extension} · ${quota.reason}`);
+	await host.save();
+	return true;
+}
+
 /**
  * Guards every operator-triggered path that would start an agent run. A pause
  * must mean "no new runs": the drive loop's own status check cannot cover
@@ -384,17 +450,50 @@ async function dispatchWithInfraRetry(
 	}
 }
 
+/**
+ * Shared failure path for every run kind: hold while the provider's quota
+ * recovers, retry runner-infra flakes for fixes, otherwise block with detail.
+ * Returns true when the card was held or re-armed (no decision raised).
+ */
+async function handleRunFailure(
+	host: DriverHost,
+	card: CardLedger,
+	status: RunStatus,
+	runId: string,
+	label: "worker" | "reviewer" | "fix" | "captain" | "reconciler",
+	note?: string,
+): Promise<boolean> {
+	const error = status.error ?? "";
+	const quota = classifyQuota(error);
+	if (quota && (await holdForQuota(host, card, quota, label))) return true;
+	if (label === "fix" && isInfraError(error) && (card.infraRetries ?? 0) < MAX_FIX_INFRA_RETRIES) {
+		// Runner infra flakes (not code failures) retry in place: the run is dead
+		// but the fix intent survives, so the same tick's dispatchFixes picks it
+		// back up (resume-first, then fresh). Capped — then it blocks loudly.
+		card.infraRetries = (card.infraRetries ?? 0) + 1;
+		await progress(
+			host,
+			`${card.id} fix run hit runner infra (${status.state}${error ? `: ${oneLine(error, 120)}` : ""}) — auto-retry ${card.infraRetries}/${MAX_FIX_INFRA_RETRIES}`,
+		);
+		await host.save();
+		return true;
+	}
+	if (label === "fix") card.infraRetries = 0;
+	await blockCard(
+		host,
+		card,
+		`${label} run ${runId} ended as ${status.state}${error ? `: ${error}` : " (no error reported)"}${note ?? ""}`,
+	);
+	return false;
+}
+
 async function onWorkerComplete(host: DriverHost, card: CardLedger, status: RunStatus, runId: string): Promise<void> {
 	if (status.state === "paused") {
 		await blockCard(host, card, `worker run ${runId} paused by operator — redispatch to continue from the lane state`);
 		return;
 	}
 	if (status.state !== "complete") {
-		await blockCard(
-			host,
-			card,
-			`worker run ${runId} ended as ${status.state}${status.error ? `: ${status.error}` : " (no error reported)"}`,
-		);
+		await handleRunFailure(host, card, status, runId, "worker");
 		return;
 	}
 	const text = await readCardText(host, card);
@@ -409,6 +508,9 @@ async function onWorkerComplete(host: DriverHost, card: CardLedger, status: RunS
 		return;
 	}
 	card.phase = "review_pending";
+	card.holdUntil = undefined;
+	card.holdReason = undefined;
+	card.holdCount = 0;
 	await progress(host, `${card.id} implemented (gates green)`);
 }
 
@@ -448,11 +550,7 @@ async function onReviewerComplete(host: DriverHost, card: CardLedger, status: Ru
 		return;
 	}
 	if (status.state !== "complete") {
-		await blockCard(
-			host,
-			card,
-			`reviewer run ${runId} ended as ${status.state}${status.error ? `: ${status.error}` : " (no error reported)"}`,
-		);
+		await handleRunFailure(host, card, status, runId, "reviewer");
 		return;
 	}
 	const cycle = card.cycles + 1;
@@ -486,24 +584,7 @@ async function onFixComplete(host: DriverHost, card: CardLedger, status: RunStat
 		return;
 	}
 	if (status.state !== "complete") {
-		// Runner infra flakes (not code failures) retry in place: the run is dead
-		// but the fix intent survives, so the same tick's dispatchFixes picks it
-		// back up (resume-first, then fresh). Capped — then it blocks loudly.
-		if (isInfraError(status.error ?? "") && (card.infraRetries ?? 0) < MAX_FIX_INFRA_RETRIES) {
-			card.infraRetries = (card.infraRetries ?? 0) + 1;
-			await progress(
-				host,
-				`${card.id} fix run hit runner infra (${status.state}${status.error ? `: ${oneLine(status.error, 120)}` : ""}) — auto-retry ${card.infraRetries}/${MAX_FIX_INFRA_RETRIES}`,
-			);
-			await host.save();
-			return;
-		}
-		card.infraRetries = 0;
-		await blockCard(
-			host,
-			card,
-			`fix run ${runId} ended as ${status.state}${status.error ? `: ${status.error}` : " (no error reported)"}`,
-		);
+		await handleRunFailure(host, card, status, runId, "fix");
 		return;
 	}
 	card.fixReason = undefined;
@@ -520,6 +601,9 @@ async function onFixComplete(host: DriverHost, card: CardLedger, status: RunStat
 		return;
 	}
 	card.phase = "review_pending";
+	card.holdUntil = undefined;
+	card.holdReason = undefined;
+	card.holdCount = 0;
 	await progress(host, `${card.id} fixes applied — re-review queued`);
 }
 
@@ -529,11 +613,7 @@ async function onCaptainComplete(host: DriverHost, card: CardLedger, status: Run
 		return;
 	}
 	if (status.state !== "complete") {
-		await blockCard(
-			host,
-			card,
-			`captain run ${runId} ended as ${status.state}${status.error ? `: ${status.error}` : " (no error reported)"}`,
-		);
+		await handleRunFailure(host, card, status, runId, "captain");
 		return;
 	}
 	const structured = status.structured as Record<string, unknown> | undefined;
@@ -771,6 +851,7 @@ async function dispatchReviews(host: DriverHost): Promise<void> {
 	let slots = Math.max(0, ledger.maxParallel - reviewing);
 	for (const card of ledgerCards(ledger)) {
 		if (card.phase !== "review_pending") continue;
+		if (isHeld(card)) continue;
 		if (slots <= 0) break;
 		slots -= 1;
 		await startReviewFor(host, card);
@@ -781,6 +862,7 @@ async function dispatchFixes(host: DriverHost): Promise<void> {
 	const ledger = host.ledger;
 	for (const card of ledgerCards(ledger)) {
 		if (card.phase !== "fixing" || card.activeRun) continue;
+		if (isHeld(card)) continue;
 		// Only an untriaged review holds fixes back — never a stale record of
 		// another kind (a stale `blocked` decision is cleared via unblock/sweep).
 		if (openDecisionOfKind(ledger, card.id, "review-triage")) continue;
@@ -933,25 +1015,32 @@ export function rearmPackets(ledger: ProgramLedger): void {
  * Fixing cards keep their fix intent (dispatchFixes re-dispatches from the
  * resolved triage); reconciling cards are picked back up by the merge queue.
  */
+/**
+ * Rearm one card left run-less in a flight phase so it is dispatchable again
+ * (used by hard pause and by quota holds). Returns a note when it moved.
+ */
+function rearmCard(card: CardLedger): string | undefined {
+	const from = card.phase;
+	if (from === "implementing") {
+		card.phase = "pending";
+	} else if (from === "reviewing") {
+		card.phase = "review_pending";
+	} else if (from === "verifying") {
+		const failed = (card.gates ?? []).some((gate) => gate.code !== 0);
+		card.phase = failed ? "fixing" : "review_pending";
+	} else {
+		return undefined;
+	}
+	card.lastError = undefined;
+	return `${card.id} ${from}→${card.phase}`;
+}
+
 export function rearmPausedCards(host: DriverHost): string[] {
 	const notes: string[] = [];
 	for (const card of ledgerCards(host.ledger)) {
 		if (card.activeRun) continue;
-		const from = card.phase;
-		if (from === "implementing") {
-			card.phase = "pending";
-			card.lastError = undefined;
-		} else if (from === "reviewing") {
-			card.phase = "review_pending";
-			card.lastError = undefined;
-		} else if (from === "verifying") {
-			const failed = (card.gates ?? []).some((gate) => gate.code !== 0);
-			card.phase = failed ? "fixing" : "review_pending";
-			card.lastError = undefined;
-		} else {
-			continue;
-		}
-		notes.push(`${card.id} ${from}→${card.phase}`);
+		const note = rearmCard(card);
+		if (note) notes.push(note);
 	}
 	return notes;
 }
@@ -1158,11 +1247,7 @@ async function onReconcilerComplete(host: DriverHost, card: CardLedger, status: 
 		return;
 	}
 	if (status.state !== "complete") {
-		await blockCard(
-			host,
-			card,
-			`reconciler run ${runId} ended as ${status.state}${status.error ? `: ${status.error}` : " (no error reported; conflict preserved)"}`,
-		);
+		await handleRunFailure(host, card, status, runId, "reconciler", " (conflict preserved)");
 		return;
 	}
 	const unmerged = await host.ports.git.unmergedPaths(host.cwd);

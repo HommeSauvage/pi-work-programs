@@ -5,13 +5,20 @@ export function depsDone(ledger: ProgramLedger, card: CardLedger): boolean {
 }
 
 export function readyCards(ledger: ProgramLedger): CardLedger[] {
+	const now = Date.now();
 	return ledger.order
 		.map((id) => ledger.cards[id])
 		.filter((card): card is CardLedger => card !== undefined)
 		.filter((card) => card.abandoned !== true)
 		.filter((card) => card.phase === "pending" || card.phase === "ready")
+		.filter((card) => card.holdUntil === undefined || card.holdUntil <= now)
 		.filter((card) => card.dependsOn.every((dep) => ledger.cards[dep]?.phase === "done"))
 		.filter((card) => !card.lastError || card.phase === "ready");
+}
+
+/** True while a provider-quota hold parks this card. */
+export function isHeld(card: CardLedger, now: number = Date.now()): boolean {
+	return card.holdUntil !== undefined && card.holdUntil > now;
 }
 
 export function writersInFlight(ledger: ProgramLedger): number {

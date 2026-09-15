@@ -80,6 +80,12 @@ export interface CardLedger {
 	blockedFrom?: CardPhase;
 	/** Consecutive runner-infra auto-retries consumed by the current fix round. */
 	infraRetries?: number;
+	/** Quota hold: no dispatch until this timestamp (provider usage limits). */
+	holdUntil?: number;
+	/** Human-readable hold reason, naming the parsed reset hint and its source. */
+	holdReason?: string;
+	/** Consecutive quota holds consumed for the current pause (extension cap). */
+	holdCount?: number;
 	/** Operator-dropped scope: terminal, kept in records, excluded from completion gating. */
 	abandoned?: boolean;
 	updatedAt: number;

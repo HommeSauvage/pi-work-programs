@@ -101,8 +101,10 @@ export class FakeGit implements GitOps {
 	async revParse(): Promise<string> {
 		return this.headSha;
 	}
+	/** Files reported as changed between a lane's base and HEAD. */
+	changedFilesResult: string[] = [];
 	async changedFiles(): Promise<string[]> {
-		return [];
+		return this.changedFilesResult;
 	}
 }
 

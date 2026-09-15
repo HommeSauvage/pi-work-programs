@@ -59,7 +59,7 @@ export interface DriverHost {
 }
 
 const TERMINAL_STATES = new Set(["complete", "failed", "stopped", "paused", "rejected", "not_found"]);
-const MAX_FIX_INFRA_RETRIES = 2;
+const MAX_RUN_INFRA_RETRIES = 2;
 const MAX_MERGE_COMMIT_FAILURES = 5;
 /** Passes per drive tick: a merge frees dependencies, which enables dispatches,
  *  which may free more merges. Bounded so one tick can never loop forever. */
@@ -248,9 +248,13 @@ async function blockCard(host: DriverHost, card: CardLedger, reason: string): Pr
 	host.ports.notify(`Work program: card ${card.id} blocked — ${oneLine(reason, 100)}`, "error");
 }
 
-/** Runner/transport flakes (never a code failure): safe to retry without asking. */
-function isInfraError(error: unknown): boolean {
-	return /timed out|timeout|runner startup|control .confirm|no run id|ECONN|EPIPE|EAI_AGAIN|socket hang up|temporarily unavailable/i.test(
+/**
+ * Runner/transport/provider blips — never a code failure, so retrying is safe.
+ * Covers runner startup control timeouts, RPC/socket errors, and provider
+ * outages ("Inference admission is unavailable", 502/503/504, capacity).
+ */
+export function isInfraError(error: unknown): boolean {
+	return /timed out|timeout|runner startup|control .confirm|no run id|ECONN|EPIPE|EAI_AGAIN|socket hang up|(?:un)?available|overloaded|admission|capacity|outage|\b50[234]\b|server error|upstream/i.test(
 		String(error),
 	);
 }
@@ -500,29 +504,73 @@ async function handleRunFailure(
 	runId: string,
 	label: "worker" | "reviewer" | "fix" | "captain" | "reconciler",
 	note?: string,
-): Promise<boolean> {
+): Promise<"handled" | "blocked" | "salvaged"> {
 	const error = status.error ?? "";
 	const quota = classifyQuota(error);
-	if (quota && (await holdForQuota(host, card, quota, label))) return true;
-	if (label === "fix" && isInfraError(error) && (card.infraRetries ?? 0) < MAX_FIX_INFRA_RETRIES) {
-		// Runner infra flakes (not code failures) retry in place: the run is dead
-		// but the fix intent survives, so the same tick's dispatchFixes picks it
-		// back up (resume-first, then fresh). Capped — then it blocks loudly.
-		card.infraRetries = (card.infraRetries ?? 0) + 1;
+	if (quota && (await holdForQuota(host, card, quota, label))) return "handled";
+	if (label === "worker" && NO_EDIT_GUARD.test(error) && (await laneHasCommits(host, card))) {
+		// pi-subagents hard-fails an implementation worker that made no edits. When
+		// the lane already carries commits, the implementation landed in an earlier
+		// run: treat the run as validation-complete so the card can reach review
+		// instead of looping through fresh workers that must not edit anything.
 		await progress(
 			host,
-			`${card.id} fix run hit runner infra (${status.state}${error ? `: ${oneLine(error, 120)}` : ""}) — auto-retry ${card.infraRetries}/${MAX_FIX_INFRA_RETRIES}`,
+			`${card.id} worker ${runId} reported no edits, but the lane already carries commits — treating the implementation as complete (State: review → gates → review)`,
 		);
 		await host.save();
-		return true;
+		return "salvaged";
 	}
-	if (label === "fix") card.infraRetries = 0;
+	if (isInfraError(error) && (card.infraRetries ?? 0) < MAX_RUN_INFRA_RETRIES) {
+		// Runner/provider blips (not code failures) retry in place: the run is dead
+		// but the card's intent survives, so the same tick's dispatch picks it back
+		// up in the right phase. Capped — then it blocks loudly.
+		card.infraRetries = (card.infraRetries ?? 0) + 1;
+		const from = card.phase;
+		rearmCard(card);
+		await progress(
+			host,
+			`${card.id} ${label} run hit a provider/runner blip (${status.state}${error ? `: ${oneLine(error, 120)}` : ""}) — auto-retry ${card.infraRetries}/${MAX_RUN_INFRA_RETRIES} (${from}→${card.phase})`,
+		);
+		await host.save();
+		return "handled";
+	}
+	card.infraRetries = 0;
 	await blockCard(
 		host,
 		card,
 		`${label} run ${runId} ended as ${status.state}${error ? `: ${error}` : " (no error reported)"}${note ?? ""}`,
 	);
-	return false;
+	return "blocked";
+}
+
+/** pi-subagents' completion-mutation guard wording. */
+const NO_EDIT_GUARD = /without making edits|made no edits|no edits for an implementation/i;
+
+/** True when the lane carries commits beyond its base (work already landed). */
+async function laneHasCommits(host: DriverHost, card: CardLedger): Promise<boolean> {
+	if (!card.lane) return false;
+	try {
+		const changed = await host.ports.git.changedFiles(card.lane.path, card.lane.base, "HEAD");
+		return changed.length > 0;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * True when this card needs no new implementation: its lane already carries
+ * commits and the card record still says `State: review`. Dispatching an
+ * implementation worker there produces no edits (and pi-subagents hard-fails
+ * that), so the card goes straight to review instead.
+ */
+async function laneAlreadyImplemented(host: DriverHost, card: CardLedger): Promise<boolean> {
+	if (!(await laneHasCommits(host, card))) return false;
+	try {
+		const text = await host.ports.readCard(host.ledger, card);
+		return /^##\s*State:\s*review/im.test(text);
+	} catch {
+		return false;
+	}
 }
 
 async function onWorkerComplete(host: DriverHost, card: CardLedger, status: RunStatus, runId: string): Promise<void> {
@@ -531,8 +579,10 @@ async function onWorkerComplete(host: DriverHost, card: CardLedger, status: RunS
 		return;
 	}
 	if (status.state !== "complete") {
-		await handleRunFailure(host, card, status, runId, "worker");
-		return;
+		const outcome = await handleRunFailure(host, card, status, runId, "worker");
+		// "salvaged": the lane already holds the implementation, so fall through and
+		// validate it (gate + review) instead of asking for another worker.
+		if (outcome !== "salvaged") return;
 	}
 	const text = await readCardText(host, card);
 	if (!parseEvidence(text)) {
@@ -764,6 +814,14 @@ export async function startWorkerFor(host: DriverHost, card: CardLedger): Promis
 		await ensureLane(host, card);
 	} catch (error) {
 		await blockCard(host, card, `lane setup failed: ${oneLine(String(error), 200)}`);
+		return;
+	}
+	if (await laneAlreadyImplemented(host, card)) {
+		// Nothing left to implement: the lane already carries the committed work,
+		// so validate and review it instead of dispatching a no-op worker.
+		card.phase = "review_pending";
+		await progress(host, `${card.id} lane already carries the implementation (State: review) — skipping the worker, queueing review`);
+		await host.save();
 		return;
 	}
 	if (ledger.mode === "captain") {
@@ -1562,6 +1620,12 @@ export async function applyUnblock(
 		return { ok: true };
 	}
 	if (host.ledger.parallelExecution === "worktrees" && card.lane) {
+		if (blockedFrom === "reviewing") {
+			// The review run was the thing that failed: re-enter review, do not send
+			// an implementation worker at already-committed work.
+			card.phase = "review_pending";
+			return { ok: true };
+		}
 		if (needsFix) {
 			// A fix was in flight when the card blocked — go back to fixing so the
 			// approved findings are actually applied instead of skipped to merge.

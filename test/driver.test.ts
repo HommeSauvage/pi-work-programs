@@ -1216,6 +1216,104 @@ describe("legacy abandoned tombstones", () => {
 	});
 });
 
+describe("review-run failures and already-committed lanes", () => {
+	/** A card that is implemented+committed in its lane, blocked on a dead review run. */
+	function blockedInReview(t: ReturnType<typeof createTestHost>): void {
+		const card = t.ledger.cards["01"]!;
+		card.phase = "blocked";
+		card.blockedFrom = "reviewing";
+		card.lane = { path: "/wt/test-program/01", branch: "feat/foo-card-01", base: "sha1" };
+		card.merge = { state: "queued", attempts: 0 };
+		card.lastError = "reviewer run run-9 ended as failed: Inference admission is unavailable";
+	}
+
+	test("redispatch after a review-run failure re-enters review, not implementation", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		blockedInReview(t);
+		const result = await applyUnblock(t.host, "01", "redispatch");
+		expect(result.ok).toBe(true);
+		expect(t.ledger.cards["01"]?.phase).toBe("review_pending");
+		await drive(t.host);
+		expect(t.fake.dispatched.at(-1)?.request.kind).toBe("reviewer");
+		expect(t.fake.dispatched.some((entry) => entry.request.kind === "worker")).toBe(false);
+	});
+
+	test("a worker dispatch is skipped when the lane already carries the implementation", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		t.git.changedFilesResult = ["src/App.tsx"];
+		t.fake.files.set(programCardPath("01"), makeCardText({ id: "01", evidence: "$ bun test\n3 pass", state: "review" }));
+		await drive(t.host);
+		const card = t.ledger.cards["01"]!;
+		expect(card.phase).toBe("reviewing");
+		expect(t.fake.dispatched.some((entry) => entry.request.kind === "worker")).toBe(false);
+		expect(t.fake.dispatched.some((entry) => entry.request.kind === "reviewer")).toBe(true);
+		expect(t.fake.progress.some((line) => line.includes("skipping the worker"))).toBe(true);
+	});
+
+	test("a no-edit guard failure on a committed lane is salvaged into review", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		t.fake.files.set(programCardPath("01"), makeCardText({ id: "01", evidence: "$ bun test\n3 pass", state: "review" }));
+		await drive(t.host);
+		const workerRun = t.fake.dispatched[0]!.runId;
+		// The lane holds the implementation, so the guard now fires for a no-op worker.
+		t.git.changedFilesResult = ["src/App.tsx"];
+		t.failRun(workerRun, "worker completed without making edits for an implementation task");
+		await drive(t.host);
+		const card = t.ledger.cards["01"]!;
+		expect(card.phase).toBe("reviewing");
+		expect(card.lastError ?? "").toBe("");
+		expect(t.fake.progress.some((line) => line.includes("treating the implementation as complete"))).toBe(true);
+	});
+
+	test("the guard still blocks when the lane has no commits", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await drive(t.host);
+		t.failRun(t.fake.dispatched[0]!.runId, "worker completed without making edits for an implementation task");
+		await drive(t.host);
+		const card = t.ledger.cards["01"]!;
+		expect(card.phase).toBe("blocked");
+		expect(card.lastError).toContain("without making edits");
+	});
+});
+
+describe("provider blips on any run kind", () => {
+	test("a 503 outage on a review run retries in place instead of blocking", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await drive(t.host);
+		writeLaneEvidence(t, "01", "evidence");
+		t.completeRun(t.fake.dispatched[0]!.runId, { output: "done" });
+		await drive(t.host);
+		const reviewRun = t.ledger.cards["01"]!.activeRun!.runId;
+		t.failRun(reviewRun, "Inference admission is unavailable");
+		await drive(t.host);
+		const card = t.ledger.cards["01"]!;
+		expect(card.infraRetries).toBe(1);
+		expect(t.ledger.decisions.filter((entry) => entry.kind === "blocked")).toHaveLength(0);
+		// The retry re-enters review and a fresh reviewer is dispatched on the same tick.
+		expect(card.phase).toBe("reviewing");
+		expect(card.activeRun?.kind).toBe("reviewer");
+		expect(t.fake.dispatched.at(-1)?.request.kind).toBe("reviewer");
+		expect(t.fake.progress.some((line) => line.includes("provider/runner blip"))).toBe(true);
+	});
+
+	test("a persistent outage still blocks after the retry cap", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await drive(t.host);
+		writeLaneEvidence(t, "01", "evidence");
+		t.completeRun(t.fake.dispatched[0]!.runId, { output: "done" });
+		await drive(t.host);
+		for (let attempt = 0; attempt < 3; attempt += 1) {
+			const run = t.ledger.cards["01"]!.activeRun?.runId;
+			if (!run) break;
+			t.failRun(run, "503 Service Unavailable");
+			await drive(t.host);
+		}
+		const card = t.ledger.cards["01"]!;
+		expect(card.phase).toBe("blocked");
+		expect(card.lastError).toContain("503");
+	});
+});
+
 describe("dispatch failures", () => {
 	test("a failing dispatch blocks the card instead of retrying silently", async () => {
 		const t = createTestHost({ cards: [{ id: "01" }] });

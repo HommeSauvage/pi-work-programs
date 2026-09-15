@@ -4,12 +4,21 @@ export function depsDone(ledger: ProgramLedger, card: CardLedger): boolean {
 	return card.dependsOn.every((dep) => ledger.cards[dep]?.phase === "done");
 }
 
+/**
+ * Deliberately dropped scope: the explicit flag, or the legacy marker left by
+ * pre-flag abandons (`blocked` with "abandoned by operator" in lastError).
+ * Legacy tombstones must not keep a program from finishing or be re-asked.
+ */
+export function isAbandonedCard(card: CardLedger): boolean {
+	return card.abandoned === true || /^abandoned by operator/i.test(card.lastError ?? "");
+}
+
 export function readyCards(ledger: ProgramLedger): CardLedger[] {
 	const now = Date.now();
 	return ledger.order
 		.map((id) => ledger.cards[id])
 		.filter((card): card is CardLedger => card !== undefined)
-		.filter((card) => card.abandoned !== true)
+		.filter((card) => !isAbandonedCard(card))
 		.filter((card) => card.phase === "pending" || card.phase === "ready")
 		.filter((card) => card.holdUntil === undefined || card.holdUntil <= now)
 		.filter((card) => card.dependsOn.every((dep) => ledger.cards[dep]?.phase === "done"))
@@ -99,7 +108,7 @@ export function boardLine(ledger: ProgramLedger): string {
 		.map((id) => {
 			const card = ledger.cards[id];
 			if (!card) return `${id}?`;
-			return `${id}${phaseSymbol(card.phase, card.abandoned === true)}`;
+			return `${id}${phaseSymbol(card.phase, isAbandonedCard(card))}`;
 		})
 		.join(" ");
 }
@@ -112,7 +121,7 @@ export function counts(ledger: ProgramLedger): { done: number; total: number; bl
 		const card = ledger.cards[id];
 		if (!card) continue;
 		if (card.phase === "done") done += 1;
-		if (card.abandoned === true) {
+		if (isAbandonedCard(card)) {
 			abandoned += 1;
 		} else if (card.phase === "blocked") {
 			blocked += 1;

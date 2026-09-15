@@ -28,3 +28,6 @@ export const GATE_TIMEOUT_MS = 30 * 60_000;
 export const MAX_REVIEW_CHARS = 60_000;
 export const MAX_DIGEST_CHARS = 1_400;
 export const MAX_OUTPUT_TAIL_CHARS = 8_000;
+
+/** Safety-tick interval for the drive loop while a program is active. */
+export const DRIVE_TICK_MS = 20_000;

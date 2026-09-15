@@ -36,7 +36,16 @@ import {
 	resolveDecision,
 	reviewDecisionMessage,
 } from "./decisions.ts";
-import { describeOpenDecisions, isHeld, openDecisionFor, openDecisionOfKind, openDecisions, readyCards, writersInFlight } from "./phases.ts";
+import {
+	describeOpenDecisions,
+	isAbandonedCard,
+	isHeld,
+	openDecisionFor,
+	openDecisionOfKind,
+	openDecisions,
+	readyCards,
+	writersInFlight,
+} from "./phases.ts";
 
 const UNKNOWN_RUN_GRACE_MS = 10 * 60_000;
 
@@ -52,6 +61,25 @@ export interface DriverHost {
 const TERMINAL_STATES = new Set(["complete", "failed", "stopped", "paused", "rejected", "not_found"]);
 const MAX_FIX_INFRA_RETRIES = 2;
 const MAX_MERGE_COMMIT_FAILURES = 5;
+/** Passes per drive tick: a merge frees dependencies, which enables dispatches,
+ *  which may free more merges. Bounded so one tick can never loop forever. */
+const MAX_DRIVE_PASSES = 8;
+
+/**
+ * Cheap state signature for the drain loop: phases, live runs, dropped flags,
+ * and the merge queue. Deliberately excludes lastError and attempt counters so
+ * a parked retry does not re-enter the loop within the same tick.
+ */
+function stateSignature(host: DriverHost): string {
+	const cards = host.ledger.order
+		.map((id) => {
+			const card = host.ledger.cards[id];
+			if (!card) return `${id}?`;
+			return `${id}:${card.phase}:${card.activeRun?.runId ?? "-"}:${card.abandoned === true ? "A" : "-"}`;
+		})
+		.join("|");
+	return `${cards}#${host.ledger.mergeQueue.join(",")}#${host.ledger.status}`;
+}
 const CAPTAIN_OUTPUT_SCHEMA: Record<string, unknown> = {
 	type: "object",
 	properties: {
@@ -135,16 +163,26 @@ export async function drive(host: DriverHost): Promise<void> {
 	}
 
 	try {
-		await reconcileRuns(host);
-		await resolveStaleBlocks(host);
-		if (ledger.mode === "managed" || ledger.mode === "captain") {
-			await dispatchReadyCards(host);
-			await dispatchReviews(host);
-			await dispatchFixes(host);
+		// Drain until quiescent: completing a card (a merge, a review) changes what
+		// is dispatchable, so a single pass can leave ready work stranded with no
+		// event left to trigger another tick.
+		// Cards whose merge was already attempted this tick: a parked failure must
+		// wait for the next tick instead of retrying immediately.
+		const attemptedMerges = new Set<string>();
+		for (let pass = 0; pass < MAX_DRIVE_PASSES; pass += 1) {
+			const before = stateSignature(host);
+			await reconcileRuns(host);
+			await resolveStaleBlocks(host);
+			if (ledger.mode === "managed" || ledger.mode === "captain") {
+				await dispatchReadyCards(host);
+				await dispatchReviews(host);
+				await dispatchFixes(host);
+			}
+			await finishApprovedCards(host);
+			await ensurePackets(host);
+			await processMergeQueue(host, attemptedMerges);
+			if (stateSignature(host) === before) break;
 		}
-		await finishApprovedCards(host);
-		await ensurePackets(host);
-		await processMergeQueue(host);
 		await maybeRunProgramGate(host);
 		await host.save();
 	} catch (error) {
@@ -314,7 +352,7 @@ async function abandonCard(host: DriverHost, card: CardLedger): Promise<{ ok: bo
 	const dependents = host.ledger.order.filter((id) => {
 		if (id === cardId) return false;
 		const other = host.ledger.cards[id];
-		if (!other || other.phase === "done" || other.abandoned === true) return false;
+		if (!other || other.phase === "done" || isAbandonedCard(other)) return false;
 		return other.dependsOn.includes(cardId);
 	});
 	if (dependents.length > 0) {
@@ -371,7 +409,7 @@ export async function planCardRemoval(
 	host: DriverHost,
 	card: CardLedger,
 ): Promise<{ drop: boolean; reason?: string; note?: string }> {
-	if (card.abandoned === true) return { drop: true, note: "abandoned tombstone" };
+	if (isAbandonedCard(card)) return { drop: true, note: "abandoned tombstone" };
 	if (card.phase === "done") return { drop: false, reason: "done cards are records; deletion ignored" };
 	if (["implementing", "reviewing", "fixing", "merging", "reconciling", "verifying"].includes(card.phase)) {
 		return { drop: false, reason: `card is ${card.phase}; a run owns it` };
@@ -379,7 +417,7 @@ export async function planCardRemoval(
 	const dependents = host.ledger.order.filter((id) => {
 		if (id === card.id) return false;
 		const other = host.ledger.cards[id];
-		if (!other || other.phase === "done" || other.abandoned === true) return false;
+		if (!other || other.phase === "done" || isAbandonedCard(other)) return false;
 		return other.dependsOn.includes(card.id);
 	});
 	if (dependents.length > 0) {
@@ -1077,7 +1115,7 @@ async function foreignChanges(host: DriverHost): Promise<string[]> {
 		});
 }
 
-async function processMergeQueue(host: DriverHost): Promise<void> {
+async function processMergeQueue(host: DriverHost, attempted: Set<string> = new Set()): Promise<void> {
 	const ledger = host.ledger;
 	if (ledger.parallelExecution !== "worktrees") return;
 	while (ledger.mergeQueue.length > 0) {
@@ -1137,6 +1175,8 @@ async function processMergeQueue(host: DriverHost): Promise<void> {
 			await host.save();
 		}
 		if (card.phase !== "merging" || !card.lane) return;
+		if (attempted.has(card.id)) return;
+		attempted.add(card.id);
 		if (await host.ports.git.merging(host.cwd)) {
 			// A previous tick merged but never committed (commit crashed after a
 			// good merge): resume at the commit step instead of re-merging.
@@ -1160,6 +1200,8 @@ async function processMergeQueue(host: DriverHost): Promise<void> {
 			continue;
 		}
 		await finishMergeCommit(host, card);
+		if (card.merge?.state === "merged") continue;
+		// Parked (commit failure) or handed to a gate fix: stop draining the queue.
 		return;
 	}
 }
@@ -1354,7 +1396,7 @@ async function maybeRunProgramGate(host: DriverHost): Promise<void> {
 	if (ledger.status !== "active") return;
 	const cards = ledgerCards(ledger);
 	if (cards.length === 0) return;
-	if (!cards.every((card) => card.phase === "done" || card.abandoned === true)) return;
+	if (!cards.every((card) => card.phase === "done" || isAbandonedCard(card))) return;
 	// Only an open program-gate decision holds completion: with every card done,
 	// any other open record is stale and must not wedge the program.
 	if (openDecisions(ledger).some((decision) => decision.kind === "gate-failed")) return;

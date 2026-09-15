@@ -74,6 +74,25 @@ function handlerFor(pi: FakePi) {
 }
 
 describe("start/resume commands", () => {
+	test("start on the already-loaded program resumes instead of refusing", async () => {
+		const { controller } = await setup();
+		await controller.startProgram("test-program");
+		// The operator's natural recovery attempt while a program looks stuck.
+		const result = await controller.startProgram("test-program");
+		expect(result.ok).toBe(true);
+		expect(result.text).toContain("already loaded; start = resume");
+	});
+
+	test("start names the loaded program when a different one is requested", async () => {
+		const { controller } = await setup();
+		const loaded = await controller.startProgram("test-program");
+		expect(loaded.ok).toBe(true);
+		const result = await controller.startProgram("some-other-program");
+		expect(result.ok).toBe(false);
+		expect(result.text).toContain("Already active: test-program");
+		expect(result.text).toContain("/work-program resume");
+	});
+
 	test("start wakes the agent so no manual nudge is needed", async () => {
 		const { pi } = await setup();
 		const { ctx } = commandCtx();

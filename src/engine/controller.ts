@@ -1,7 +1,7 @@
 import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
-import { DECISION_CUSTOM_TYPE, SESSION_ENTRY_TYPE } from "../constants.ts";
+import { DECISION_CUSTOM_TYPE, DRIVE_TICK_MS, SESSION_ENTRY_TYPE } from "../constants.ts";
 import { DEFAULT_SETTINGS, applyOverrides, formatPlanConfig, isPackageConfigured, loadSettings } from "../config.ts";
 import { buildBrief, planInstructions } from "../brief.ts";
 import { loadResources } from "../protocol/resources.ts";
@@ -55,7 +55,7 @@ import {
 	rearmPausedCards,
 } from "./driver.ts";
 import { createDecision } from "./decisions.ts";
-import { counts, isHeld, openDecisionFor, openDecisions, phaseSymbol } from "./phases.ts";
+import { counts, isAbandonedCard, isHeld, openDecisionFor, openDecisions, phaseSymbol } from "./phases.ts";
 import { Git } from "../platform/git.ts";
 import { Gates } from "../platform/gates.ts";
 import { SubagentsRpc } from "../platform/runs.ts";
@@ -103,6 +103,9 @@ export class WorkProgramController {
 	private intercomReady = false;
 	private driving = false;
 	private driveQueued = false;
+	/** Safety tick: the drive is event-driven, so a missed event (a lost
+	 *  completion, a late RPC bridge) must not freeze a live program forever. */
+	private tickTimer: ReturnType<typeof setInterval> | undefined;
 
 	constructor(private readonly pi: ExtensionAPI) {
 		this.runs = new SubagentsRpc(pi);
@@ -142,10 +145,26 @@ export class WorkProgramController {
 	}
 
 	shutdown(): void {
+		this.stopTick();
 		this.runs.dispose();
 		this.active = undefined;
 		this.sessionCtx = undefined;
 		this.sessionStarted = false;
+	}
+
+	/** Idempotent periodic drive tick while a program is loaded (no-op when paused). */
+	private startTick(): void {
+		if (this.tickTimer !== undefined) return;
+		this.tickTimer = setInterval(() => {
+			if (!this.active || this.active.ledger.status !== "active") return;
+			this.scheduleDrive();
+		}, DRIVE_TICK_MS);
+	}
+
+	private stopTick(): void {
+		if (this.tickTimer === undefined) return;
+		clearInterval(this.tickTimer);
+		this.tickTimer = undefined;
 	}
 
 	async onDependenciesChanged(): Promise<void> {
@@ -229,6 +248,12 @@ export class WorkProgramController {
 			ledger = await adoptProgram({ cwd: this.cwd, settings: this.settings, ref });
 		}
 		this.active = { slug: ref.slug, absDir: ref.absDir, ledger };
+		// Pick up file-driven edits (folded/dropped cards, rewired deps) at session
+		// start instead of waiting for an explicit sync.
+		const syncResult = await this.syncFromDisk().catch(() => undefined);
+		if (syncResult && !syncResult.ok && syncResult.text.length > 0) {
+			this.sessionCtx?.ui.notify(`Work program: ${oneLine(syncResult.text, 200)}`, "warning");
+		}
 		// The worker briefs point at the operator todo file; make sure it exists
 		// (verbatim header, created once — never touches existing content).
 		await ensureOperatorTodoFile({
@@ -242,6 +267,7 @@ export class WorkProgramController {
 		this.pi.appendEntry(SESSION_ENTRY_TYPE, { slug: ref.slug, dir: ref.relDir });
 		this.pi.setSessionName(`wp: ${ledger.slug}`);
 		await appendProgress(ref.absDir, `session attached (${ledger.mode}, ${ledger.order.length} cards)`);
+		this.startTick();
 		this.refreshUi();
 		if (ledger.status === "active") this.scheduleDrive();
 	}
@@ -616,7 +642,18 @@ export class WorkProgramController {
 	async startProgram(target: string): Promise<ActionResult> {
 		const depError = this.requireDependencies();
 		if (depError) return { ok: false, text: depError };
-		if (this.active) return { ok: false, text: `Already active: ${this.active.slug}. Pause it first.` };
+		if (this.active) {
+			if (this.active.slug === target) {
+				// Same program already loaded: "start" is the operator asking for motion,
+				// so resume instead of refusing with "already active".
+				const resumed = await this.resume();
+				return resumed.ok ? { ok: true, text: `${resumed.text} (already loaded; start = resume)` } : resumed;
+			}
+			return {
+				ok: false,
+				text: `Already active: ${this.active.slug} (${this.active.ledger.status}). Resume it with /work-program resume, or pause/close it before starting ${target}.`,
+			};
+		}
 		const refs = await listProgramRefs(this.cwd, this.settings);
 		const ref =
 			refs.find((entry) => entry.slug === target) ??
@@ -934,7 +971,7 @@ export class WorkProgramController {
 		const ledger = this.active.ledger;
 		const pending = ledger.order.filter((id) => {
 			const card = ledger.cards[id];
-			return card !== undefined && card.phase !== "done" && card.abandoned !== true;
+			return card !== undefined && card.phase !== "done" && !isAbandonedCard(card);
 		});
 		if (pending.length > 0) {
 			return {

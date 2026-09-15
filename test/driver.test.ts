@@ -1133,6 +1133,89 @@ describe("quota holds", () => {
 	});
 });
 
+describe("drain (a merge cannot strand ready work)", () => {
+	test("a merge in one tick dispatches the dependent card in the same tick", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }, { id: "02", depends: ["01"] }] });
+		await drive(t.host);
+		writeLaneEvidence(t, "01", "evidence");
+		t.completeRun(t.fake.dispatched[0]!.runId, { output: "done" });
+		await drive(t.host);
+		t.completeRun(t.fake.dispatched.at(-1)!.runId, { output: "No issues." });
+		await drive(t.host);
+		applyTriage(t.host, "01", []);
+		// One tick: merge 01, and 02 becomes ready as a result of that merge.
+		await drive(t.host);
+		expect(t.ledger.cards["01"]?.phase).toBe("done");
+		expect(t.ledger.cards["02"]?.phase).toBe("implementing");
+		expect(t.fake.dispatched.some((entry) => entry.request.label.includes("card 02"))).toBe(true);
+	});
+
+	test("the queue drains fully in one tick without new events", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }, { id: "02" }], maxParallel: 2 });
+		// Both cards reach approved+queued first, so the queue holds two entries.
+		for (const id of ["01", "02"]) {
+			writeLaneEvidence(t, id, `evidence ${id}`);
+			const card = t.ledger.cards[id]!;
+			card.phase = "approved";
+			card.lane = { path: `/wt/test-program/${id}`, branch: `feat/foo-card-${id}`, base: "base0" };
+		}
+		await drive(t.host);
+		expect(t.ledger.mergeQueue).toEqual([]);
+		expect(t.ledger.cards["01"]?.phase).toBe("done");
+		expect(t.ledger.cards["02"]?.phase).toBe("done");
+	});
+
+	test("a parked merge failure does not retry in the same tick", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		t.git.mergeResult = { code: 0, conflicted: [], output: "merged" };
+		let commits = 0;
+		const original = t.git.commitMerge;
+		t.git.commitMerge = async (cwd: string) => {
+			commits += 1;
+			if (commits === 1) throw new Error("commit exploded");
+			return original.call(t.git, cwd);
+		};
+		writeLaneEvidence(t, "01", "evidence");
+		const card = t.ledger.cards["01"]!;
+		card.phase = "approved";
+		card.lane = { path: "/wt/test-program/01", branch: "feat/foo-card-01", base: "base0" };
+		await drive(t.host);
+		expect(commits).toBe(1);
+		expect(t.ledger.cards["01"]?.lastError).toContain("merge commit failed");
+	});
+});
+
+describe("legacy abandoned tombstones", () => {
+	test("legacy abandoned cards do not block completion or count as blocked", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }, { id: "02" }] });
+		t.ledger.cards["01"]!.phase = "done";
+		const ghost = t.ledger.cards["02"]!;
+		ghost.phase = "blocked";
+		ghost.lastError = "abandoned by operator";
+		// The tombstones must not read as live work either.
+		const { counts, isAbandonedCard } = await import("../src/engine/phases.ts");
+		expect(isAbandonedCard(ghost)).toBe(true);
+		const counted = counts(t.ledger);
+		expect(counted.blocked).toBe(0);
+		expect(counted.abandoned).toBe(1);
+		// Completion is not wedged by the tombstone.
+		await drive(t.host);
+		expect(t.ledger.status).toBe("complete");
+	});
+
+	test("a legacy tombstone with no file and no lane is dropped by sync", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }, { id: "02" }] });
+		const ghost = t.ledger.cards["02"]!;
+		ghost.phase = "blocked";
+		ghost.lastError = "abandoned by operator";
+		ghost.dependsOn = [];
+		const { planCardRemoval } = await import("../src/engine/driver.ts");
+		const decision = await planCardRemoval(t.host, ghost);
+		expect(decision.drop).toBe(true);
+		expect(decision.note).toContain("abandoned");
+	});
+});
+
 describe("dispatch failures", () => {
 	test("a failing dispatch blocks the card instead of retrying silently", async () => {
 		const t = createTestHost({ cards: [{ id: "01" }] });

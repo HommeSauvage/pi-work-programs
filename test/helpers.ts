@@ -118,6 +118,8 @@ export interface FakeState {
 	asked: string[];
 	gateResults: Map<string, GateResult[]>;
 	notifications: string[];
+	/** Drives DriverPorts.sessionIdle in tests. */
+	sessionIdle: boolean;
 }
 
 export interface TestHost {
@@ -129,6 +131,17 @@ export interface TestHost {
 	completeRun(runId: string, payload?: { output?: string; structured?: unknown }): void;
 	failRun(runId: string, error?: string): void;
 	lastRunId(): string;
+}
+
+/**
+ * Backdate every open decision so the packet wake-up gate lets them through.
+ * Fresh decisions are deliberately NOT announced (see PACKET_WAKE_MIN_AGE_MS).
+ */
+export function ageOpenDecisions(t: TestHost, ms = 20_000): void {
+	const now = Date.now();
+	for (const decision of t.ledger.decisions) {
+		if (decision.status === "open") decision.createdAt = now - ms;
+	}
 }
 
 export function makeCardText(input: {
@@ -243,6 +256,7 @@ export function createTestHost(input: {
 		asked: [],
 		gateResults: new Map(),
 		notifications: [],
+		sessionIdle: true,
 	};
 	const git = new FakeGit();
 	let runCounter = 0;
@@ -315,6 +329,7 @@ export function createTestHost(input: {
 		ask: (message) => {
 			fake.asked.push(message);
 		},
+		sessionIdle: () => fake.sessionIdle,
 		git,
 		gates,
 		runs,

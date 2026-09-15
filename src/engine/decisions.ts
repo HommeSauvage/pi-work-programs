@@ -54,11 +54,20 @@ export function cancelOpenDecisionsFor(host: DecisionHost, cardId: string, reaso
 	}
 }
 
-export function packetText(ledger: ProgramLedger, decisions: Decision[]): string {
+function clockOf(ms: number | undefined): string {
+	if (ms === undefined) return "unknown";
+	const d = new Date(ms);
+	return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
+}
+
+export function packetText(ledger: ProgramLedger, decisions: Decision[], now: number = Date.now()): string {
 	const header = `[WORK PROGRAM DECISION — ${ledger.slug} · ${ledger.mode}]`;
 	const blocks = decisions.map((decision) => {
+		const raised = decision.createdAt;
+		const ageSeconds = raised === undefined ? undefined : Math.max(0, Math.round((now - raised) / 1000));
 		const lines = [
 			`Decision ${decision.id} (still open)${decision.card ? ` · card ${decision.card}` : ""}`,
+			`raised ${clockOf(raised)}${ageSeconds === undefined ? "" : ` (${ageSeconds}s ago)`} · prepared ${clockOf(now)}`,
 			"",
 			decision.message ?? "Decision required.",
 		];
@@ -72,7 +81,7 @@ export function packetText(ledger: ProgramLedger, decisions: Decision[]): string
 		"",
 		blocks.join("\n\n---\n\n"),
 		"",
-		'Only these decisions are open right now. If a decision looks already answered, call work_program({ action: "status" }) instead of re-answering.',
+		"This packet is a wake-up, not the whole picture: every turn's program brief lists the decisions that are open right now. If `work_program({ action: \"status\" })` no longer lists one of these, it was answered between preparation and delivery — ignore that decision instead of re-answering it.",
 	].join("\n");
 }
 

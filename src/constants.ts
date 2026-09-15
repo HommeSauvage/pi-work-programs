@@ -31,3 +31,12 @@ export const MAX_OUTPUT_TAIL_CHARS = 8_000;
 
 /** Safety-tick interval for the drive loop while a program is active. */
 export const DRIVE_TICK_MS = 20_000;
+
+/**
+ * Decision packets are wake-ups, not the primary channel (the per-turn program
+ * brief lists open decisions for free). So a packet waits until the session is
+ * idle: a decision answered during the agent's current turn is never announced
+ * afterwards. The force age escapes a session that never goes idle.
+ */
+export const PACKET_WAKE_MIN_AGE_MS = 15_000;
+export const PACKET_WAKE_FORCE_AGE_MS = 180_000;

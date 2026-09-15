@@ -35,7 +35,10 @@ function recordingUi(): { ui: StubUi; calls: Array<{ method: string; key?: strin
 	return { ui, calls };
 }
 
-async function setupProgram(ui?: StubUi): Promise<{ controller: WorkProgramController; cwd: string; pi: FakePi }> {
+async function setupProgram(
+	ui?: StubUi,
+	options: { idle?: boolean } = {},
+): Promise<{ controller: WorkProgramController; cwd: string; pi: FakePi }> {
 	const root = await mkdtemp(join(tmpdir(), "wp-controller-"));
 	tempDirs.push(root);
 	const agentDir = join(root, "agent");
@@ -61,7 +64,7 @@ async function setupProgram(ui?: StubUi): Promise<{ controller: WorkProgramContr
 	const pi = new FakePi();
 	installRpcResponder(pi);
 	const controller = new WorkProgramController(pi.asExtensionApi());
-	await controller.initialize(fakeSessionContext({ cwd, ...(ui ? { ui } : {}) }));
+	await controller.initialize(fakeSessionContext({ cwd, ...(ui ? { ui } : {}), ...(options.idle !== undefined ? { idle: options.idle } : {}) }));
 	const started = await controller.startProgram("test-program");
 	expect(started.ok).toBe(true);
 	return { controller, cwd, pi };
@@ -225,6 +228,27 @@ describe("soft and hard pause", () => {
 		const progress = await readFile(join(cwd, ".agents", "work-programs", "test-program", "progress.md"), "utf8");
 		expect(progress).toContain("resumed by operator");
 		expect(progress).toContain("01 reviewing→review_pending");
+	});
+});
+
+describe("session idle detection", () => {
+	test("reports idle when pi is not processing a run", async () => {
+		const { controller } = await setupProgram(undefined, { idle: true });
+		expect(controller.sessionIdle()).toBe(true);
+	});
+
+	test("reports busy while pi is processing a run", async () => {
+		const { controller } = await setupProgram(undefined, { idle: false });
+		expect(controller.sessionIdle()).toBe(false);
+	});
+
+	test("treats a pi build without the idle helper as idle", async () => {
+		const { controller, cwd } = await setupProgram();
+		// Strip the helper to emulate an older pi, then re-initialize.
+		const ctx = fakeSessionContext({ cwd });
+		delete (ctx as { isIdle?: unknown }).isIdle;
+		await controller.initialize(ctx);
+		expect(controller.sessionIdle()).toBe(true);
 	});
 });
 

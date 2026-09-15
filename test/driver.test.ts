@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { applyTriage, applyUnblock, dispatchManual, drive, finishManualMerge, rearmPausedCards } from "../src/engine/driver.ts";
 import { createDecision } from "../src/engine/decisions.ts";
-import { createTestHost, makeCardText } from "./helpers.ts";
+import { ageOpenDecisions, createTestHost, makeCardText } from "./helpers.ts";
 import type { CardLedger } from "../src/shared/types.ts";
 
 function setPhase(t: ReturnType<typeof createTestHost>, id: string, phase: CardLedger["phase"]): void {
@@ -42,6 +42,11 @@ describe("managed driver loop", () => {
 		t.completeRun(reviewRun!.runId, { output: "## Findings\n- F1: missing null check" });
 		await drive(t.host);
 		expect(t.ledger.cards["01"]?.phase).toBe("triaging");
+		// A freshly raised decision is not announced: the agent may answer it in
+		// its current turn, and a packet would then arrive stale.
+		expect(t.fake.asked).toHaveLength(0);
+		ageOpenDecisions(t);
+		await drive(t.host);
 		expect(t.fake.asked).toHaveLength(1);
 		expect(t.fake.asked[0]).toContain("triage");
 
@@ -91,6 +96,8 @@ describe("managed driver loop", () => {
 		await drive(t.host);
 		expect(t.ledger.cards["01"]?.phase).toBe("blocked");
 		expect(t.ledger.cards["01"]?.lastError).toContain("Evidence");
+		ageOpenDecisions(t);
+		await drive(t.host);
 		expect(t.fake.asked.some((message) => message.includes("unblock"))).toBe(true);
 	});
 
@@ -262,6 +269,8 @@ describe("merge queue and reconciliation", () => {
 		await drive(t.host);
 		expect(String(card.phase)).toBe("triaging");
 		expect(t.ledger.decisions.some((decision) => decision.kind === "review-triage")).toBe(true);
+		ageOpenDecisions(t);
+		await drive(t.host);
 		expect(t.fake.asked.length).toBeGreaterThan(0);
 	});
 });
@@ -1311,6 +1320,131 @@ describe("provider blips on any run kind", () => {
 		const card = t.ledger.cards["01"]!;
 		expect(card.phase).toBe("blocked");
 		expect(card.lastError).toContain("503");
+	});
+});
+
+describe("decision packet wake-up gating", () => {
+	/** Only the "[WORK PROGRAM DECISION …]" messages; completion summaries are not packets. */
+	const decisionPackets = (t: ReturnType<typeof createTestHost>): string[] =>
+		t.fake.asked.filter((message) => message.includes("[WORK PROGRAM DECISION"));
+
+	/** Drive an implement→review cycle so a review-triage decision exists. */
+	async function raiseTriageDecision(t: ReturnType<typeof createTestHost>): Promise<void> {
+		await drive(t.host);
+		writeLaneEvidence(t, "01", "evidence");
+		t.completeRun(t.fake.dispatched[0]!.runId, { output: "done" });
+		await drive(t.host);
+		t.completeRun(t.fake.dispatched.at(-1)!.runId, { output: "F1: bug" });
+		await drive(t.host);
+		expect(t.ledger.cards["01"]?.phase).toBe("triaging");
+	}
+
+	test("a fresh decision is not announced even when the session is idle", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		t.fake.sessionIdle = true;
+		await raiseTriageDecision(t);
+		expect(decisionPackets(t)).toHaveLength(0);
+		// Still pending, not marked sent: the next tick re-evaluates it.
+		const decision = t.ledger.decisions.find((entry) => entry.kind === "review-triage")!;
+		expect(decision.status).toBe("open");
+		expect(decision.packetSent).not.toBe(true);
+	});
+
+	test("an aged decision is announced once the session is idle", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await raiseTriageDecision(t);
+		ageOpenDecisions(t);
+		await drive(t.host);
+		expect(decisionPackets(t)).toHaveLength(1);
+		expect(t.fake.asked[0]).toContain("Decision d");
+		expect(t.fake.asked[0]).toContain("raised");
+	});
+
+	test("a busy session defers the packet however old the decision is", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await raiseTriageDecision(t);
+		ageOpenDecisions(t, 30_000);
+		t.fake.sessionIdle = false;
+		await drive(t.host);
+		expect(decisionPackets(t)).toHaveLength(0);
+		// The decision is unanswered, so it must survive for the next tick.
+		expect(t.ledger.decisions.find((entry) => entry.kind === "review-triage")?.packetSent).not.toBe(true);
+		// Going idle delivers it without any further change.
+		t.fake.sessionIdle = true;
+		await drive(t.host);
+		expect(decisionPackets(t)).toHaveLength(1);
+	});
+
+	test("a session that never goes idle still gets packets past the force age", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await raiseTriageDecision(t);
+		ageOpenDecisions(t, 200_000);
+		t.fake.sessionIdle = false;
+		await drive(t.host);
+		expect(decisionPackets(t)).toHaveLength(1);
+	});
+
+	test("a decision answered before delivery is never announced", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await raiseTriageDecision(t);
+		ageOpenDecisions(t);
+		t.fake.sessionIdle = false;
+		await drive(t.host);
+		expect(decisionPackets(t)).toHaveLength(0);
+		// The agent answers it during its turn; the pending packet must be dropped.
+		applyTriage(t.host, "01", [{ finding: "F1", verdict: "reject" }]);
+		t.fake.sessionIdle = true;
+		await drive(t.host);
+		// Completion may announce itself; no *decision* packet may follow the answer.
+		expect(decisionPackets(t)).toHaveLength(0);
+	});
+
+	test("a delivered packet is never re-sent on later ticks", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await raiseTriageDecision(t);
+		ageOpenDecisions(t);
+		await drive(t.host);
+		expect(decisionPackets(t)).toHaveLength(1);
+		await drive(t.host);
+		await drive(t.host);
+		expect(decisionPackets(t)).toHaveLength(1);
+	});
+
+	test("only the eligible subset is announced and marked sent", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }, { id: "02" }] });
+		await raiseTriageDecision(t);
+		// A second, younger decision for another card.
+		const { createDecision } = await import("../src/engine/decisions.ts");
+		const young = createDecision(
+			{ programDir: t.host.programDir, ledger: t.ledger },
+			{
+				kind: "blocked",
+				card: "02",
+				message: "Card 02 is blocked: something.",
+				expectedAction: 'work_program({ action: "unblock", card: "02", resolution: "redispatch" })',
+			},
+		);
+		const aged = t.ledger.decisions.find((entry) => entry.kind === "review-triage")!;
+		aged.createdAt = Date.now() - 30_000;
+		await drive(t.host);
+		expect(decisionPackets(t)).toHaveLength(1);
+		expect(t.fake.asked[0]).toContain(`Decision ${aged.id}`);
+		expect(t.fake.asked[0]).not.toContain(`Decision ${young.id}`);
+		expect(aged.packetSent).toBe(true);
+		expect(young.packetSent).not.toBe(true);
+	});
+
+	test("a blocked card after a run failure still reaches the operator once aged", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await drive(t.host);
+		t.failRun(t.fake.dispatched[0]!.runId, "something went wrong in the code");
+		await drive(t.host);
+		expect(t.ledger.cards["01"]?.phase).toBe("blocked");
+		expect(decisionPackets(t)).toHaveLength(0);
+		ageOpenDecisions(t);
+		await drive(t.host);
+		expect(decisionPackets(t)).toHaveLength(1);
+		expect(t.fake.asked[0]).toContain("unblock");
 	});
 });
 

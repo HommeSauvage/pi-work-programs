@@ -1,4 +1,5 @@
 import { loadResources } from "../protocol/resources.ts";
+import { PACKET_WAKE_FORCE_AGE_MS, PACKET_WAKE_MIN_AGE_MS } from "../constants.ts";
 import {
 	captainBrief,
 	fixBrief,
@@ -1088,12 +1089,33 @@ async function commitRecordPaths(host: DriverHost, card: CardLedger, message: st
 	return commit;
 }
 
-async function ensurePackets(host: DriverHost): Promise<void> {
+/**
+ * Deliver decision packets — but only as wake-ups for an idle session.
+ *
+ * The per-turn program brief already lists open decisions (pull), so a packet
+ * exists to wake a stalled agent, not to announce a decision the agent is
+ * already handling. A packet queues only when the decision is still open, is
+ * older than the minimum age, and the session is idle; a session that never
+ * goes idle still gets packets once a decision passes the force age, so nothing
+ * is starved. Deferred decisions keep `packetSent = false` and are re-evaluated
+ * on the next tick.
+ */
+async function ensurePackets(host: DriverHost, now: number = Date.now()): Promise<void> {
 	const pending = openDecisions(host.ledger).filter((decision) => !decision.packetSent);
 	if (pending.length === 0) return;
-	for (const decision of pending) decision.packetSent = true;
-	const text = packetText(host.ledger, pending);
-	host.ports.ask(text);
+	const idle = host.ports.sessionIdle();
+	const ready = pending.filter((decision) => {
+		const age = now - (decision.createdAt ?? now);
+		if (age < PACKET_WAKE_MIN_AGE_MS) return false;
+		return idle || age >= PACKET_WAKE_FORCE_AGE_MS;
+	});
+	if (ready.length === 0) return;
+	// Re-check open state immediately before queueing: resolving between the
+	// filter above and here must not produce a stale announcement.
+	const stillOpen = ready.filter((decision) => decision.status === "open");
+	if (stillOpen.length === 0) return;
+	for (const decision of stillOpen) decision.packetSent = true;
+	host.ports.ask(packetText(host.ledger, stillOpen, now));
 	await host.save();
 }
 

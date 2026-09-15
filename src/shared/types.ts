@@ -292,6 +292,12 @@ export interface DriverPorts {
 	notify(message: string, level?: "info" | "warning" | "error"): void;
 	/** Inject a message into the session and wake the agent when needed. */
 	ask(message: string): void;
+	/**
+	 * False while pi is processing a run, an automatic retry, a compaction, or a
+	 * queued continuation. Decision packets only wake an idle session, so a
+	 * decision answered during the current turn is never announced afterwards.
+	 */
+	sessionIdle(): boolean;
 	git: GitOps;
 	runs: RunOps;
 	gates: GateOps;

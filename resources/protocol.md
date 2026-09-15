@@ -157,6 +157,24 @@ plan and card files stay the source of truth; `sync` reconciles.
   the card/plan text (fold, rewire `Depends on:`, delete or add cards) and run
   `sync` — see Reshaping the program.
 
+## Decisions and wake-ups
+
+- Open decisions live in every turn's **program brief** (pull) — you always see
+  what is open without asking.
+- A **decision packet** is a *wake-up* for an idle session, not the primary
+  channel. It is queued only when the decision is still open, is older than
+  15 seconds, and pi is idle (not processing a run, retry, compaction, or
+  queued continuation). A session that never goes idle still receives packets
+  once a decision passes 3 minutes, so nothing is starved, and a deferred
+  decision is re-evaluated on the next tick.
+- Consequence: a decision you answer during your current turn is **never**
+  announced afterwards. A packet therefore cannot be a stale duplicate of work
+  you just did.
+- Each packet states when the decision was raised and when the packet was
+  prepared, and says what to do if it arrives stale anyway: if `status` no
+  longer lists the decision, it was answered between preparation and delivery —
+  ignore it instead of re-answering.
+
 ## Drive and scheduling
 
 - The drive is event-driven (session start, run completions, operator actions)

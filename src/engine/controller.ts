@@ -403,6 +403,7 @@ export class WorkProgramController {
 					{ deliverAs: "followUp", triggerTurn: true },
 				);
 			},
+			sessionIdle: () => this.sessionIdle(),
 			git: this.git,
 			gates: this.gates,
 			runs: this.runs,
@@ -1190,6 +1191,23 @@ export class WorkProgramController {
 
 	protocol(): string {
 		return loadResources().protocol;
+	}
+
+	/**
+	 * True when pi is not processing a run, retry, compaction, or queued
+	 * continuation. Older pi builds without the helper are treated as idle, which
+	 * preserves the previous wake-every-time behavior.
+	 */
+	sessionIdle(): boolean {
+		const ctx = this.sessionCtx;
+		if (!ctx) return true;
+		const idle = (ctx as { isIdle?: () => boolean }).isIdle;
+		if (typeof idle !== "function") return true;
+		try {
+			return idle.call(ctx) !== false;
+		} catch {
+			return true;
+		}
 	}
 
 	/**

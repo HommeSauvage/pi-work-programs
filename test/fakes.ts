@@ -150,7 +150,12 @@ export interface StubUi {
 	theme: { fg: (color: string, text: string) => string };
 }
 
-export function fakeSessionContext(input: { cwd: string; entries?: unknown[]; ui?: StubUi }): ExtensionContext {
+export function fakeSessionContext(input: {
+	cwd: string;
+	entries?: unknown[];
+	ui?: StubUi;
+	idle?: boolean;
+}): ExtensionContext {
 	const ui: StubUi = input.ui ?? {
 		notify: () => {},
 		setStatus: () => {},
@@ -160,6 +165,7 @@ export function fakeSessionContext(input: { cwd: string; entries?: unknown[]; ui
 	return {
 		cwd: input.cwd,
 		hasUI: false,
+		isIdle: () => input.idle !== false,
 		ui,
 		sessionManager: {
 			getEntries: () => input.entries ?? [],

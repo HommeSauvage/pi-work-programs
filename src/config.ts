@@ -1,0 +1,216 @@
+import type {
+	Mode,
+	ParallelExecution,
+	ProgramConfigOverrides,
+	ReviewProfile,
+	WorkProgramSettings,
+} from "./shared/types.ts";
+import { projectSettingsPath, userSettingsPath } from "./shared/paths.ts";
+import { readJson } from "./shared/fsx.ts";
+import { asNumber, asString, isRecord, parseStringArray } from "./shared/text.ts";
+
+export const DEFAULT_SETTINGS: WorkProgramSettings = {
+	dir: ".agents/work-programs",
+	mode: "managed",
+	maxParallel: 2,
+	parallelExecution: "worktrees",
+	review: { agent: "reviewer", profile: "light", maxCycles: 3, onExhausted: "ask" },
+	worker: { agent: "worker" },
+	reviewer: {},
+	gates: { card: [], program: [] },
+	laneBranchPattern: "{branch}-card-{id}",
+};
+
+const MODES: Mode[] = ["session", "managed", "captain"];
+const PARALLEL_EXECUTIONS: ParallelExecution[] = ["worktrees", "direct"];
+const REVIEW_PROFILES: ReviewProfile[] = ["light", "enhanced"];
+
+export function isMode(value: unknown): value is Mode {
+	return typeof value === "string" && (MODES as string[]).includes(value);
+}
+
+export function isParallelExecution(value: unknown): value is ParallelExecution {
+	return typeof value === "string" && (PARALLEL_EXECUTIONS as string[]).includes(value);
+}
+
+export function isReviewProfile(value: unknown): value is ReviewProfile {
+	return typeof value === "string" && (REVIEW_PROFILES as string[]).includes(value);
+}
+
+function clampParallel(value: number | undefined, fallback: number): number {
+	if (value === undefined) return fallback;
+	const rounded = Math.floor(value);
+	if (rounded < 1) return 1;
+	if (rounded > 32) return 32;
+	return rounded;
+}
+
+export function normalizeSettings(raw: unknown, base: WorkProgramSettings = DEFAULT_SETTINGS): WorkProgramSettings {
+	if (!isRecord(raw)) return { ...base };
+	const settings: WorkProgramSettings = {
+		...base,
+		review: { ...base.review },
+		worker: { ...base.worker },
+		reviewer: { ...base.reviewer },
+		gates: { card: [...base.gates.card], program: [...base.gates.program] },
+	};
+	const dir = asString(raw.dir);
+	if (dir) settings.dir = dir;
+	if (isMode(raw.mode)) settings.mode = raw.mode;
+	settings.maxParallel = clampParallel(asNumber(raw.maxParallel), base.maxParallel);
+	if (isParallelExecution(raw.parallelExecution)) settings.parallelExecution = raw.parallelExecution;
+	const pattern = asString(raw.laneBranchPattern);
+	if (pattern) settings.laneBranchPattern = pattern;
+	const worktreeDir = asString(raw.worktreeDir);
+	if (worktreeDir) settings.worktreeDir = worktreeDir;
+
+	const review = isRecord(raw.review) ? raw.review : undefined;
+	if (review) {
+		const agent = asString(review.agent);
+		if (agent) settings.review.agent = agent;
+		if (isReviewProfile(review.profile)) settings.review.profile = review.profile;
+		settings.review.maxCycles = clampParallel(asNumber(review.maxCycles), base.review.maxCycles);
+		const onExhausted = asString(review.onExhausted);
+		if (onExhausted === "ask" || onExhausted === "accept" || onExhausted === "block") {
+			settings.review.onExhausted = onExhausted;
+		}
+	}
+
+	const worker = isRecord(raw.worker) ? raw.worker : undefined;
+	if (worker) {
+		const agent = asString(worker.agent);
+		if (agent) settings.worker.agent = agent;
+		const model = asString(worker.model);
+		if (model) settings.worker.model = model;
+		const thinking = asString(worker.thinking);
+		if (thinking) settings.worker.thinking = thinking;
+	}
+
+	const reviewer = isRecord(raw.reviewer) ? raw.reviewer : undefined;
+	if (reviewer) {
+		const model = asString(reviewer.model);
+		if (model) settings.reviewer.model = model;
+		const thinking = asString(reviewer.thinking);
+		if (thinking) settings.reviewer.thinking = thinking;
+	}
+
+	const gates = isRecord(raw.gates) ? raw.gates : undefined;
+	if (gates) {
+		const card = parseStringArray(gates.card);
+		if (card) settings.gates.card = card;
+		const program = parseStringArray(gates.program);
+		if (program) settings.gates.program = program;
+	}
+
+	return settings;
+}
+
+export async function loadSettings(cwd: string, configDirName: string): Promise<WorkProgramSettings> {
+	const userRaw = await readJson<Record<string, unknown>>(userSettingsPath());
+	const projectRaw = await readJson<Record<string, unknown>>(projectSettingsPath(cwd, configDirName));
+	const user = normalizeSettings(userRaw?.workPrograms, DEFAULT_SETTINGS);
+	return normalizeSettings(projectRaw?.workPrograms, user);
+}
+
+const CONFIG_COMMENT_RE = /<!--\s*wp:\s*(\{[\s\S]*?\})\s*-->/;
+
+export function parsePlanConfig(planText: string): Record<string, unknown> {
+	const match = CONFIG_COMMENT_RE.exec(planText.slice(0, 8_192));
+	if (!match?.[1]) return {};
+	try {
+		const parsed = JSON.parse(match[1]) as unknown;
+		return isRecord(parsed) ? parsed : {};
+	} catch {
+		return {};
+	}
+}
+
+export function formatPlanConfig(overrides: ProgramConfigOverrides): string {
+	const clean: Record<string, unknown> = {};
+	if (overrides.mode) clean.mode = overrides.mode;
+	if (overrides.maxParallel !== undefined) clean.maxParallel = overrides.maxParallel;
+	if (overrides.parallelExecution) clean.parallelExecution = overrides.parallelExecution;
+	if (overrides.reviewProfile) clean.reviewProfile = overrides.reviewProfile;
+	if (overrides.maxCycles !== undefined) clean.maxCycles = overrides.maxCycles;
+	if (overrides.laneBranchPattern) clean.laneBranchPattern = overrides.laneBranchPattern;
+	const review: Record<string, unknown> = {};
+	if (overrides.reviewProfile) review.profile = overrides.reviewProfile;
+	if (overrides.maxCycles !== undefined) review.maxCycles = overrides.maxCycles;
+	if (Object.keys(review).length > 0) clean.review = review;
+	const gates: Record<string, unknown> = {};
+	if (overrides.gates?.card) gates.card = overrides.gates.card;
+	if (overrides.gates?.program) gates.program = overrides.gates.program;
+	if (Object.keys(gates).length > 0) clean.gates = gates;
+	const worker: Record<string, unknown> = {};
+	if (overrides.workerAgent) worker.agent = overrides.workerAgent;
+	if (overrides.workerModel) worker.model = overrides.workerModel;
+	if (overrides.workerThinking) worker.thinking = overrides.workerThinking;
+	if (Object.keys(worker).length > 0) clean.worker = worker;
+	const reviewer: Record<string, unknown> = {};
+	if (overrides.reviewerAgent) reviewer.agent = overrides.reviewerAgent;
+	if (overrides.reviewerModel) reviewer.model = overrides.reviewerModel;
+	if (overrides.reviewerThinking) reviewer.thinking = overrides.reviewerThinking;
+	if (Object.keys(reviewer).length > 0) clean.reviewer = reviewer;
+	return `<!-- wp: ${JSON.stringify(clean)} -->`;
+}
+
+export function applyOverrides(
+	settings: WorkProgramSettings,
+	overrides: ProgramConfigOverrides,
+): WorkProgramSettings {
+	const normalized = normalizeSettings({
+		dir: settings.dir,
+		mode: overrides.mode ?? settings.mode,
+		maxParallel: overrides.maxParallel ?? settings.maxParallel,
+		parallelExecution: overrides.parallelExecution ?? settings.parallelExecution,
+		laneBranchPattern: overrides.laneBranchPattern ?? settings.laneBranchPattern,
+		review: {
+			agent: overrides.reviewerAgent ?? settings.review.agent,
+			profile: overrides.reviewProfile ?? settings.review.profile,
+			maxCycles: overrides.maxCycles ?? settings.review.maxCycles,
+			onExhausted: settings.review.onExhausted,
+		},
+		worker: {
+			agent: overrides.workerAgent ?? settings.worker.agent,
+			model: overrides.workerModel ?? settings.worker.model,
+			thinking: overrides.workerThinking ?? settings.worker.thinking,
+		},
+		reviewer: {
+			model: overrides.reviewerModel ?? settings.reviewer.model,
+			thinking: overrides.reviewerThinking ?? settings.reviewer.thinking,
+		},
+		gates: {
+			card: overrides.gates?.card ?? settings.gates.card,
+			program: overrides.gates?.program ?? settings.gates.program,
+		},
+	}, settings);
+	return normalized;
+}
+
+
+/** True when a package source for `name` appears in the user or project settings `packages` list. */
+export async function isPackageConfigured(cwd: string, configDirName: string, name: string): Promise<boolean> {
+	const candidates = [userSettingsPath(), projectSettingsPath(cwd, configDirName)];
+	for (const path of candidates) {
+		const raw = await readJson<Record<string, unknown>>(path);
+		const packages = raw?.packages;
+		if (!Array.isArray(packages)) continue;
+		for (const entry of packages) {
+			if (typeof entry !== "string") continue;
+			if (matchesPackage(entry, name)) return true;
+		}
+	}
+	return false;
+}
+
+function matchesPackage(entry: string, name: string): boolean {
+	const trimmed = entry.trim();
+	if (trimmed === name) return true;
+	const npmMatch = /^npm:(.+?)(?:@[^@/]*)?$/.exec(trimmed);
+	if (npmMatch?.[1] === name) return true;
+	if (trimmed.startsWith("git:") || trimmed.startsWith("http")) {
+		const tail = trimmed.split("/").pop() ?? "";
+		return tail.replace(/\.git$/, "").replace(/@.*$/, "") === name;
+	}
+	return trimmed.replace(/\/+$/, "").split("/").pop() === name;
+}

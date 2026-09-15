@@ -1,0 +1,59 @@
+{
+  "name": "pi-work-programs",
+  "version": "0.1.0",
+  "description": "Work programs for pi: durable, dependency-aware, review-gated multi-card execution driven by a pi extension.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Aladdin Bouzerd",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HommeSauvage/pi-work-programs.git"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "pi-subagents",
+    "work-program",
+    "orchestration"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ],
+    "subagents": {
+      "agents": [
+        "./agents"
+      ]
+    }
+  },
+  "pi-subagents": {
+    "agents": [
+      "./agents"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "check": "bun run typecheck && bun test"
+  },
+  "files": [
+    "src",
+    "resources",
+    "agents",
+    "README.md",
+    "LICENSE",
+    "tsconfig.json"
+  ],
+  "dependencies": {},
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@types/bun": "^1.2.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}

@@ -1,6 +1,6 @@
 {
   "name": "pi-work-programs",
-  "version": "0.4.2",
+  "version": "0.6.1",
   "description": "Work programs for pi: durable, dependency-aware, review-gated multi-card execution driven by a pi extension.",
   "type": "module",
   "license": "MIT",

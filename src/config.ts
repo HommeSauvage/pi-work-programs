@@ -14,7 +14,7 @@ export const DEFAULT_SETTINGS: WorkProgramSettings = {
 	mode: "managed",
 	maxParallel: 2,
 	parallelExecution: "worktrees",
-	review: { agent: "reviewer", profile: "light", maxCycles: 2, onExhausted: "ask" },
+	review: { agent: "reviewer", profile: "light", maxCycles: 3, onExhausted: "ask" },
 	worker: { agent: "worker" },
 	reviewer: {},
 	gates: { card: [], program: [] },

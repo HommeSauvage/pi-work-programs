@@ -233,14 +233,14 @@ describe("runtime config", () => {
 		const { controller, cwd } = await setupProgram();
 		const result = await controller.setConfig({ maxCycles: 1 });
 		expect(result.ok).toBe(true);
-		expect(result.text).toContain("maxCycles 2→1");
+		expect(result.text).toContain("maxCycles 3→1");
 		const ledger = controller.getActive()!.ledger;
 		expect(ledger.maxCycles).toBe(1);
 		const { readFile } = await import("node:fs/promises");
 		const plan = await readFile(join(cwd, ".agents", "work-programs", "test-program", "plan.md"), "utf8");
 		expect(plan).toContain('"maxCycles":1');
 		const progress = await readFile(join(cwd, ".agents", "work-programs", "test-program", "progress.md"), "utf8");
-		expect(progress).toContain("config updated — maxCycles 2→1");
+		expect(progress).toContain("config updated — maxCycles 3→1");
 	});
 
 	test("the change survives a sync from disk", async () => {
@@ -298,9 +298,9 @@ describe("runtime config", () => {
 });
 
 describe("cycle cap without one_more", () => {
-	test("maxCycles defaults to 2", async () => {
+	test("maxCycles defaults to 3", async () => {
 		const { controller } = await setupProgram();
-		expect(controller.getActive()?.ledger.maxCycles).toBe(2);
+		expect(controller.getActive()?.ledger.maxCycles).toBe(3);
 	});
 
 	test("accept lands the card and records the unfixed findings in the card", async () => {

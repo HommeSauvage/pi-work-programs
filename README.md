@@ -66,7 +66,7 @@ pending → ready → implementing → review_pending → reviewing → triaging
 | orchestrator (you, or a captain) | Triages every finding: `approve`, `reject`, or `defer`. Approved findings go back to the same worker. |
 | `reconciler` | Resolves a lane merge conflict preserving both intents, then completes the merge. |
 
-Review/fix cycles are capped (default 2). On exhaustion the program asks a binary decision — `accept` or `block`; there is no "one more round". Accepting records every approved-but-unfixed finding in the card, so landing at the cap never silently drops debt.
+Review/fix cycles are capped (default 3). On exhaustion the program asks a binary decision — `accept` or `block`; there is no "one more round". Accepting records every approved-but-unfixed finding in the card, so landing at the cap never silently drops debt.
 
 ## Orchestration modes
 

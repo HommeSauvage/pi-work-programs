@@ -36,7 +36,7 @@ pending → ready → implementing → review_pending → reviewing → triaging
 - Review findings are advisory. The orchestrator (session agent or card
   captain) approves, rejects, or defers each finding; approved findings are
   handed back to the **same worker** for a fix pass.
-- Review/fix cycles are capped (default **2**); on exhaustion the program asks
+- Review/fix cycles are capped (default **3**); on exhaustion the program asks
   for a decision instead of silently accepting or looping forever. The only
   answers are `accept` and `block` — there is no "one more round". `accept`
   lands the card and records every finding that was approved and never fixed
@@ -139,7 +139,7 @@ plan and card files stay the source of truth; `sync` reconciles.
   around it: `work_program({ action: "config", maxCycles, onExhausted,
   reviewProfile, maxParallel, parallelExecution, mode, workerModel,
   workerThinking, reviewerModel, reviewerThinking })`.
-- `maxCycles` is **review cycles before the harness asks** (default 2). Setting
+- `maxCycles` is **review cycles before the harness asks** (default 3). Setting
   it low does not silence the question — it makes the question arrive sooner.
   The question is binary: `accept` (land it, with the unfixed findings recorded
   on the card) or `block` (park it). Extra review rounds are deliberately not
@@ -150,7 +150,7 @@ plan and card files stay the source of truth; `sync` reconciles.
   the decision.
 - The change applies to the live ledger, is written back into `plan.md`'s
   machine comment (so `sync` and session reload keep it), and lands in
-  `progress.md` as `config updated — maxCycles 2→1`.
+  `progress.md` as `config updated — maxCycles 3→2`.
 - `mode` is still refused while runs are in flight (pause first); every other
   knob applies immediately.
 - Card **scope** is reshaped through the files, not through this action: edit

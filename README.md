@@ -66,7 +66,7 @@ pending → ready → implementing → review_pending → reviewing → triaging
 | orchestrator (you, or a captain) | Triages every finding: `approve`, `reject`, or `defer`. Approved findings go back to the same worker. |
 | `reconciler` | Resolves a lane merge conflict preserving both intents, then completes the merge. |
 
-Review/fix cycles are capped (default 3). On exhaustion the program asks for a decision instead of silently accepting or looping forever.
+Review/fix cycles are capped (default 2). On exhaustion the program asks a binary decision — `accept` or `block`; there is no "one more round". Accepting records every approved-but-unfixed finding in the card, so landing at the cap never silently drops debt.
 
 ## Orchestration modes
 
@@ -89,7 +89,7 @@ Switch any time: `work_program({ action: "mode", mode: "captain" })` or `/work-p
 | List programs | `work_program({ action: "list" })` or `/work-program list` |
 | Triage a review | Answer the decision packet with `work_program({ action: "triage", card, verdicts })` — one verdict per finding |
 | Unblock a card | `work_program({ action: "unblock", card, resolution })` — `redispatch` retries the pending fix when one exists (and re-adopts an abandoned card), `done` marks it finished, `abandon` drops its scope (branch kept, excluded from completion) |
-| Resolve an exhausted cycle | `work_program({ action: "cycle_decision", card, choice })` — `one_more`, `accept`, or `block` |
+| Resolve an exhausted cycle | `work_program({ action: "cycle_decision", card, choice })` — `accept` (land it; unfixed findings recorded on the card) or `block`. Extra review rounds are not offered |
 | Retune a running program | `work_program({ action: "config", maxCycles, onExhausted, reviewProfile, maxParallel, workerModel, reviewerModel, … })` — applies live and persists into plan.md, so it survives sync and reload |
 | Resolve a program gate | `work_program({ action: "program_gate", choice })` — `retry` or `block` |
 | Merge a reconciled lane | `work_program({ action: "merge_resolved", card })` |
@@ -123,6 +123,8 @@ After `finalize_plan`, Pi stops and shows you the plan. That pause is load-beari
 - When every card is `done`, the program completes: the work-program UI goes quiet and the agent delivers a completion summary, then asks whether to close. Close only on your explicit word — `/work-program close --remove` (or `work_program({ action: "close", remove: true })`) deletes the folder and all card lanes; git history keeps every commit. Until then the records stay put and the program never reactivates on its own.
 - Provider/runner blips (502/503/504, admission or capacity outages, runner-startup timeouts) retry in place up to twice before blocking; a review-run failure re-enters review rather than re-running implementation, and a lane that already carries committed work skips the worker entirely.
 - The drive ticks on a 20-second safety timer (plus events) and drains until quiescent, so a merge can never strand the cards it unblocks; `start` on the loaded program resumes it.
+- The drive ticks on a 20-second safety timer (plus events) and drains until quiescent, so a merge can never strand the cards it unblocks; `start` on the loaded program resumes it.
+- Provider/runner blips (502/503/504, admission or capacity outages, runner-startup timeouts) retry in place up to twice before blocking; a review-run failure re-enters review rather than re-running implementation, and a lane that already carries committed work skips the worker entirely.
 - Provider quota/rate-limit failures **hold** the card until the reset time named in the error (parsed and quoted in `progress.md`) instead of raising a decision the supervisor can only answer with "wait". Repeats extend the hold up to a cap; an unknown reset falls back to a normal block.
 - Work that needs human hands lives in `.operator/todo.md` (one `## <stream>` heading per stream; programs use their slug). Workers park items there instead of guessing; open items surface in `status`, `doctor`, and the completion summary, and never block merges or completion.
 

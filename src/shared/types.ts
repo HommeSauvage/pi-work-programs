@@ -88,6 +88,8 @@ export interface CardLedger {
 	holdCount?: number;
 	/** Operator-dropped scope: terminal, kept in records, excluded from completion gating. */
 	abandoned?: boolean;
+	/** Findings approved at the review-cycle cap and carried into the merge unfixed. */
+	acceptedFindings?: string[];
 	updatedAt: number;
 }
 

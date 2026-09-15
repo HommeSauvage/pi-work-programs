@@ -36,8 +36,13 @@ pending → ready → implementing → review_pending → reviewing → triaging
 - Review findings are advisory. The orchestrator (session agent or card
   captain) approves, rejects, or defers each finding; approved findings are
   handed back to the **same worker** for a fix pass.
-- Review/fix cycles are capped; on exhaustion the program asks for a decision
-  instead of silently accepting or looping forever.
+- Review/fix cycles are capped (default **2**); on exhaustion the program asks
+  for a decision instead of silently accepting or looping forever. The only
+  answers are `accept` and `block` — there is no "one more round". `accept`
+  lands the card and records every finding that was approved and never fixed
+  into the card (`## Accepted findings (approved at the review-cycle cap,
+  carried unfixed)`) plus a `progress.md` line, so accepting cannot silently
+  drop real debt into a merge. `block` parks the card for a human.
 
 ## Completion and close-out
 
@@ -108,6 +113,65 @@ plan and card files stay the source of truth; `sync` reconciles.
   left running untouched and reconciles on resume.
 - Both modes are recorded in `progress.md` (what was stopped, what was
   rearmed); resume logs its own line and restarts the drive.
+
+## Retries, blips, and already-committed lanes
+
+- A run that dies on a **provider/runner blip** (runner-startup control
+  timeouts, RPC/socket errors, 502/503/504, "admission is unavailable",
+  overloaded/capacity outages) is retried in place up to 2 times on the same
+  phase — the card is rearmed (`reviewing`→`review_pending`,
+  `implementing`→`pending`, …) and the retry dispatches in the same tick. Past
+  the cap it blocks loudly with the provider's error text. A provider quota
+  error with a reset hint is **held** instead (see Provider quota).
+- A **review-run failure never re-dispatches an implementation worker**:
+  redispatch honors the phase the card blocked from, so a dead reviewer
+  re-enters review.
+- A card whose lane **already carries the committed work** (lane ahead of base
+  and the card record still says `State: review`) skips the worker entirely and
+  goes straight to review — that also prevents the loop where pi-subagents
+  hard-fails a worker for making no edits on already-finished work. If such a
+  worker does fail the no-edit guard, the failure is salvaged the same way
+  (validation-complete) when the lane has commits.
+
+## Retuning a running program
+
+- The orchestrator can change program behaviour mid-flight instead of working
+  around it: `work_program({ action: "config", maxCycles, onExhausted,
+  reviewProfile, maxParallel, parallelExecution, mode, workerModel,
+  workerThinking, reviewerModel, reviewerThinking })`.
+- `maxCycles` is **review cycles before the harness asks** (default 2). Setting
+  it low does not silence the question — it makes the question arrive sooner.
+  The question is binary: `accept` (land it, with the unfixed findings recorded
+  on the card) or `block` (park it). Extra review rounds are deliberately not
+  offerable.
+- `onExhausted` pre-answers the question: `"accept"` approves exhausted cards —
+  recording their unfixed findings — and resolves any **open** cycle decisions
+  in the same call; `"block"` pre-answers with a park; `"ask"` (default) raises
+  the decision.
+- The change applies to the live ledger, is written back into `plan.md`'s
+  machine comment (so `sync` and session reload keep it), and lands in
+  `progress.md` as `config updated — maxCycles 2→1`.
+- `mode` is still refused while runs are in flight (pause first); every other
+  knob applies immediately.
+- Card **scope** is reshaped through the files, not through this action: edit
+  the card/plan text (fold, rewire `Depends on:`, delete or add cards) and run
+  `sync` — see Reshaping the program.
+
+## Drive and scheduling
+
+- The drive is event-driven (session start, run completions, operator actions)
+  **and** ticks on a 20-second safety timer while a program is active, so a
+  missed event can never freeze a live program with a healthy-looking board.
+- One tick drains until quiescent: a merge that frees dependencies dispatches
+  the dependent cards in the same tick, and the merge queue drains instead of
+  advancing one card per event.
+- `start` on the already-loaded program means "get moving" and behaves as
+  `resume`; asking to start a *different* program names the loaded one and how
+  to switch.
+- Legacy tombstones (cards abandoned before the `abandoned` flag existed, i.e.
+  `blocked` with "abandoned by operator") count as dropped scope: they do not
+  block completion, and `sync` removes them when they hold no lane and no live
+  dependents.
 
 ## Evidence
 

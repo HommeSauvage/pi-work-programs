@@ -80,6 +80,24 @@ export interface ActiveProgram {
 	ledger: ProgramLedger;
 }
 
+/**
+ * Append the findings accepted at the cycle cap to the card record. Additive and
+ * idempotent: the block is replaced if it already exists, so a re-accept does not
+ * stack duplicates.
+ */
+export function appendAcceptedFindings(cardText: string, findings: string[]): string {
+	const block = [
+		"",
+		"## Accepted findings (approved at the review-cycle cap, carried unfixed)",
+		"",
+		...findings.map((finding) => `- ${finding}`),
+		"",
+	].join("\n");
+	const existing = /\n## Accepted findings \(approved at the review-cycle cap, carried unfixed\)[\s\S]*?(?=\n## |$)/;
+	if (existing.test(cardText)) return cardText.replace(existing, block.trimEnd());
+	return `${cardText.trimEnd()}\n${block}`;
+}
+
 /** Runtime knobs an orchestrator may retune while the program runs. */
 export interface ProgramConfigPatch {
 	mode?: Mode;
@@ -1050,11 +1068,24 @@ export class WorkProgramController {
 		return { ok: true, text: `Card ${cardId}: ${resolution}.` };
 	}
 
-	async cycleDecision(cardId: string, choice: "one_more" | "accept" | "block"): Promise<ActionResult> {
+	async cycleDecision(cardId: string, choice: "accept" | "block"): Promise<ActionResult> {
 		if (!this.active) return { ok: false, text: "No active work program." };
 		const result = applyCycleDecision(this, cardId, choice);
 		if (!result.ok) return { ok: false, text: result.error ?? "cycle decision failed" };
-		await appendProgress(this.active.absDir, `[card ${cardId}] cycle decision: ${choice}`);
+		const card = this.active.ledger.cards[cardId];
+		if (choice === "accept" && card?.acceptedFindings !== undefined && card.acceptedFindings.length > 0) {
+			// Keep the accepted debt in the card record, not just the ledger.
+			const text = (await readTextOrUndefined(this.cardFilePath(card))) ?? "";
+			if (text.trim().length > 0) {
+				await writeTextAtomic(this.cardFilePath(card), appendAcceptedFindings(text, card.acceptedFindings));
+			}
+			await appendProgress(
+				this.active.absDir,
+				`[card ${cardId}] cycle decision: accept — ${card.acceptedFindings.length} approved finding(s) carried unfixed`,
+			);
+		} else {
+			await appendProgress(this.active.absDir, `[card ${cardId}] cycle decision: ${choice}`);
+		}
 		await this.save();
 		this.scheduleDrive();
 		return { ok: true, text: `Card ${cardId}: ${choice}.` };

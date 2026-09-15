@@ -233,14 +233,14 @@ describe("runtime config", () => {
 		const { controller, cwd } = await setupProgram();
 		const result = await controller.setConfig({ maxCycles: 1 });
 		expect(result.ok).toBe(true);
-		expect(result.text).toContain("maxCycles 3→1");
+		expect(result.text).toContain("maxCycles 2→1");
 		const ledger = controller.getActive()!.ledger;
 		expect(ledger.maxCycles).toBe(1);
 		const { readFile } = await import("node:fs/promises");
 		const plan = await readFile(join(cwd, ".agents", "work-programs", "test-program", "plan.md"), "utf8");
 		expect(plan).toContain('"maxCycles":1');
 		const progress = await readFile(join(cwd, ".agents", "work-programs", "test-program", "progress.md"), "utf8");
-		expect(progress).toContain("config updated — maxCycles 3→1");
+		expect(progress).toContain("config updated — maxCycles 2→1");
 	});
 
 	test("the change survives a sync from disk", async () => {
@@ -265,8 +265,8 @@ describe("runtime config", () => {
 			{
 				kind: "cycle-exhausted",
 				card: "01",
-				message: "Card 01 has used all 3 review cycles and findings are still open.",
-				expectedAction: 'work_program({ action: "cycle_decision", card: "01", choice: "one_more" | "accept" | "block" })',
+				message: "Card 01 has used all 2 review cycles and findings are still open.",
+				expectedAction: 'work_program({ action: "cycle_decision", card: "01", choice: "accept" | "block" })',
 			},
 		);
 		const result = await controller.setConfig({ onExhausted: "accept" });
@@ -294,6 +294,84 @@ describe("runtime config", () => {
 		const applied = await controller.setConfig({ maxParallel: 1 });
 		expect(applied.ok).toBe(true);
 		expect(controller.getActive()!.ledger.maxParallel).toBe(1);
+	});
+});
+
+describe("cycle cap without one_more", () => {
+	test("maxCycles defaults to 2", async () => {
+		const { controller } = await setupProgram();
+		expect(controller.getActive()?.ledger.maxCycles).toBe(2);
+	});
+
+	test("accept lands the card and records the unfixed findings in the card", async () => {
+		const { controller, cwd } = await setupProgram();
+		const ledger = controller.getActive()!.ledger;
+		const card = ledger.cards["01"]!;
+		card.phase = "triaging";
+		card.cycles = 2;
+		const { createDecision, resolveDecision } = await import("../src/engine/decisions.ts");
+		const triage = createDecision(
+			{ programDir: "/prog", ledger },
+			{
+				kind: "review-triage",
+				card: "01",
+				message: "Card 01 review 2 (light) is ready for triage.",
+				expectedAction: 'work_program({ action: "triage", card: "01", verdicts: [] })',
+			},
+		);
+		resolveDecision({ programDir: "/prog", ledger }, triage.id, {
+			verdicts: [
+				{ finding: "P1 — accepted debt: reversible address hash", verdict: "approve" },
+				{ finding: "P2 — nits", verdict: "reject" },
+			],
+		});
+		const cycle = createDecision(
+			{ programDir: "/prog", ledger },
+			{
+				kind: "cycle-exhausted",
+				card: "01",
+				summary: "1 approved finding(s) remain",
+				message: "Card 01 has used all 2 review cycles and findings are still open.",
+				expectedAction: 'work_program({ action: "cycle_decision", card: "01", choice: "accept" | "block" })',
+			},
+		);
+		expect(cycle.kind).toBe("cycle-exhausted");
+
+		const result = await controller.cycleDecision("01", "accept");
+		expect(result.ok).toBe(true);
+		expect(card.acceptedFindings).toEqual(["P1 — accepted debt: reversible address hash"]);
+		const { readFile } = await import("node:fs/promises");
+		const cardText = await readFile(
+			join(cwd, ".agents", "work-programs", "test-program", "tasks", "01-card.md"),
+			"utf8",
+		);
+		expect(cardText).toContain("## Accepted findings (approved at the review-cycle cap, carried unfixed)");
+		expect(cardText).toContain("reversible address hash");
+		expect(cardText).not.toContain("nits");
+		const progress = await readFile(join(cwd, ".agents", "work-programs", "test-program", "progress.md"), "utf8");
+		expect(progress).toContain("cycle decision: accept — 1 approved finding(s) carried unfixed");
+	});
+
+	test("block still parks the card", async () => {
+		const { controller } = await setupProgram();
+		const ledger = controller.getActive()!.ledger;
+		const card = ledger.cards["01"]!;
+		card.phase = "triaging";
+		card.cycles = 2;
+		const { createDecision } = await import("../src/engine/decisions.ts");
+		createDecision(
+			{ programDir: "/prog", ledger },
+			{
+				kind: "cycle-exhausted",
+				card: "01",
+				message: "Card 01 has used all 2 review cycles and findings are still open.",
+				expectedAction: 'work_program({ action: "cycle_decision", card: "01", choice: "accept" | "block" })',
+			},
+		);
+		const result = await controller.cycleDecision("01", "block");
+		expect(result.ok).toBe(true);
+		expect(card.phase as string).toBe("blocked");
+		expect(card.acceptedFindings).toBeUndefined();
 	});
 });
 

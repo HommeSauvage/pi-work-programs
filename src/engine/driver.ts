@@ -1544,7 +1544,7 @@ export function applyTriage(host: DriverHost, cardId: string, verdicts: FindingV
 			card: cardId,
 			summary: `${approved.length} approved finding(s) remain`,
 			message: cycleDecisionMessage(cardId, host.ledger.maxCycles),
-			expectedAction: `work_program({ action: "cycle_decision", card: "${cardId}", choice: "one_more" | "accept" | "block" })`,
+			expectedAction: `work_program({ action: "cycle_decision", card: "${cardId}", choice: "accept" | "block" })`,
 		});
 		return { ok: true };
 	}
@@ -1661,10 +1661,23 @@ export async function applyUnblock(
 	return { ok: true };
 }
 
+/**
+ * Approved findings from the card's most recent triage — the debt that an
+ * `accept` at the cycle cap leaves unfixed. Recorded on the card so the merge
+ * keeps the record instead of quietly dropping it.
+ */
+function unfixedApprovedFindings(host: DriverHost, cardId: string): string[] {
+	const latest = [...host.ledger.decisions]
+		.reverse()
+		.find((entry) => entry.card === cardId && entry.kind === "review-triage" && entry.status === "resolved");
+	const verdicts = latest?.verdicts ?? [];
+	return verdicts.filter((verdict) => verdict.verdict === "approve").map((verdict) => verdict.finding);
+}
+
 export function applyCycleDecision(
 	host: DriverHost,
 	cardId: string,
-	choice: "one_more" | "accept" | "block",
+	choice: "accept" | "block",
 ): { ok: boolean; error?: string } {
 	const card = host.ledger.cards[cardId];
 	if (!card) return { ok: false, error: `unknown card ${cardId}` };
@@ -1673,12 +1686,11 @@ export function applyCycleDecision(
 		return { ok: false, error: `card ${cardId} has no open cycle decision (${describeOpenDecisions(host.ledger, cardId)})` };
 	}
 	resolveDecision(host, decision.id);
-	if (choice === "one_more") {
-		card.phase = "fixing";
-		card.infraRetries = 0;
-		return { ok: true };
-	}
 	if (choice === "accept") {
+		// No further review rounds: land the card, but record the findings that were
+		// approved and never fixed, so accepting at the cap cannot silently drop
+		// real debt into a merge.
+		card.acceptedFindings = unfixedApprovedFindings(host, cardId);
 		card.phase = "approved";
 		return { ok: true };
 	}

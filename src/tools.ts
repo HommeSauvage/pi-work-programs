@@ -122,7 +122,7 @@ export function registerTools(pi: ExtensionAPI, controller: WorkProgramControlle
 			mode: Type.Optional(Type.String({ description: "session | managed | captain" })),
 			resolution: Type.Optional(Type.String({ description: "unblock resolution: redispatch | done | abandon" })),
 			choice: Type.Optional(
-				Type.String({ description: "cycle_decision: one_more | accept | block; program_gate: retry | block" }),
+				Type.String({ description: "cycle_decision: accept | block (no extra review rounds); program_gate: retry | block" }),
 			),
 			remove: Type.Optional(Type.Boolean({ description: "close with remove=true deletes the program folder" })),
 			hard: Type.Optional(
@@ -280,12 +280,12 @@ export function registerTools(pi: ExtensionAPI, controller: WorkProgramControlle
 				}
 				case "cycle_decision": {
 					if (!params.card || !params.choice) fail("cycle_decision requires card and choice");
-					if (!["one_more", "accept", "block"].includes(params.choice)) {
-						fail("choice must be one_more | accept | block");
+					if (!["accept", "block"].includes(params.choice)) {
+						fail("choice must be accept | block (extra review rounds are not offered)");
 					}
 					const result = await controller.cycleDecision(
 						params.card,
-						params.choice as "one_more" | "accept" | "block",
+						params.choice as "accept" | "block",
 					);
 					if (!result.ok) fail(result.text);
 					return textResult(result.text, { ok: true });

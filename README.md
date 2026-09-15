@@ -90,6 +90,7 @@ Switch any time: `work_program({ action: "mode", mode: "captain" })` or `/work-p
 | Triage a review | Answer the decision packet with `work_program({ action: "triage", card, verdicts })` — one verdict per finding |
 | Unblock a card | `work_program({ action: "unblock", card, resolution })` — `redispatch` retries the pending fix when one exists (and re-adopts an abandoned card), `done` marks it finished, `abandon` drops its scope (branch kept, excluded from completion) |
 | Resolve an exhausted cycle | `work_program({ action: "cycle_decision", card, choice })` — `one_more`, `accept`, or `block` |
+| Retune a running program | `work_program({ action: "config", maxCycles, onExhausted, reviewProfile, maxParallel, workerModel, reviewerModel, … })` — applies live and persists into plan.md, so it survives sync and reload |
 | Resolve a program gate | `work_program({ action: "program_gate", choice })` — `retry` or `block` |
 | Merge a reconciled lane | `work_program({ action: "merge_resolved", card })` |
 | Dispatch manually (session mode) | `work_program({ action: "dispatch", card, role })` — `worker`, `reviewer`, or `reconciler` |

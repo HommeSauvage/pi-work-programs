@@ -22,6 +22,15 @@ interface WorkProgramParams {
 	choice?: string;
 	remove?: boolean;
 	hard?: boolean;
+	maxCycles?: number;
+	onExhausted?: string;
+	reviewProfile?: string;
+	maxParallel?: number;
+	parallelExecution?: string;
+	workerModel?: string;
+	workerThinking?: string;
+	reviewerModel?: string;
+	reviewerThinking?: string;
 	verdicts?: Array<{ finding: string; verdict: string; note?: string }>;
 }
 
@@ -42,6 +51,7 @@ const ACTIONS = [
 	"cycle_decision",
 	"program_gate",
 	"merge_resolved",
+	"config",
 	"close",
 	"doctor",
 ] as const;
@@ -92,13 +102,14 @@ export function registerTools(pi: ExtensionAPI, controller: WorkProgramControlle
 		name: "work_program",
 		label: "Work Program",
 		description:
-			"Drive and inspect the active work program. Actions: status, protocol, list, create, start, finalize_plan, sync, pause, resume, mode, dispatch, triage, unblock, cycle_decision, program_gate, merge_resolved, close, doctor.",
+			"Drive and inspect the active work program. Actions: status, protocol, list, create, start, finalize_plan, sync, pause, resume, mode, config, dispatch, triage, unblock, cycle_decision, program_gate, merge_resolved, close, doctor.",
 		promptSnippet: "Inspect or drive the active work program (status, dispatch, triage, finalize plan)",
 		promptGuidelines: [
 			"Use work_program to inspect and drive a work program; never edit plan.md or progress.md directly.",
 			"finalize_plan only validates and stages a program — it never starts execution. After writing a plan, STOP and wait for the operator to review; only call resume/start/dispatch after the operator explicitly says to start.",
 			"When a work program completes, you receive a summary packet: reply with a completion summary, then ask whether to close the program. Only call close with remove:true after the operator explicitly confirms — never delete program records unprompted.",
 			"Pause is soft by default (in-flight runs finish, resume reconciles); pass hard:true to stop runs immediately and rearm their cards. Resume restarts the drive.",
+			"The program is retunable while it runs: work_program({ action: \"config\", maxCycles, onExhausted, reviewProfile, maxParallel, parallelExecution, workerModel, reviewerModel }) updates the live ledger and persists into plan.md, so it survives sync and reload. Use it instead of answering cycle decisions one by one (onExhausted: \"accept\" also resolves the open ones), and instead of editing plan.md by hand.",
 			"When a work-program decision packet arrives, answer with the exact work_program call it names (for review triage use action 'triage' with one verdict per finding).",
 		],
 		parameters: Type.Object({
@@ -117,6 +128,19 @@ export function registerTools(pi: ExtensionAPI, controller: WorkProgramControlle
 			hard: Type.Optional(
 				Type.Boolean({ description: "pause with hard=true stops in-flight runs immediately (default soft: let them finish)" }),
 			),
+			maxCycles: Type.Optional(
+				Type.Number({ description: "config: review cycles before the harness asks (0-32); lowering it applies to the next triage" }),
+			),
+			onExhausted: Type.Optional(
+				Type.String({ description: "config: ask | accept | block when maxCycles is reached; accept also resolves open cycle decisions" }),
+			),
+			reviewProfile: Type.Optional(Type.String({ description: "config: light | enhanced review profile" })),
+			maxParallel: Type.Optional(Type.Number({ description: "config: how many cards may run at once (1-32)" })),
+			parallelExecution: Type.Optional(Type.String({ description: "config: worktrees | direct" })),
+			workerModel: Type.Optional(Type.String({ description: "config: model for worker runs" })),
+			workerThinking: Type.Optional(Type.String({ description: "config: thinking level for worker runs" })),
+			reviewerModel: Type.Optional(Type.String({ description: "config: model for reviewer runs" })),
+			reviewerThinking: Type.Optional(Type.String({ description: "config: thinking level for reviewer runs" })),
 			verdicts: Type.Optional(
 				Type.Array(
 					Type.Object({
@@ -198,6 +222,22 @@ export function registerTools(pi: ExtensionAPI, controller: WorkProgramControlle
 						fail("mode action requires mode: session | managed | captain");
 					}
 					const result = await controller.setMode(params.mode as Mode);
+					if (!result.ok) fail(result.text);
+					return textResult(result.text, { ok: true });
+				}
+				case "config": {
+					const patch: Record<string, unknown> = {};
+					if (params.maxCycles !== undefined) patch.maxCycles = params.maxCycles;
+					if (params.onExhausted !== undefined) patch.onExhausted = params.onExhausted;
+					if (params.reviewProfile !== undefined) patch.reviewProfile = params.reviewProfile;
+					if (params.maxParallel !== undefined) patch.maxParallel = params.maxParallel;
+					if (params.parallelExecution !== undefined) patch.parallelExecution = params.parallelExecution;
+					if (params.mode !== undefined) patch.mode = params.mode;
+					if (params.workerModel !== undefined) patch.workerModel = params.workerModel;
+					if (params.workerThinking !== undefined) patch.workerThinking = params.workerThinking;
+					if (params.reviewerModel !== undefined) patch.reviewerModel = params.reviewerModel;
+					if (params.reviewerThinking !== undefined) patch.reviewerThinking = params.reviewerThinking;
+					const result = await controller.setConfig(patch as Parameters<typeof controller.setConfig>[0]);
 					if (!result.ok) fail(result.text);
 					return textResult(result.text, { ok: true });
 				}

@@ -228,6 +228,75 @@ describe("soft and hard pause", () => {
 	});
 });
 
+describe("runtime config", () => {
+	test("lowers maxCycles, records it, and persists it into plan.md", async () => {
+		const { controller, cwd } = await setupProgram();
+		const result = await controller.setConfig({ maxCycles: 1 });
+		expect(result.ok).toBe(true);
+		expect(result.text).toContain("maxCycles 3→1");
+		const ledger = controller.getActive()!.ledger;
+		expect(ledger.maxCycles).toBe(1);
+		const { readFile } = await import("node:fs/promises");
+		const plan = await readFile(join(cwd, ".agents", "work-programs", "test-program", "plan.md"), "utf8");
+		expect(plan).toContain('"maxCycles":1');
+		const progress = await readFile(join(cwd, ".agents", "work-programs", "test-program", "progress.md"), "utf8");
+		expect(progress).toContain("config updated — maxCycles 3→1");
+	});
+
+	test("the change survives a sync from disk", async () => {
+		const { controller } = await setupProgram();
+		await controller.setConfig({ maxCycles: 1, reviewProfile: "enhanced" });
+		const synced = await controller.syncFromDisk();
+		expect(synced.ok).toBe(true);
+		const ledger = controller.getActive()!.ledger;
+		expect(ledger.maxCycles).toBe(1);
+		expect(ledger.reviewProfile).toBe("enhanced");
+	});
+
+	test("onExhausted accept resolves an open cycle decision in bulk", async () => {
+		const { controller } = await setupProgram();
+		const ledger = controller.getActive()!.ledger;
+		const card = ledger.cards["01"]!;
+		card.phase = "triaging";
+		card.cycles = 3;
+		const { createDecision } = await import("../src/engine/decisions.ts");
+		createDecision(
+			{ programDir: "/prog", ledger },
+			{
+				kind: "cycle-exhausted",
+				card: "01",
+				message: "Card 01 has used all 3 review cycles and findings are still open.",
+				expectedAction: 'work_program({ action: "cycle_decision", card: "01", choice: "one_more" | "accept" | "block" })',
+			},
+		);
+		const result = await controller.setConfig({ onExhausted: "accept" });
+		expect(result.ok).toBe(true);
+		expect(result.text).toContain("Accepted 1 open cycle decision(s)");
+		expect(ledger.onExhausted).toBe("accept");
+		expect(ledger.decisions.find((entry) => entry.kind === "cycle-exhausted")?.status).toBe("resolved");
+		expect(card.phase as string).toBe("approved");
+	});
+
+	test("rejects nonsense and unrelated keys", async () => {
+		const { controller } = await setupProgram();
+		expect((await controller.setConfig({ maxCycles: 99 })).ok).toBe(false);
+		expect((await controller.setConfig({ reviewProfile: "deep" as never })).ok).toBe(false);
+		expect((await controller.setConfig({})).ok).toBe(false);
+	});
+
+	test("mode is refused while a run is in flight, other knobs still apply", async () => {
+		const { controller } = await setupProgram();
+		const card = controller.getActive()!.ledger.cards["01"]!;
+		card.activeRun = { kind: "worker", runId: "run-1", startedAt: Date.now() };
+		const blocked = await controller.setConfig({ mode: "captain" });
+		expect(blocked.ok).toBe(false);
+		expect(blocked.text).toContain("in flight");
+		const applied = await controller.setConfig({ maxParallel: 1 });
+		expect(applied.ok).toBe(true);
+		expect(controller.getActive()!.ledger.maxParallel).toBe(1);
+	});
+});
+
 describe("completion and close-out", () => {
 	test("close refuses while any card is pending — even with remove", async () => {
 		const { controller } = await setupProgram();

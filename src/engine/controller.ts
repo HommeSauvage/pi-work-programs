@@ -2,7 +2,17 @@ import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { DECISION_CUSTOM_TYPE, DRIVE_TICK_MS, SESSION_ENTRY_TYPE } from "../constants.ts";
-import { DEFAULT_SETTINGS, applyOverrides, formatPlanConfig, isPackageConfigured, loadSettings } from "../config.ts";
+import {
+	DEFAULT_SETTINGS,
+	applyOverrides,
+	formatPlanConfig,
+	isMode,
+	isPackageConfigured,
+	isParallelExecution,
+	isReviewProfile,
+	loadSettings,
+	mergePlanConfig,
+} from "../config.ts";
 import { buildBrief, planInstructions } from "../brief.ts";
 import { loadResources } from "../protocol/resources.ts";
 import {
@@ -26,6 +36,7 @@ import { formatProblems, validatePlanFiles } from "../program/validate.ts";
 import { defaultWorktreeDir } from "../shared/paths.ts";
 import { oneLine, slugify, formatAgo, formatDuration } from "../shared/text.ts";
 import { readTextOrUndefined, writeTextAtomic } from "../shared/fsx.ts";
+import { PLAN_FILE } from "../constants.ts";
 import {
 	ensureOperatorTodoFile,
 	operatorTodoPath,
@@ -38,8 +49,10 @@ import type {
 	DriverPorts,
 	FindingVerdict,
 	Mode,
+	ParallelExecution,
 	ProgramConfigOverrides,
 	ProgramLedger,
+	ReviewProfile,
 	WorkProgramSettings,
 } from "../shared/types.ts";
 import {
@@ -54,7 +67,7 @@ import {
 	rearmPackets,
 	rearmPausedCards,
 } from "./driver.ts";
-import { createDecision } from "./decisions.ts";
+import { createDecision, resolveDecision } from "./decisions.ts";
 import { counts, isAbandonedCard, isHeld, openDecisionFor, openDecisions, phaseSymbol } from "./phases.ts";
 import { Git } from "../platform/git.ts";
 import { Gates } from "../platform/gates.ts";
@@ -65,6 +78,20 @@ export interface ActiveProgram {
 	slug: string;
 	absDir: string;
 	ledger: ProgramLedger;
+}
+
+/** Runtime knobs an orchestrator may retune while the program runs. */
+export interface ProgramConfigPatch {
+	mode?: Mode;
+	reviewProfile?: ReviewProfile;
+	maxCycles?: number;
+	onExhausted?: "ask" | "accept" | "block";
+	maxParallel?: number;
+	parallelExecution?: ParallelExecution;
+	workerModel?: string;
+	workerThinking?: string;
+	reviewerModel?: string;
+	reviewerThinking?: string;
 }
 
 export interface ActionResult {
@@ -736,6 +763,132 @@ export class WorkProgramController {
 		await appendProgress(this.active.absDir, `mode changed to ${mode}`);
 		this.refreshUi();
 		return { ok: true, text: `Mode set to ${mode}.` };
+	}
+
+	/**
+	 * Retune a running program: review rounds, profile, parallelism, mode, models.
+	 * Applies to the live ledger, persists into the plan's machine comment (so
+	 * `sync` and reload keep it), records a progress line, and — when
+	 * `onExhausted: "accept"` is set — resolves open cycle decisions instead of
+	 * making the orchestrator answer them one by one.
+	 */
+	async setConfig(patch: ProgramConfigPatch): Promise<ActionResult> {
+		if (!this.active) return { ok: false, text: "No active work program." };
+		const ledger = this.active.ledger;
+		const overrides: ProgramConfigOverrides = {};
+		const changes: string[] = [];
+		if (patch.mode !== undefined) {
+			if (!isMode(patch.mode)) return { ok: false, text: `mode must be session | managed | captain` };
+			const busy = Object.values(ledger.cards).some((card) => card.activeRun);
+			if (busy && patch.mode !== ledger.mode) {
+				return { ok: false, text: "Cannot change mode while runs are in flight; pause first (or set the other knobs)." };
+			}
+			if (patch.mode !== ledger.mode) changes.push(`mode ${ledger.mode}→${patch.mode}`);
+			overrides.mode = patch.mode;
+		}
+		if (patch.reviewProfile !== undefined) {
+			if (!isReviewProfile(patch.reviewProfile)) return { ok: false, text: "reviewProfile must be light | enhanced" };
+			if (patch.reviewProfile !== ledger.reviewProfile) {
+				changes.push(`reviewProfile ${ledger.reviewProfile}→${patch.reviewProfile}`);
+			}
+			overrides.reviewProfile = patch.reviewProfile;
+		}
+		if (patch.maxCycles !== undefined) {
+			const cycles = Math.floor(patch.maxCycles);
+			if (!Number.isFinite(cycles) || cycles < 0 || cycles > 32) {
+				return { ok: false, text: "maxCycles must be a number between 0 and 32" };
+			}
+			if (cycles !== ledger.maxCycles) changes.push(`maxCycles ${ledger.maxCycles}→${cycles}`);
+			overrides.maxCycles = cycles;
+		}
+		if (patch.onExhausted !== undefined) {
+			if (patch.onExhausted !== "ask" && patch.onExhausted !== "accept" && patch.onExhausted !== "block") {
+				return { ok: false, text: "onExhausted must be ask | accept | block" };
+			}
+			if (patch.onExhausted !== ledger.onExhausted) {
+				changes.push(`onExhausted ${ledger.onExhausted}→${patch.onExhausted}`);
+			}
+		}
+		if (patch.maxParallel !== undefined) {
+			const parallel = Math.floor(patch.maxParallel);
+			if (!Number.isFinite(parallel) || parallel < 1 || parallel > 32) {
+				return { ok: false, text: "maxParallel must be between 1 and 32" };
+			}
+			if (parallel !== ledger.maxParallel) changes.push(`maxParallel ${ledger.maxParallel}→${parallel}`);
+			overrides.maxParallel = parallel;
+		}
+		if (patch.parallelExecution !== undefined) {
+			if (!isParallelExecution(patch.parallelExecution)) {
+				return { ok: false, text: "parallelExecution must be worktrees | direct" };
+			}
+			if (patch.parallelExecution !== ledger.parallelExecution) {
+				changes.push(`parallelExecution ${ledger.parallelExecution}→${patch.parallelExecution}`);
+			}
+			overrides.parallelExecution = patch.parallelExecution;
+		}
+		if (patch.workerModel !== undefined) {
+			changes.push(`workerModel ${ledger.workerModel ?? "(default)"}→${patch.workerModel}`);
+			overrides.workerModel = patch.workerModel;
+		}
+		if (patch.workerThinking !== undefined) {
+			changes.push(`workerThinking ${ledger.workerThinking ?? "(default)"}→${patch.workerThinking}`);
+			overrides.workerThinking = patch.workerThinking;
+		}
+		if (patch.reviewerModel !== undefined) {
+			changes.push(`reviewerModel ${ledger.reviewerModel ?? "(default)"}→${patch.reviewerModel}`);
+			overrides.reviewerModel = patch.reviewerModel;
+		}
+		if (patch.reviewerThinking !== undefined) {
+			changes.push(`reviewerThinking ${ledger.reviewerThinking ?? "(default)"}→${patch.reviewerThinking}`);
+			overrides.reviewerThinking = patch.reviewerThinking;
+		}
+		if (Object.keys(overrides).length === 0 && patch.onExhausted === undefined) {
+			return { ok: false, text: "Nothing to change; pass at least one of maxCycles, onExhausted, reviewProfile, maxParallel, parallelExecution, mode, workerModel, workerThinking, reviewerModel, reviewerThinking." };
+		}
+
+		// Apply to the live ledger via the same normalization the plan path uses.
+		const settings = applyOverrides(this.settings, overrides);
+		if (overrides.mode) ledger.mode = settings.mode;
+		if (overrides.maxParallel !== undefined) ledger.maxParallel = settings.maxParallel;
+		if (overrides.parallelExecution) ledger.parallelExecution = settings.parallelExecution;
+		if (overrides.reviewProfile) ledger.reviewProfile = settings.review.profile;
+		if (overrides.maxCycles !== undefined) ledger.maxCycles = settings.review.maxCycles;
+		if (patch.onExhausted !== undefined) ledger.onExhausted = patch.onExhausted;
+		if (patch.workerModel !== undefined) ledger.workerModel = patch.workerModel;
+		if (patch.workerThinking !== undefined) ledger.workerThinking = patch.workerThinking;
+		if (patch.reviewerModel !== undefined) ledger.reviewerModel = patch.reviewerModel;
+		if (patch.reviewerThinking !== undefined) ledger.reviewerThinking = patch.reviewerThinking;
+
+		// Persist into the plan so sync/reload keep the change.
+		const planText = await readPlan(this.active.absDir);
+		if (planText.trim().length > 0) {
+			await writeTextAtomic(join(this.active.absDir, PLAN_FILE), mergePlanConfig(planText, overrides));
+		}
+
+		// Accept-on-exhaustion makes pending cycle decisions answerable in bulk.
+		let accepted = 0;
+		if (patch.onExhausted === "accept") {
+			for (const decision of openDecisions(ledger)) {
+				if (decision.kind !== "cycle-exhausted" || !decision.card) continue;
+				const card = ledger.cards[decision.card];
+				if (!card || card.phase !== "triaging") continue;
+				resolveDecision(this, decision.id);
+				card.phase = "approved";
+				accepted += 1;
+			}
+		}
+
+		await this.save();
+		await appendProgress(
+			this.active.absDir,
+			`config updated — ${changes.length > 0 ? changes.join(", ") : "(no effective change)"}${accepted > 0 ? `; ${accepted} open cycle decision(s) accepted` : ""}`,
+		);
+		this.refreshUi();
+		this.scheduleDrive();
+		return {
+			ok: true,
+			text: `Config updated: ${changes.length > 0 ? changes.join(", ") : "(no effective change)"}.${accepted > 0 ? ` Accepted ${accepted} open cycle decision(s).` : ""}`,
+		};
 	}
 
 	async statusText(): Promise<string> {

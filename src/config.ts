@@ -214,3 +214,50 @@ function matchesPackage(entry: string, name: string): boolean {
 	}
 	return trimmed.replace(/\/+$/, "").split("/").pop() === name;
 }
+
+/**
+ * Merge a runtime config patch into the plan's machine comment so the change
+ * survives `sync` and session reload. Unknown keys already in the comment are
+ * preserved; the patch wins where it speaks.
+ */
+export function mergePlanConfig(planText: string, patch: ProgramConfigOverrides): string {
+	const existing = parsePlanConfig(planText);
+	const current: ProgramConfigOverrides = {};
+	if (isMode(existing.mode)) current.mode = existing.mode;
+	if (typeof existing.maxParallel === "number") current.maxParallel = existing.maxParallel;
+	if (isParallelExecution(existing.parallelExecution)) current.parallelExecution = existing.parallelExecution;
+	if (typeof existing.laneBranchPattern === "string") current.laneBranchPattern = existing.laneBranchPattern;
+	const review = isPlainRecord(existing.review) ? existing.review : undefined;
+	const worker = isPlainRecord(existing.worker) ? existing.worker : undefined;
+	const reviewer = isPlainRecord(existing.reviewer) ? existing.reviewer : undefined;
+	const profile = asString(review?.profile) ?? asString(existing.reviewProfile);
+	if (profile && isReviewProfile(profile)) current.reviewProfile = profile;
+	const maxCycles = asNumber(review?.maxCycles) ?? asNumber(existing.maxCycles);
+	if (maxCycles !== undefined) current.maxCycles = maxCycles;
+	if (worker) {
+		const agent = asString(worker.agent);
+		if (agent) current.workerAgent = agent;
+		const model = asString(worker.model);
+		if (model) current.workerModel = model;
+		const thinking = asString(worker.thinking);
+		if (thinking) current.workerThinking = thinking;
+	}
+	if (reviewer) {
+		const model = asString(reviewer.model);
+		if (model) current.reviewerModel = model;
+		const thinking = asString(reviewer.thinking);
+		if (thinking) current.reviewerThinking = thinking;
+	}
+	const merged: ProgramConfigOverrides = { ...current, ...patch };
+	const comment = formatPlanConfig(merged);
+	const match = CONFIG_COMMENT_RE.exec(planText.slice(0, 8_192));
+	if (!match) {
+		// No comment yet: put one on the first line, keeping the title below.
+		return `${comment}\n${planText}`;
+	}
+	return planText.replace(CONFIG_COMMENT_RE, comment);
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}

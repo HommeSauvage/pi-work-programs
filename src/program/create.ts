@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { PLAN_FILE, PROGRESS_FILE, RUNTIME_DIR, RUNTIME_GITIGNORE, TASKS_DIR } from "../constants.ts";
 import { ensureDir, listDirectory, pathExists, readText, writeTextAtomic } from "../shared/fsx.ts";
-import type { ParsedCard, ProgramLedger, WorkProgramSettings } from "../shared/types.ts";
+import type { CardLedger, ParsedCard, ProgramLedger, WorkProgramSettings } from "../shared/types.ts";
 import { compareCardIds, cardFromParsed, saveLedger } from "./ledger.ts";
 import { resolveProgramDir } from "../shared/paths.ts";
 import { loadResources } from "../protocol/resources.ts";
@@ -134,7 +134,32 @@ export async function appendProgress(absDir: string, line: string): Promise<void
 }
 
 /** Merge on-disk card records into the ledger without clobbering runtime state. */
-export function syncCards(ledger: ProgramLedger, parsedCards: ParsedCard[], planText: string): string[] {
+export interface RemovedCardDecision {
+	drop: boolean;
+	reason?: string;
+	note?: string;
+}
+
+export interface SyncCardsOptions {
+	/**
+	 * Policy for a card file that disappeared from the plan. Omitted = legacy
+	 * behavior (mark blocked, keep the ledger row).
+	 */
+	onRemoved?: (card: CardLedger) => Promise<RemovedCardDecision>;
+}
+
+/**
+ * Reconcile the ledger with the plan + card files on disk. Adoption and
+ * field updates always apply; removals follow `options.onRemoved` so a
+ * collapse (fold scope into survivors, rewire deps, delete files, sync) can
+ * drop cards without hand-editing the ledger.
+ */
+export async function syncCards(
+	ledger: ProgramLedger,
+	parsedCards: ParsedCard[],
+	planText: string,
+	options: SyncCardsOptions = {},
+): Promise<string[]> {
 	const notes: string[] = [];
 	const seen = new Set(parsedCards.map((card) => card.id));
 	for (const parsed of parsedCards) {
@@ -152,10 +177,21 @@ export function syncCards(ledger: ProgramLedger, parsedCards: ParsedCard[], plan
 	}
 	for (const [id, card] of Object.entries(ledger.cards)) {
 		if (seen.has(id)) continue;
-		if (card.phase === "done" || card.phase === "blocked") continue;
-		card.phase = "blocked";
-		card.lastError = "card file is missing from the plan";
-		notes.push(`card ${id} marked blocked (file removed)`);
+		const decision = options.onRemoved
+			? await options.onRemoved(card)
+			: { drop: false, reason: "card file is missing from the plan" };
+		if (decision.drop) {
+			delete ledger.cards[id];
+			const index = ledger.mergeQueue.indexOf(id);
+			if (index >= 0) ledger.mergeQueue.splice(index, 1);
+			notes.push(`card ${id} dropped (file removed)${decision.note ? ` — ${decision.note}` : ""}`);
+			continue;
+		}
+		if (card.phase !== "done" && !["implementing", "reviewing", "fixing", "merging", "reconciling", "verifying"].includes(card.phase)) {
+			card.phase = "blocked";
+		}
+		card.lastError = `card file is missing from the plan${decision.reason ? ` — ${decision.reason}` : ""}`;
+		notes.push(`card ${id} kept (file removed — ${decision.reason ?? "needs a decision"})`);
 	}
 	ledger.order = Object.keys(ledger.cards).sort(compareCardIds);
 	return notes;

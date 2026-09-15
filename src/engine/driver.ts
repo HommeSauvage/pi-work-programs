@@ -36,7 +36,7 @@ import {
 	resolveDecision,
 	reviewDecisionMessage,
 } from "./decisions.ts";
-import { openDecisionFor, openDecisionOfKind, openDecisions, readyCards, writersInFlight } from "./phases.ts";
+import { describeOpenDecisions, openDecisionFor, openDecisionOfKind, openDecisions, readyCards, writersInFlight } from "./phases.ts";
 
 const UNKNOWN_RUN_GRACE_MS = 10 * 60_000;
 
@@ -51,6 +51,7 @@ export interface DriverHost {
 
 const TERMINAL_STATES = new Set(["complete", "failed", "stopped", "paused", "rejected", "not_found"]);
 const MAX_FIX_INFRA_RETRIES = 2;
+const MAX_MERGE_COMMIT_FAILURES = 5;
 const CAPTAIN_OUTPUT_SCHEMA: Record<string, unknown> = {
 	type: "object",
 	properties: {
@@ -133,18 +134,27 @@ export async function drive(host: DriverHost): Promise<void> {
 		return;
 	}
 
-	await reconcileRuns(host);
-	await resolveStaleBlocks(host);
-	if (ledger.mode === "managed" || ledger.mode === "captain") {
-		await dispatchReadyCards(host);
-		await dispatchReviews(host);
-		await dispatchFixes(host);
+	try {
+		await reconcileRuns(host);
+		await resolveStaleBlocks(host);
+		if (ledger.mode === "managed" || ledger.mode === "captain") {
+			await dispatchReadyCards(host);
+			await dispatchReviews(host);
+			await dispatchFixes(host);
+		}
+		await finishApprovedCards(host);
+		await ensurePackets(host);
+		await processMergeQueue(host);
+		await maybeRunProgramGate(host);
+		await host.save();
+	} catch (error) {
+		// Durable trace, not just a toast: the next session (or a `status` call)
+		// must be able to see why the drive is wedged.
+		const message = error instanceof Error ? error.message : String(error);
+		ports.notify(`Work program drive error: ${oneLine(message, 120)}`, "error");
+		await ports.appendProgress(`[program] drive error: ${oneLine(message, 200)}`).catch(() => undefined);
+		await host.save().catch(() => undefined);
 	}
-	await finishApprovedCards(host);
-	await ensurePackets(host);
-	await processMergeQueue(host);
-	await maybeRunProgramGate(host);
-	await host.save();
 	host.refreshUi();
 }
 
@@ -205,6 +215,109 @@ function isInfraError(error: unknown): boolean {
 	return /timed out|timeout|runner startup|control .confirm|no run id|ECONN|EPIPE|EAI_AGAIN|socket hang up|temporarily unavailable/i.test(
 		String(error),
 	);
+}
+
+/**
+ * Drop a card's scope deliberately. Terminal, but never destructive: the
+ * branch is kept for inspection, the record stays, and completion/close treat
+ * it as resolved. Refuses while live cards still depend on it (rewire first),
+ * while a run owns it, or when its lane holds uncommitted work.
+ */
+async function abandonCard(host: DriverHost, card: CardLedger): Promise<{ ok: boolean; error?: string }> {
+	const cardId = card.id;
+	if (card.activeRun) {
+		return {
+			ok: false,
+			error: `card ${cardId} has a live ${card.activeRun.kind} run (${card.activeRun.runId}); stop it first (pause --hard) or wait for it`,
+		};
+	}
+	const dependents = host.ledger.order.filter((id) => {
+		if (id === cardId) return false;
+		const other = host.ledger.cards[id];
+		if (!other || other.phase === "done" || other.abandoned === true) return false;
+		return other.dependsOn.includes(cardId);
+	});
+	if (dependents.length > 0) {
+		return {
+			ok: false,
+			error: `card ${cardId} is still a dependency of ${dependents.join(", ")}; rewire those cards (edit their \`Depends on:\` and sync) before abandoning it`,
+		};
+	}
+	if (card.lane) {
+		const dirty = await host.ports.git.statusPorcelain(card.lane.path).catch(() => "");
+		if (dirty.trim().length > 0) {
+			return {
+				ok: false,
+				error: `card ${cardId}'s lane has uncommitted work (${oneLine(dirty, 120)}); commit, stash, or discard it in ${card.lane.path} first`,
+			};
+		}
+		const note = await releaseLane(host, card, { keepBranch: true });
+		if (note) await progress(host, `${cardId} lane released — ${note}`);
+	}
+	await host.ports.git.mergeAbort(host.cwd).catch(() => undefined);
+	const index = host.ledger.mergeQueue.indexOf(cardId);
+	if (index >= 0) host.ledger.mergeQueue.splice(index, 1);
+	card.abandoned = true;
+	card.phase = "blocked";
+	card.activeRun = undefined;
+	card.lastError = card.lastError ?? "abandoned by operator (scope dropped)";
+	await progress(host, `${cardId} abandoned — scope dropped (branch kept for inspection)`);
+	host.ports.notify(`Work program: card ${cardId} abandoned (scope dropped)`, "warning");
+	return { ok: true };
+}
+
+/** Remove a lane worktree, optionally keeping the branch for inspection. */
+async function releaseLane(host: DriverHost, card: CardLedger, opts: { keepBranch: boolean }): Promise<string | undefined> {
+	const lane = card.lane;
+	if (!lane) return undefined;
+	try {
+		await host.ports.git.worktreeRemove(host.cwd, lane.path);
+		if (!opts.keepBranch) await host.ports.git.branchDelete(host.cwd, lane.branch).catch(() => undefined);
+		card.lane = undefined;
+		return `worktree removed, branch \`${lane.branch}\` kept`;
+	} catch (error) {
+		return `could not remove worktree ${lane.path}: ${oneLine(String(error), 120)}`;
+	}
+}
+
+/**
+ * Policy for a card file that disappeared from the plan. Drops only what is
+ * safe: no live dependents, no live run, no lane holding work. Anything else
+ * is kept and explained — never silently discarded. Dropping is additive to
+ * `sync`, so a collapse (fold scope into survivors, rewire deps, delete files,
+ * sync) works without hand-editing the ledger.
+ */
+export async function planCardRemoval(
+	host: DriverHost,
+	card: CardLedger,
+): Promise<{ drop: boolean; reason?: string; note?: string }> {
+	if (card.abandoned === true) return { drop: true, note: "abandoned tombstone" };
+	if (card.phase === "done") return { drop: false, reason: "done cards are records; deletion ignored" };
+	if (["implementing", "reviewing", "fixing", "merging", "reconciling", "verifying"].includes(card.phase)) {
+		return { drop: false, reason: `card is ${card.phase}; a run owns it` };
+	}
+	const dependents = host.ledger.order.filter((id) => {
+		if (id === card.id) return false;
+		const other = host.ledger.cards[id];
+		if (!other || other.phase === "done" || other.abandoned === true) return false;
+		return other.dependsOn.includes(card.id);
+	});
+	if (dependents.length > 0) {
+		return { drop: false, reason: `still a dependency of ${dependents.join(", ")}` };
+	}
+	if (card.lane) {
+		const dirty = await host.ports.git.statusPorcelain(card.lane.path).catch(() => "");
+		const committed = await host.ports.git.changedFiles(card.lane.path, card.lane.base, "HEAD").catch(() => ["?"]);
+		if (dirty.trim().length > 0 || committed.length > 0) {
+			return {
+				drop: false,
+				reason: `lane \`${card.lane.branch}\` holds work; inspect ${card.lane.path} (or abandon the card) before removing`,
+			};
+		}
+		const note = await releaseLane(host, card, { keepBranch: false });
+		return { drop: true, note: note ?? "empty lane cleaned" };
+	}
+	return { drop: true };
 }
 
 /**
@@ -756,8 +869,7 @@ async function completeDirectCard(host: DriverHost, card: CardLedger): Promise<v
 		`completed: ${new Date().toISOString()}`,
 	]);
 	await writeCardText(host, card, updated);
-	const cwd = host.cwd;
-	const commit = await host.ports.git.commitPaths(cwd, `wp(${host.ledger.slug}): card ${card.id} done`, [
+	const commit = await commitRecordPaths(host, card, `wp(${host.ledger.slug}): card ${card.id} done`, [
 		`${host.programDir}/${card.path}`,
 		`${host.programDir}/plan.md`,
 		`${host.programDir}/progress.md`,
@@ -765,6 +877,23 @@ async function completeDirectCard(host: DriverHost, card: CardLedger): Promise<v
 	card.phase = "done";
 	card.activeRun = undefined;
 	await progress(host, `${card.id} done (${commit.slice(0, 7)})`);
+}
+
+/**
+ * Commit program records tolerantly: repos that gitignore their program folder
+ * (`.agents/`) keep the records on disk untracked instead of wedging the card.
+ * Returns the resulting HEAD, warning once when paths had to be skipped.
+ */
+async function commitRecordPaths(host: DriverHost, card: CardLedger, message: string, paths: string[]): Promise<string> {
+	const { commit, skipped } = await host.ports.git.commitRecords(host.cwd, message, paths);
+	if (skipped.length > 0) {
+		host.ports.notify(
+			`Work program: program records not committed (${skipped.length} path(s) ignored or missing); records remain on disk untracked`,
+			"warning",
+		);
+		await progress(host, `${card.id} record commit skipped (${skipped.length} path(s) not stageable) — records remain on disk`);
+	}
+	return commit;
 }
 
 async function ensurePackets(host: DriverHost): Promise<void> {
@@ -905,6 +1034,12 @@ async function processMergeQueue(host: DriverHost): Promise<void> {
 			await host.save();
 		}
 		if (card.phase !== "merging" || !card.lane) return;
+		if (await host.ports.git.merging(host.cwd)) {
+			// A previous tick merged but never committed (commit crashed after a
+			// good merge): resume at the commit step instead of re-merging.
+			await finishMergeCommit(host, card);
+			return;
+		}
 		const result = await host.ports.git.mergeNoCommit(host.cwd, card.lane.branch);
 		card.merge = { state: "merging", attempts: (card.merge?.attempts ?? 0) + 1 };
 		await host.save();
@@ -921,7 +1056,7 @@ async function processMergeQueue(host: DriverHost): Promise<void> {
 			await host.save();
 			continue;
 		}
-		await completeMerge(host, card);
+		await finishMergeCommit(host, card);
 		return;
 	}
 }
@@ -979,6 +1114,26 @@ async function beginReconcile(
 	await progress(host, `${card.id} merge conflict — reconciler dispatched`);
 }
 
+/** Complete a clean merge: commit it, gate it, record it — parking (never
+ *  crash-looping) when the commit step fails. Bounded: past the cap the card
+ *  blocks loudly with a decision instead of retrying forever. */
+async function finishMergeCommit(host: DriverHost, card: CardLedger): Promise<void> {
+	try {
+		await completeMerge(host, card);
+	} catch (error) {
+		const attempts = (card.merge?.attempts ?? 0) + 1;
+		card.merge = { state: "merging", attempts };
+		card.lastError = `merge commit failed (attempt ${attempts}): ${oneLine(String(error), 160)}`;
+		await progress(host, `${card.id} merge commit failed — parked (${oneLine(String(error), 120)})`);
+		if (attempts > MAX_MERGE_COMMIT_FAILURES) {
+			await blockCard(host, card, `merge commit failed ${attempts} times: ${oneLine(String(error), 160)}`);
+			const index = host.ledger.mergeQueue.indexOf(card.id);
+			if (index >= 0) host.ledger.mergeQueue.splice(index, 1);
+		}
+		await host.save();
+	}
+}
+
 async function onReconcilerComplete(host: DriverHost, card: CardLedger, status: RunStatus, runId: string): Promise<void> {
 	if (status.state === "paused") {
 		await blockCard(
@@ -1005,9 +1160,10 @@ async function onReconcilerComplete(host: DriverHost, card: CardLedger, status: 
 		return;
 	}
 	if (await host.ports.git.merging(host.cwd)) {
-		await host.ports.git.commitAll(host.cwd, `wp(${host.ledger.slug}): merge card ${card.id} (reconciled)`);
+		// Commit only what the merge staged — never `add`, so stray files stay out.
+		await host.ports.git.commitMerge(host.cwd);
 	}
-	await completeMerge(host, card);
+	await finishMergeCommit(host, card);
 }
 
 function recordPaths(host: DriverHost, card: CardLedger): string[] {
@@ -1034,15 +1190,13 @@ async function markDoneAndCommit(host: DriverHost, card: CardLedger, extraLines:
 		`completed: ${new Date().toISOString()}`,
 	]);
 	await host.ports.writeFile(mainCardPath, updated);
-	return host.ports.git.commitPaths(host.cwd, `wp(${host.ledger.slug}): card ${card.id} done`, recordPaths(host, card));
+	return commitRecordPaths(host, card, `wp(${host.ledger.slug}): card ${card.id} done`, recordPaths(host, card));
 }
 
 async function completeMerge(host: DriverHost, card: CardLedger): Promise<void> {
-	const commit = await host.ports.git.commitPaths(
-		host.cwd,
-		`wp(${host.ledger.slug}): merge card ${card.id} — ${oneLine(card.title, 60)}`,
-		[],
-	);
+	// Commit exactly what the merge staged (never `add`), tolerating an
+	// open-but-empty merge instead of failing the card.
+	const commit = await host.ports.git.commitMerge(host.cwd);
 	card.merge = { state: "merged", commit, attempts: card.merge?.attempts ?? 1 };
 	const outcome = await runCardGates(host, card, host.cwd);
 	if (!outcome.ok) {
@@ -1101,7 +1255,7 @@ async function maybeRunProgramGate(host: DriverHost): Promise<void> {
 	if (ledger.status !== "active") return;
 	const cards = ledgerCards(ledger);
 	if (cards.length === 0) return;
-	if (!cards.every((card) => card.phase === "done")) return;
+	if (!cards.every((card) => card.phase === "done" || card.abandoned === true)) return;
 	// Only an open program-gate decision holds completion: with every card done,
 	// any other open record is stale and must not wedge the program.
 	if (openDecisions(ledger).some((decision) => decision.kind === "gate-failed")) return;
@@ -1133,9 +1287,15 @@ async function completeProgram(host: DriverHost, how: string): Promise<void> {
 	const ledger = host.ledger;
 	ledger.status = "complete";
 	await progress(host, `program complete (${how})`);
-	await host.ports.git
-		.commitPaths(host.cwd, `wp(${ledger.slug}): program complete`, programRecordPaths(host))
-		.catch(() => undefined);
+	try {
+		await host.ports.git.commitRecords(
+			host.cwd,
+			`wp(${ledger.slug}): program complete`,
+			programRecordPaths(host),
+		);
+	} catch {
+		// Records stay on disk; completion is not blocked by an unstageable path.
+	}
 	host.ports.notify(`Work program ${ledger.slug} complete`, "info");
 	host.ports.ask(programCompleteMessage(ledger, await openOperatorTodos(host, ledger.slug)));
 }
@@ -1161,7 +1321,7 @@ export function applyTriage(host: DriverHost, cardId: string, verdicts: FindingV
 	// Kind-scoped: a stale `blocked` record must never shadow the live review.
 	const decision = openDecisionOfKind(host.ledger, cardId, "review-triage");
 	if (!decision) {
-		return { ok: false, error: `card ${cardId} has no open review decision` };
+		return { ok: false, error: `card ${cardId} has no open review decision (${describeOpenDecisions(host.ledger, cardId)})` };
 	}
 	const approved = verdicts.filter((verdict) => verdict.verdict === "approve");
 	resolveDecision(host, decision.id, { verdicts });
@@ -1211,17 +1371,12 @@ export async function applyUnblock(
 			await progress(host, `${cardId} stale blocked decision cleared (card is ${card.phase})`);
 			return { ok: true };
 		}
-		return { ok: false, error: `card ${cardId} is ${card.phase}; only a blocked card can be unblocked` };
+		return { ok: false, error: `card ${cardId} is ${card.phase}; only a blocked card can be unblocked (${describeOpenDecisions(host.ledger, cardId)})` };
 	}
 	const decision = openDecisionFor(host.ledger, cardId);
 	if (decision) resolveDecision(host, decision.id);
 	if (resolution === "abandon") {
-		card.phase = "blocked";
-		card.lastError = "abandoned by operator";
-		const index = host.ledger.mergeQueue.indexOf(cardId);
-		if (index >= 0) host.ledger.mergeQueue.splice(index, 1);
-		await host.ports.git.mergeAbort(host.cwd).catch(() => undefined);
-		return { ok: true };
+		return abandonCard(host, card);
 	}
 	const reviewed = host.ledger.decisions.some(
 		(entry) => entry.card === cardId && entry.kind === "review-triage" && entry.status === "resolved",
@@ -1232,6 +1387,11 @@ export async function applyUnblock(
 	card.activeRun = undefined;
 	card.blockedFrom = undefined;
 	card.infraRetries = 0;
+	if (card.abandoned === true) {
+		// Redispatch of a dropped card re-adopts its scope.
+		card.abandoned = false;
+		await progress(host, `${cardId} re-adopted (abandon cleared)`);
+	}
 	if (resolution === "done") {
 		if (!reviewed) {
 			return { ok: false, error: `card ${cardId} has no completed review; use "redispatch" instead` };
@@ -1301,7 +1461,7 @@ export function applyCycleDecision(
 	if (!card) return { ok: false, error: `unknown card ${cardId}` };
 	const decision = openDecisionOfKind(host.ledger, cardId, "cycle-exhausted");
 	if (!decision) {
-		return { ok: false, error: `card ${cardId} has no open cycle decision` };
+		return { ok: false, error: `card ${cardId} has no open cycle decision (${describeOpenDecisions(host.ledger, cardId)})` };
 	}
 	resolveDecision(host, decision.id);
 	if (choice === "one_more") {

@@ -55,6 +55,31 @@ pending → ready → implementing → review_pending → reviewing → triaging
 - `close` refuses while any card is not `done`. Closing is only for completed
   programs.
 
+## Reshaping the program
+
+Cards can be folded, added, or dropped without hand-editing the ledger. The
+plan and card files stay the source of truth; `sync` reconciles.
+
+- **Folding cards** (e.g. 9 cards down to 5): move the scope into the surviving
+  card files, rewire `Depends on:` so nothing points at a card you are deleting,
+  delete the dead files and their plan rows, then run
+  `work_program({ action: "sync" })`.
+- Sync drops a removed card when it is safe: no live dependents, no live run,
+  and no lane holding work. An empty lane is cleaned up (worktree removed,
+  branch deleted).
+- Anything unsafe is **kept and explained** instead: a done card is a record and
+  is never dropped, a card with live dependents lists them (rewire first), a
+  card with a run is owned by it, and a lane holding work points at its path for
+  inspection or an explicit `abandon`.
+- **Dropping an unfinished card** deliberately: `work_program({ action:
+  "unblock", card: "NN", resolution: "abandon" })`. Abandon is terminal but not
+  destructive — the branch is kept for inspection, the record stays, and the
+  card stops counting against completion. It refuses while live cards still
+  depend on it, while a run owns it, or when its lane has uncommitted work.
+  `redispatch` re-adopts an abandoned card.
+- Abandoned cards show as `✕` on the board and are listed as dropped in the
+  completion summary, so dropped scope is recorded rather than hand-waved.
+
 ## Operator todos
 
 - Some work needs human hands (credentials, external approvals, secrets,

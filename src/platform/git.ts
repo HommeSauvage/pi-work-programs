@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { GitOps } from "../shared/types.ts";
+import { pathExists } from "../shared/fsx.ts";
 import { oneLine } from "../shared/text.ts";
 
 interface CommandResult {
@@ -97,12 +98,69 @@ export class Git implements GitOps {
 		return result.code === 0;
 	}
 
+	/** True when nothing is staged. Checked instead of sniffing git's varying
+	 *  "nothing to commit" message flavors (clean tree vs. untracked files). */
+	async diffCachedQuiet(cwd: string): Promise<boolean> {
+		const result = await this.git(cwd, ["diff", "--cached", "--quiet"]);
+		return result.code === 0;
+	}
+
+	/** Paths git refuses to stage because a .gitignore rule covers them. */
+	async ignoredPaths(cwd: string, paths: string[]): Promise<string[]> {
+		if (paths.length === 0) return [];
+		const result = await this.git(cwd, ["check-ignore", "--", ...paths]);
+		if (result.code !== 0) return [];
+		return result.stdout
+			.split("\n")
+			.map((line) => line.trim())
+			.filter((line) => line.length > 0);
+	}
+
+	/**
+	 * Commit program records without ever failing the card. Stages only what git
+	 * can accept (existing, not ignored), commits when anything is staged, and
+	 * reports the paths it had to skip. Repos that gitignore their program folder
+	 * (`.agents/`) therefore record cards on disk with the records untracked —
+	 * no force-add, no throw, no stuck merge.
+	 */
+	async commitRecords(cwd: string, message: string, paths: string[]): Promise<{ commit: string; skipped: string[] }> {
+		const skipped: string[] = [];
+		const stageable: string[] = [];
+		const ignored = new Set(await this.ignoredPaths(cwd, paths));
+		for (const path of paths) {
+			if (ignored.has(path)) {
+				skipped.push(path);
+				continue;
+			}
+			if (!(await pathExists(path))) {
+				skipped.push(path);
+				continue;
+			}
+			stageable.push(path);
+		}
+		if (stageable.length > 0) {
+			const add = await this.git(cwd, ["add", "--", ...stageable]);
+			if (add.code !== 0) {
+				// Belt and braces: an unexpected add failure must not fail the card.
+				for (const path of stageable) skipped.push(path);
+				return { commit: await this.head(cwd), skipped };
+			}
+		}
+		if (await this.diffCachedQuiet(cwd)) return { commit: await this.head(cwd), skipped };
+		const commit = await this.git(cwd, ["commit", "-m", message]);
+		if (commit.code !== 0) {
+			throw new Error(`git commit failed: ${oneLine(commit.stderr || commit.stdout, 300)}`);
+		}
+		return { commit: await this.head(cwd), skipped };
+	}
+
 	async commitPaths(cwd: string, message: string, paths: string[]): Promise<string> {
 		if (paths.length > 0) {
 			await this.run(cwd, ["add", "--", ...paths], "git add failed");
 		}
+		if (await this.diffCachedQuiet(cwd)) return this.head(cwd);
 		const commit = await this.git(cwd, ["commit", "-m", message]);
-		if (commit.code !== 0 && !commit.stdout.includes("nothing to commit") && !commit.stderr.includes("nothing to commit")) {
+		if (commit.code !== 0) {
 			throw new Error(`git commit failed: ${oneLine(commit.stderr || commit.stdout, 300)}`);
 		}
 		return this.head(cwd);
@@ -110,11 +168,28 @@ export class Git implements GitOps {
 
 	async commitAll(cwd: string, message: string): Promise<string> {
 		await this.run(cwd, ["add", "-A"], "git add failed");
+		if (await this.diffCachedQuiet(cwd)) return this.head(cwd);
 		const commit = await this.git(cwd, ["commit", "-m", message]);
-		if (commit.code !== 0 && !commit.stdout.includes("nothing to commit") && !commit.stderr.includes("nothing to commit")) {
+		if (commit.code !== 0) {
 			throw new Error(`git commit failed: ${oneLine(commit.stderr || commit.stdout, 300)}`);
 		}
 		return this.head(cwd);
+	}
+
+	/**
+	 * Finalize a merge in progress (conflicts already resolved in the tree).
+	 * Commits only what the merge staged — never `add`, so stray or untracked
+	 * files (operator todos, lane droppings) can never enter merge commits.
+	 * An open-but-empty merge carries nothing and is aborted instead of failed.
+	 */
+	async commitMerge(cwd: string): Promise<string> {
+		const commit = await this.git(cwd, ["commit", "--no-edit"]);
+		if (commit.code === 0) return this.head(cwd);
+		if (await this.diffCachedQuiet(cwd)) {
+			await this.git(cwd, ["merge", "--abort"]);
+			return this.head(cwd);
+		}
+		throw new Error(`git merge commit failed: ${oneLine(commit.stderr || commit.stdout, 300)}`);
 	}
 
 	async revParse(cwd: string, ref: string): Promise<string> {

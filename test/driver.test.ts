@@ -872,6 +872,99 @@ describe("fix runner-flake retries", () => {
 	});
 });
 
+describe("gitignored program records", () => {
+	async function prepareApproved(t: ReturnType<typeof createTestHost>): Promise<void> {
+		await drive(t.host);
+		writeLaneEvidence(t, "01", "evidence");
+		t.completeRun(t.fake.dispatched[0]!.runId, { output: "done" });
+		await drive(t.host);
+		t.completeRun(t.fake.dispatched.at(-1)!.runId, { output: "No issues." });
+		await drive(t.host);
+		applyTriage(t.host, "01", []);
+	}
+
+	test("a merge still completes when every record path is ignored", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		// The flytrader policy: the whole program folder is gitignored.
+		t.git.ignoredPrefixes = [t.host.programDir];
+		await prepareApproved(t);
+		await drive(t.host);
+		const card = t.ledger.cards["01"]!;
+		expect(card.phase).toBe("done");
+		expect(t.ledger.mergeQueue).toEqual([]);
+		expect(t.git.deletedBranches).toContain("feat/foo-card-01");
+		// Records stay on disk (State: done + harness evidence) with one warning.
+		const text = t.fake.files.get(programCardPath("01")) ?? "";
+		expect(text).toContain("State: done");
+		expect(text).toContain("Harness evidence");
+		expect(t.fake.notifications.some((note) => note.includes("program records not committed"))).toBe(true);
+		expect(t.fake.progress.some((line) => line.includes("record commit skipped"))).toBe(true);
+		// No crash loop: a second tick is a clean no-op.
+		await drive(t.host);
+		expect(card.phase).toBe("done");
+	});
+
+	test("tracked records commit normally with no warning", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await prepareApproved(t);
+		await drive(t.host);
+		expect(t.ledger.cards["01"]?.phase).toBe("done");
+		expect(t.fake.notifications.some((note) => note.includes("program records not committed"))).toBe(false);
+		expect(t.git.commits.some((message) => message.includes("card 01 done"))).toBe(true);
+	});
+});
+
+describe("program reshape (file-driven removal)", () => {
+	test("a removed card with no dependents is dropped from the ledger", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }, { id: "02" }, { id: "03", depends: ["02"] }] });
+		// Fold 02 into 03: rewire 03 onto 01, delete 02's file.
+		t.fake.files.delete(join(PROGRAM_DIR, "tasks/02-card.md"));
+		t.fake.files.set(join(PROGRAM_DIR, "tasks/03-card.md"), makeCardText({ id: "03", depends: ["01"] }));
+		t.ledger.cards["03"]!.dependsOn = ["01"];
+		const { planCardRemoval } = await import("../src/engine/driver.ts");
+		const decision = await planCardRemoval(t.host, t.ledger.cards["02"]!);
+		expect(decision.drop).toBe(true);
+	});
+
+	test("a done card is never dropped", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		t.ledger.cards["01"]!.phase = "done";
+		const { planCardRemoval } = await import("../src/engine/driver.ts");
+		const decision = await planCardRemoval(t.host, t.ledger.cards["01"]!);
+		expect(decision.drop).toBe(false);
+		expect(decision.reason).toContain("records");
+	});
+
+	test("a card with live dependents is kept with the dependents named", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }, { id: "02", depends: ["01"] }] });
+		const { planCardRemoval } = await import("../src/engine/driver.ts");
+		const decision = await planCardRemoval(t.host, t.ledger.cards["01"]!);
+		expect(decision.drop).toBe(false);
+		expect(decision.reason).toContain("still a dependency of 02");
+	});
+
+	test("a lane holding work is kept; an empty lane is dropped", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		const card = t.ledger.cards["01"]!;
+		card.lane = { path: "/wt/test-program/01", branch: "feat/foo-card-01", base: "base0" };
+		const { planCardRemoval } = await import("../src/engine/driver.ts");
+		// FakeGit reports no changes by default: the empty lane is cleaned and dropped.
+		const empty = await planCardRemoval(t.host, card);
+		expect(empty.drop).toBe(true);
+		expect(t.git.removedWorktrees).toContain("/wt/test-program/01");
+	});
+
+	test("a run-owned card is kept", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		const card = t.ledger.cards["01"]!;
+		card.phase = "implementing";
+		const { planCardRemoval } = await import("../src/engine/driver.ts");
+		const decision = await planCardRemoval(t.host, card);
+		expect(decision.drop).toBe(false);
+		expect(decision.reason).toContain("run owns it");
+	});
+});
+
 describe("dispatch failures", () => {
 	test("a failing dispatch blocks the card instead of retrying silently", async () => {
 		const t = createTestHost({ cards: [{ id: "01" }] });
@@ -917,9 +1010,45 @@ describe("unblock semantics", () => {
 		await prepareQueuedCard(t);
 		const card = t.ledger.cards["01"]!;
 		card.phase = "blocked";
+		// Clear the foreign change that held the queue: the lane must be clean
+		// for a deliberate abandon (dirty lanes are refused, never discarded).
+		t.git.statusOutput = "";
 		const result = await applyUnblock(t.host, "01", "abandon");
 		expect(result.ok).toBe(true);
 		expect(t.ledger.mergeQueue).not.toContain("01");
+		expect(card.abandoned).toBe(true);
+		expect(card.lane).toBeUndefined();
+	});
+
+	test("abandon refuses while a live card depends on it", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }, { id: "02", depends: ["01"] }] });
+		const card = t.ledger.cards["01"]!;
+		card.phase = "blocked";
+		const result = await applyUnblock(t.host, "01", "abandon");
+		expect(result.ok).toBe(false);
+		expect(result.error).toContain("still a dependency of 02");
+		expect(card.abandoned).not.toBe(true);
+	});
+
+	test("abandon refuses a dirty lane instead of discarding work", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		const card = t.ledger.cards["01"]!;
+		card.phase = "blocked";
+		card.lane = { path: "/wt/test-program/01", branch: "feat/foo-card-01", base: "base0" };
+		t.git.statusOutput = " M src/wip.ts";
+		const result = await applyUnblock(t.host, "01", "abandon");
+		expect(result.ok).toBe(false);
+		expect(result.error).toContain("uncommitted work");
+	});
+
+	test("redispatching an abandoned card re-adopts its scope", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		const card = t.ledger.cards["01"]!;
+		card.phase = "blocked";
+		card.abandoned = true;
+		const result = await applyUnblock(t.host, "01", "redispatch");
+		expect(result.ok).toBe(true);
+		expect(card.abandoned).toBe(false);
 	});
 
 	test("done without a completed review is refused", async () => {

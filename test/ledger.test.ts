@@ -55,11 +55,32 @@ describe("buildLedger", () => {
 });
 
 describe("syncCards", () => {
-	test("adds new cards and blocks files that disappeared", () => {
+	test("adds new cards and blocks files that disappeared", async () => {
 		const ledger = ledgerFor([parsed("01", "—", "todo"), parsed("02", "01", "todo")]);
-		const notes = syncCards(ledger, [parsed("01", "—", "todo"), parsed("03", "01", "todo")], "");
+		const notes = await syncCards(ledger, [parsed("01", "—", "todo"), parsed("03", "01", "todo")], "");
 		expect(Object.keys(ledger.cards).sort()).toEqual(["01", "02", "03"]);
 		expect(ledger.cards["02"]?.phase).toBe("blocked");
 		expect(notes.length).toBeGreaterThan(0);
+	});
+
+	test("drops removed cards when the policy allows it", async () => {
+		const ledger = ledgerFor([parsed("01", "—", "todo"), parsed("02", "—", "todo")]);
+		ledger.mergeQueue.push("02");
+		const notes = await syncCards(ledger, [parsed("01", "—", "todo")], "", {
+			onRemoved: async () => ({ drop: true, note: "no dependents" }),
+		});
+		expect(Object.keys(ledger.cards)).toEqual(["01"]);
+		expect(ledger.order).toEqual(["01"]);
+		expect(ledger.mergeQueue).toEqual([]);
+		expect(notes.some((note) => note.includes("02 dropped"))).toBe(true);
+	});
+
+	test("keeps a refused removal with the policy's reason", async () => {
+		const ledger = ledgerFor([parsed("01", "—", "todo"), parsed("02", "—", "todo")]);
+		await syncCards(ledger, [parsed("01", "—", "todo")], "", {
+			onRemoved: async () => ({ drop: false, reason: "still a dependency of 03" }),
+		});
+		expect(Object.keys(ledger.cards).sort()).toEqual(["01", "02"]);
+		expect(ledger.cards["02"]?.lastError).toContain("still a dependency of 03");
 	});
 });

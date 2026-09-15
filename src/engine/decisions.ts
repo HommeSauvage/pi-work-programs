@@ -57,13 +57,23 @@ export function cancelOpenDecisionsFor(host: DecisionHost, cardId: string, reaso
 export function packetText(ledger: ProgramLedger, decisions: Decision[]): string {
 	const header = `[WORK PROGRAM DECISION — ${ledger.slug} · ${ledger.mode}]`;
 	const blocks = decisions.map((decision) => {
-		const lines = [decision.message ?? "Decision required."];
+		const lines = [
+			`Decision ${decision.id} (still open)${decision.card ? ` · card ${decision.card}` : ""}`,
+			"",
+			decision.message ?? "Decision required.",
+		];
 		if (decision.summary) lines.push("", `Review digest: ${decision.summary}`);
 		if (decision.reviewPath) lines.push(`Full review: ${decision.reviewPath}`);
 		if (decision.expectedAction) lines.push("", `Answer with: ${decision.expectedAction}`);
 		return lines.join("\n");
 	});
-	return [header, "", blocks.join("\n\n---\n\n"), "", "Use work_program({ action: \"status\" }) for the full board."].join("\n");
+	return [
+		header,
+		"",
+		blocks.join("\n\n---\n\n"),
+		"",
+		'Only these decisions are open right now. If a decision looks already answered, call work_program({ action: "status" }) instead of re-answering.',
+	].join("\n");
 }
 
 export function reviewDecisionMessage(ledger: ProgramLedger, cardId: string, cycles: number, profile: string): string {
@@ -96,13 +106,17 @@ export function programCompleteMessage(ledger: ProgramLedger, openTodos: Operato
 	const lines = [
 		`[WORK PROGRAM COMPLETE — ${ledger.slug}]`,
 		"",
-		`${ledger.title}: ${done}/${total} cards done. The work-program UI is now cleared; the records stay at ${ledger.dir} until closed.`,
+		`${ledger.title}: ${done}/${total} cards done${ledger.order.some((id) => ledger.cards[id]?.abandoned === true) ? ` (${ledger.order.filter((id) => ledger.cards[id]?.abandoned === true).length} dropped by operator)` : ""}. The work-program UI is now cleared; the records stay at ${ledger.dir} until closed.`,
 		"",
 		"Cards:",
 	];
 	for (const id of ledger.order) {
 		const card = ledger.cards[id];
 		if (!card) continue;
+		if (card.abandoned === true) {
+			lines.push(`- ${card.id} ${card.title} — DROPPED (${oneLine(card.lastError ?? "abandoned by operator", 100)})`);
+			continue;
+		}
 		const landing = card.merge?.commit ? `merged ${card.merge.commit.slice(0, 7)}` : "done";
 		lines.push(`- ${card.id} ${card.title} — ${landing} (${card.cycles} review cycle(s))`);
 	}

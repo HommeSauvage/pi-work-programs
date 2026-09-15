@@ -22,6 +22,8 @@ import type {
 
 export class FakeGit implements GitOps {
 	headSha = "base0";
+	/** When true, commitPaths/commitAll record nothing (clean tree). */
+	nothingStaged = false;
 	statusOutput = "";
 	mergeResult: { code: number; conflicted: string[]; output: string } = { code: 0, conflicted: [], output: "" };
 	ancestor = true;
@@ -71,7 +73,27 @@ export class FakeGit implements GitOps {
 		this.headSha = `sha${this.commits.length}`;
 		return this.headSha;
 	}
+	async diffCachedQuiet(): Promise<boolean> {
+		return this.nothingStaged;
+	}
+	/** Paths the fake repo treats as gitignored (prefix match). */
+	ignoredPrefixes: string[] = [];
+	async ignoredPaths(_cwd: string, paths: string[]): Promise<string[]> {
+		return paths.filter((path) => this.ignoredPrefixes.some((prefix) => path === prefix || path.startsWith(`${prefix}/`)));
+	}
+	async commitRecords(cwd: string, message: string, paths: string[]): Promise<{ commit: string; skipped: string[] }> {
+		const skipped = await this.ignoredPaths(cwd, paths);
+		const stageable = paths.filter((path) => !skipped.includes(path));
+		if (stageable.length === 0 && paths.length > 0) return { commit: this.headSha, skipped };
+		return { commit: await this.commitPaths(cwd, message, stageable), skipped };
+	}
+	async commitMerge(_cwd: string): Promise<string> {
+		this.commits.push("merge");
+		this.headSha = `sha${this.commits.length}`;
+		return this.headSha;
+	}
 	async commitPaths(_cwd: string, message: string, _paths: string[]): Promise<string> {
+		if (this.nothingStaged) return this.headSha;
 		this.commits.push(message);
 		this.headSha = `sha${this.commits.length}`;
 		return this.headSha;

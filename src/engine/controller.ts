@@ -50,6 +50,7 @@ import {
 	dispatchManual,
 	drive,
 	finishManualMerge,
+	planCardRemoval,
 	rearmPackets,
 	rearmPausedCards,
 } from "./driver.ts";
@@ -288,10 +289,10 @@ export class WorkProgramController {
 			ui.setWidget("work-program", undefined);
 			return;
 		}
-		const { done, total, blocked } = counts(this.active.ledger);
+		const { done, total, blocked, abandoned } = counts(this.active.ledger);
 		ui.setStatus(
 			"work-program",
-			`wp ${this.active.slug} ${done}/${total}${blocked > 0 ? ` · ${blocked} blocked` : ""}${this.deps && !this.deps.ok ? " · blocked (deps)" : ""}`,
+			`wp ${this.active.slug} ${done}/${total}${abandoned > 0 ? ` · ${abandoned} dropped` : ""}${blocked > 0 ? ` · ${blocked} blocked` : ""}${this.deps && !this.deps.ok ? " · blocked (deps)" : ""}`,
 		);
 		const lines = [`${this.active.slug} · ${this.active.ledger.mode}`, this.boardText()];
 		for (const id of this.active.ledger.order) {
@@ -363,7 +364,14 @@ export class WorkProgramController {
 		}
 		const existing = paths.filter((path) => path !== undefined);
 		try {
-			return await this.git.commitPaths(this.cwd, message, existing);
+			const { commit, skipped } = await this.git.commitRecords(this.cwd, message, existing);
+			if (skipped.length > 0) {
+				this.sessionCtx?.ui.notify(
+					`Work program: program records not committed (${skipped.length} path(s) ignored or missing); records remain on disk untracked.`,
+					"warning",
+				);
+			}
+			return commit;
 		} catch (error) {
 			this.sessionCtx?.ui.notify(
 				`Work program: could not commit program records (${oneLine(String(error), 120)}); records remain on disk untracked.`,
@@ -588,7 +596,9 @@ export class WorkProgramController {
 		const planText = await readPlan(active.absDir);
 		const cardFiles = await listCardFiles(active.absDir);
 		const validation = validatePlanFiles(planText, cardFiles);
-		const notes = syncCards(active.ledger, validation.cards, planText);
+		const notes = await syncCards(active.ledger, validation.cards, planText, {
+			onRemoved: (card) => planCardRemoval(this, card),
+		});
 		const overrides = configOverridesFromPlan(planText);
 		const settings = applyOverrides(this.settings, overrides);
 		if (overrides.mode) active.ledger.mode = overrides.mode;
@@ -694,10 +704,10 @@ export class WorkProgramController {
 	async statusText(): Promise<string> {
 		if (!this.active) return "No active work program. Use /work-program start <slug> or work_program({action:'list'}).";
 		const ledger = this.active.ledger;
-		const { done, total, blocked } = counts(ledger);
+		const { done, total, blocked, abandoned } = counts(ledger);
 		const lines = [
 			`${ledger.title}`,
-			`slug: ${ledger.slug} · status: ${ledger.status} · mode: ${ledger.mode} · ${done}/${total} done${blocked ? ` · ${blocked} blocked` : ""}`,
+			`slug: ${ledger.slug} · status: ${ledger.status} · mode: ${ledger.mode} · ${done}/${total} done${abandoned ? ` · ${abandoned} dropped` : ""}${blocked ? ` · ${blocked} blocked` : ""}`,
 			`parallel: ${ledger.parallelExecution} (max ${ledger.maxParallel}) · review: ${ledger.reviewProfile} · cycles: ${ledger.maxCycles}`,
 			`dir: ${ledger.dir}`,
 			"",
@@ -708,13 +718,18 @@ export class WorkProgramController {
 			if (!card) continue;
 			const deps = card.dependsOn.length > 0 ? ` (deps: ${card.dependsOn.join(",")})` : "";
 			const parts: string[] = [];
+			if (card.abandoned === true) {
+				parts.push(card.lastError ? `dropped — ${oneLine(card.lastError, 90)}` : "dropped (scope abandoned)");
+			}
 			if (card.activeRun) parts.push(await this.heartbeatLine(card));
 			if ((card.phase === "queued" || card.phase === "merging" || card.phase === "reconciling") && card.merge) {
 				parts.push(`merge ${card.merge.state}${card.lane ? ` · lane ${card.lane.branch}` : ""}`);
 			}
 			if (card.fixReason !== undefined && card.phase !== "blocked") parts.push(`pending ${card.fixReason} fix`);
-			if (card.lastError) parts.push(card.lastError);
-			lines.push(`  ${phaseSymbol(card.phase)} ${id} ${card.phase}${deps}${parts.length > 0 ? ` — ${parts.join("; ")}` : ""}`);
+			if (card.lastError && card.abandoned !== true) parts.push(card.lastError);
+			lines.push(
+				`  ${phaseSymbol(card.phase, card.abandoned === true)} ${id} ${card.abandoned === true ? "abandoned" : card.phase}${deps}${parts.length > 0 ? ` — ${parts.join("; ")}` : ""}`,
+			);
 		}
 		if (ledger.mergeQueue.length > 0) {
 			lines.push(
@@ -742,7 +757,7 @@ export class WorkProgramController {
 		}
 		const blockedCards = ledger.order
 			.map((id) => ledger.cards[id])
-			.filter((card): card is CardLedger => card?.phase === "blocked");
+			.filter((card): card is CardLedger => card?.phase === "blocked" && card.abandoned !== true);
 		if (blockedCards.length > 0) {
 			lines.push("", "Issues:");
 			for (const card of blockedCards) {
@@ -908,11 +923,14 @@ export class WorkProgramController {
 	async closeProgram(remove: boolean): Promise<ActionResult> {
 		if (!this.active) return { ok: false, text: "No active work program." };
 		const ledger = this.active.ledger;
-		const pending = ledger.order.filter((id) => ledger.cards[id]?.phase !== "done");
+		const pending = ledger.order.filter((id) => {
+			const card = ledger.cards[id];
+			return card !== undefined && card.phase !== "done" && card.abandoned !== true;
+		});
 		if (pending.length > 0) {
 			return {
 				ok: false,
-				text: `Cannot close: cards not done: ${pending.join(", ")}. Closing is only for completed programs — finish the cards first. Program records are untouched.`,
+				text: `Cannot close: cards not done: ${pending.join(", ")}. Closing is only for completed programs — finish the cards (or abandon their scope) first. Program records are untouched.`,
 			};
 		}
 		ledger.status = "complete";
@@ -942,6 +960,18 @@ export class WorkProgramController {
 
 	protocol(): string {
 		return loadResources().protocol;
+	}
+
+	/**
+	 * Tell the session agent to take over (used after start/resume commands so
+		 * the operator doesn't have to nudge the session manually). Same
+		 * follow-up channel as decision packets: visible message + a real turn.
+	 */
+	nudgeAgent(message: string): void {
+		this.pi.sendMessage(
+			{ customType: DECISION_CUSTOM_TYPE, content: message, display: true },
+			{ deliverAs: "followUp", triggerTurn: true },
+		);
 	}
 
 	contextBrief(): string {

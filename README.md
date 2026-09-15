@@ -88,7 +88,7 @@ Switch any time: `work_program({ action: "mode", mode: "captain" })` or `/work-p
 | Check status | "What's the program status?" or `work_program({ action: "status" })` |
 | List programs | `work_program({ action: "list" })` or `/work-program list` |
 | Triage a review | Answer the decision packet with `work_program({ action: "triage", card, verdicts })` — one verdict per finding |
-| Unblock a card | `work_program({ action: "unblock", card, resolution })` — `redispatch` retries the pending fix when one exists, otherwise restarts the card; `done` or `abandon` |
+| Unblock a card | `work_program({ action: "unblock", card, resolution })` — `redispatch` retries the pending fix when one exists (and re-adopts an abandoned card), `done` marks it finished, `abandon` drops its scope (branch kept, excluded from completion) |
 | Resolve an exhausted cycle | `work_program({ action: "cycle_decision", card, choice })` — `one_more`, `accept`, or `block` |
 | Resolve a program gate | `work_program({ action: "program_gate", choice })` — `retry` or `block` |
 | Merge a reconciled lane | `work_program({ action: "merge_resolved", card })` |
@@ -117,6 +117,8 @@ After `finalize_plan`, Pi stops and shows you the plan. That pause is load-beari
 - `plan.md` must make sense with zero conversation history. Its first line carries the machine config (`<!-- wp: {...} -->`); leave it alone.
 - Every card declares `Depends on:` explicitly (`—` when none), a `Kind: write|recon`, and a `## State: todo` line. No card starts before its dependencies are `done`.
 - Workers never touch `plan.md` or `progress.md`. The extension is the single writer of program records — it even blocks direct `write`/`edit` calls to `progress.md` while a program is active.
+- Reshape freely: fold scope into surviving cards, rewire `Depends on:`, delete dead card files and their plan rows, then `work_program({ action: "sync" })`. Safe removals are dropped (empty lanes cleaned); unsafe ones are kept and explained (done records, live dependents, lanes holding work). To drop an unfinished card deliberately, `unblock … resolution: "abandon"` — the branch is kept and the card stops counting against completion.
+- Program records live outside git when the repo ignores them (e.g. `.agents/` is gitignored): cards still reach `done` on disk, the merge still lands, and the harness warns once that records stay untracked instead of failing.
 - When every card is `done`, the program completes: the work-program UI goes quiet and the agent delivers a completion summary, then asks whether to close. Close only on your explicit word — `/work-program close --remove` (or `work_program({ action: "close", remove: true })`) deletes the folder and all card lanes; git history keeps every commit. Until then the records stay put and the program never reactivates on its own.
 - Work that needs human hands lives in `.operator/todo.md` (one `## <stream>` heading per stream; programs use their slug). Workers park items there instead of guessing; open items surface in `status`, `doctor`, and the completion summary, and never block merges or completion.
 

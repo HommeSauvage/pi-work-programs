@@ -8,6 +8,7 @@ export function readyCards(ledger: ProgramLedger): CardLedger[] {
 	return ledger.order
 		.map((id) => ledger.cards[id])
 		.filter((card): card is CardLedger => card !== undefined)
+		.filter((card) => card.abandoned !== true)
 		.filter((card) => card.phase === "pending" || card.phase === "ready")
 		.filter((card) => card.dependsOn.every((dep) => ledger.cards[dep]?.phase === "done"))
 		.filter((card) => !card.lastError || card.phase === "ready");
@@ -44,6 +45,14 @@ export function openDecisions(ledger: ProgramLedger): Decision[] {
 	return ledger.decisions.filter((decision) => decision.status === "open");
 }
 
+/** One-line inventory of the open records for a card — used in action refusals
+ *  so an agent can tell a stale record from a live one without guessing. */
+export function describeOpenDecisions(ledger: ProgramLedger, cardId: string): string {
+	const open = openDecisions(ledger).filter((decision) => decision.card === cardId);
+	if (open.length === 0) return "no open decisions";
+	return `open for card ${cardId}: ${open.map((decision) => `${decision.kind} ${decision.id}`).join(", ")}`;
+}
+
 export function nextDecisionId(ledger: ProgramLedger): string {
 	const used = new Set(ledger.decisions.map((decision) => decision.id));
 	let index = ledger.decisions.length + 1;
@@ -51,7 +60,8 @@ export function nextDecisionId(ledger: ProgramLedger): string {
 	return `d${index}`;
 }
 
-export function phaseSymbol(phase: CardPhase): string {
+export function phaseSymbol(phase: CardPhase, abandoned = false): string {
+	if (abandoned) return "✕";
 	switch (phase) {
 		case "done":
 			return "✓";
@@ -82,19 +92,24 @@ export function boardLine(ledger: ProgramLedger): string {
 		.map((id) => {
 			const card = ledger.cards[id];
 			if (!card) return `${id}?`;
-			return `${id}${phaseSymbol(card.phase)}`;
+			return `${id}${phaseSymbol(card.phase, card.abandoned === true)}`;
 		})
 		.join(" ");
 }
 
-export function counts(ledger: ProgramLedger): { done: number; total: number; blocked: number } {
+export function counts(ledger: ProgramLedger): { done: number; total: number; blocked: number; abandoned: number } {
 	let done = 0;
 	let blocked = 0;
+	let abandoned = 0;
 	for (const id of ledger.order) {
 		const card = ledger.cards[id];
 		if (!card) continue;
 		if (card.phase === "done") done += 1;
-		if (card.phase === "blocked") blocked += 1;
+		if (card.abandoned === true) {
+			abandoned += 1;
+		} else if (card.phase === "blocked") {
+			blocked += 1;
+		}
 	}
-	return { done, total: ledger.order.length, blocked };
+	return { done, total: ledger.order.length, blocked, abandoned };
 }

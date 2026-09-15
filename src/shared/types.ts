@@ -80,6 +80,8 @@ export interface CardLedger {
 	blockedFrom?: CardPhase;
 	/** Consecutive runner-infra auto-retries consumed by the current fix round. */
 	infraRetries?: number;
+	/** Operator-dropped scope: terminal, kept in records, excluded from completion gating. */
+	abandoned?: boolean;
 	updatedAt: number;
 }
 
@@ -233,6 +235,10 @@ export interface DispatchResult {
 
 export interface GitOps {
 	statusPorcelain(cwd: string): Promise<string>;
+	diffCachedQuiet(cwd: string): Promise<boolean>;
+	ignoredPaths(cwd: string, paths: string[]): Promise<string[]>;
+	commitRecords(cwd: string, message: string, paths: string[]): Promise<{ commit: string; skipped: string[] }>;
+	commitMerge(cwd: string): Promise<string>;
 	head(cwd: string): Promise<string>;
 	currentBranch(cwd: string): Promise<string>;
 	worktreeAdd(cwd: string, path: string, branch: string, baseRef: string): Promise<void>;

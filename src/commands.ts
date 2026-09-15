@@ -10,6 +10,17 @@ function completions(prefix: string): Array<{ value: string; label: string }> | 
 	return filtered.length > 0 ? filtered : null;
 }
 
+/** Follow-up that hands the session to the agent after start/resume so the
+ *  operator never has to type "continue" to get motion. */
+function startResumeNudge(controller: WorkProgramController, verb: string): string {
+	const brief = controller.contextBrief();
+	return [
+		`[WORK PROGRAM] ${verb}${brief ? ` — ${brief.split("\n")[0] ?? ""}` : ""}.`,
+		"Continue execution now: check status, let ready work dispatch, triage any open reviews.",
+		"If the drive reports errors, surface them to the operator instead of waiting in silence.",
+	].join("\n");
+}
+
 export function registerCommands(pi: ExtensionAPI, controller: WorkProgramController): void {
 	pi.registerCommand("work-program", {
 		description:
@@ -75,6 +86,7 @@ export function registerCommands(pi: ExtensionAPI, controller: WorkProgramContro
 					}
 					const result = await controller.startProgram(slug);
 					ctx.ui.notify(result.text, result.ok ? "info" : "error");
+					if (result.ok) controller.nudgeAgent(startResumeNudge(controller, "Started"));
 					return;
 				}
 				case "pause": {
@@ -86,6 +98,7 @@ export function registerCommands(pi: ExtensionAPI, controller: WorkProgramContro
 				case "resume": {
 					const result = await controller.resume();
 					ctx.ui.notify(result.text, result.ok ? "info" : "error");
+					if (result.ok) controller.nudgeAgent(startResumeNudge(controller, "Resumed"));
 					return;
 				}
 				case "mode": {

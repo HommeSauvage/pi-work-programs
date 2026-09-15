@@ -1,4 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { buildBrief } from "../src/brief.ts";
 import { DEFAULT_SETTINGS } from "../src/config.ts";
 import { buildLedger } from "../src/program/ledger.ts";
@@ -50,6 +53,23 @@ describe("buildBrief", () => {
 		const brief = buildBrief(ledger);
 		expect(brief).toContain("Card 02 review 1");
 		expect(brief).toContain("action: \"triage\"");
+	});
+
+	test("names open operator todos when a cwd is given", async () => {
+		const root = await mkdtemp(join(tmpdir(), "wp-brief-"));
+		try {
+			await mkdir(join(root, ".operator"), { recursive: true });
+			await writeFile(join(root, ".operator", "todo.md"), "## demo\n### [ ] Human step\n", "utf8");
+			const brief = buildBrief(program(), root);
+			expect(brief).toContain("Operator todos: 1 open");
+			expect(brief).toContain("## demo");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("omits the operator line without a cwd or file", () => {
+		expect(buildBrief(program())).not.toContain("Operator todos");
 	});
 
 	test("stays bounded", () => {

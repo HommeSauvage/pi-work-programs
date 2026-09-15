@@ -88,6 +88,7 @@ export interface FakeState {
 	files: Map<string, string>;
 	dispatched: Array<{ runId: string; request: DispatchRequest }>;
 	resumed: Array<{ target: string; runId: string; message: string }>;
+	stopped: string[];
 	statuses: Map<string, RunStatus>;
 	progress: string[];
 	asked: string[];
@@ -212,6 +213,7 @@ export function createTestHost(input: {
 		files,
 		dispatched: [],
 		resumed: [],
+		stopped: [],
 		statuses: new Map(),
 		progress: [],
 		asked: [],
@@ -257,6 +259,13 @@ export function createTestHost(input: {
 			return { runId };
 		},
 		status: async (runId: string): Promise<RunStatus> => fake.statuses.get(runId) ?? { state: "not_found" },
+		stop: async (runId: string): Promise<void> => {
+			fake.stopped.push(runId);
+			const current = fake.statuses.get(runId);
+			if (current && (current.state === "running" || current.state === "unknown")) {
+				fake.statuses.set(runId, { state: "stopped" });
+			}
+		},
 		heartbeat: async (runId: string): Promise<RunHeartbeat> => heartbeatSnapshot(runId),
 		heartbeatSnapshot: (runId: string): RunHeartbeat => heartbeatSnapshot(runId),
 	};

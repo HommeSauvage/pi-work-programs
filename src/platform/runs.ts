@@ -192,6 +192,11 @@ export class SubagentsRpc implements RunOps {
 		return snapshotFromStatus(runId, status);
 	}
 
+	/** Stop a live run immediately (hard pause). Throws when the run cannot be stopped. */
+	async stop(runId: string): Promise<void> {
+		await this.request("stop", { id: runId }, RPC_TIMEOUT_MS);
+	}
+
 	async status(runId: string, asyncDir?: string): Promise<RunStatus> {
 		const dir = asyncDir ?? this.asyncDirs.get(runId);
 		if (dir) {

@@ -1,5 +1,6 @@
 import type { CardLedger, FindingVerdict, GateResult, ProgramLedger } from "../shared/types.ts";
 import { indent, oneLine, truncateTail } from "../shared/text.ts";
+import { operatorTodoRule } from "../program/operator-todos.ts";
 import { MAX_OUTPUT_TAIL_CHARS, MAX_REVIEW_CHARS } from "../constants.ts";
 import type { ProtocolResources } from "./resources.ts";
 
@@ -15,6 +16,7 @@ export function workerBrief(input: {
 	cwd: string;
 	gates: string[];
 	reviewCwdNote?: string;
+	repoRoot: string;
 }): string {
 	const { ledger, card } = input;
 	const gateLines =
@@ -42,6 +44,7 @@ export function workerBrief(input: {
 		`6. Commit only your own files with message: \`wp(${ledger.slug}): ${card.id} ${oneLine(card.title, 60)}\`.`,
 		"7. Do NOT edit plan.md or progress.md.",
 		"8. If blocked, or if a plan decision is wrong, stop and ask via contact_supervisor instead of guessing.",
+		`Operator todos: ${operatorTodoRule(input.repoRoot, ledger.slug, card.id)}`,
 		"",
 		"When finished, reply with a short summary: what changed, files touched, gate results, commit SHA, and anything the reviewer should look at.",
 	].join("\n");
@@ -112,6 +115,7 @@ export function fixBrief(input: {
 	reviewPath: string;
 	verdicts: FindingVerdict[];
 	gates: string[];
+	repoRoot: string;
 }): string {
 	const approved = input.verdicts.filter((verdict) => verdict.verdict === "approve");
 	const rejected = input.verdicts.filter((verdict) => verdict.verdict === "reject");
@@ -141,6 +145,7 @@ export function fixBrief(input: {
 		"- Change only what the approved findings require.",
 		`- Re-run the gates (${gates}), update the card's \`## Evidence\` with the new exact output and commit SHA, keep \`State: review\`, and commit with \`wp(${input.ledger.slug}): ${input.card.id} review fixes\`.`,
 		"- If an approved finding is wrong or conflicts with the plan, stop and ask via contact_supervisor instead of inventing scope.",
+		`Operator todos: ${operatorTodoRule(input.repoRoot, input.ledger.slug, input.card.id)}`,
 		"",
 		"Reply with what you changed per finding and the new commit SHA(s).",
 	].join("\n");
@@ -155,6 +160,7 @@ export function captainBrief(input: {
 	gates: string[];
 	reviewProfile: "light" | "enhanced";
 	reviewPath: string;
+	repoRoot: string;
 }): string {
 	const { ledger, card } = input;
 	const gates = input.gates.length > 0 ? input.gates.map((gate) => `\`${gate}\``).join(", ") : "(none configured)";
@@ -179,7 +185,9 @@ export function captainBrief(input: {
 		"- Review is mandatory and must be a separate fresh read-only pass. Never approve your own implementation work.",
 		"- The card's `State` must be `review` while work is pending; the harness sets `done` after accepting the card.",
 		"- If a product or plan decision is needed, use contact_supervisor and wait.",
+		`Operator todos: ${operatorTodoRule(input.repoRoot, ledger.slug, card.id)}`,
 		"",
+
 		"Finish by calling structured_output with:",
 		indent(
 			[
@@ -202,6 +210,7 @@ export function gateFixBrief(input: {
 	card: CardLedger;
 	failures: GateResult[];
 	origin: "implementation" | "merge" | "captain";
+	repoRoot: string;
 }): string {
 	const failures = input.failures
 		.map((gate) => `- \`${gate.command}\` → exit ${gate.code}\n\`\`\`\n${truncateTail(gate.tail, 3_000)}\n\`\`\``)
@@ -217,6 +226,7 @@ export function gateFixBrief(input: {
 		"- Re-run the gates until they pass.",
 		`- Update the card's \`## Evidence\` with the EXACT new output and commit SHA, keep \`State: review\`, and commit with \`wp(${input.ledger.slug}): ${input.card.id} gate fixes\`.`,
 		"- If the gate itself is wrong, stop and ask via contact_supervisor instead of editing it.",
+		`Operator todos: ${operatorTodoRule(input.repoRoot, input.ledger.slug, input.card.id)}`,
 	].join("\n");
 }
 

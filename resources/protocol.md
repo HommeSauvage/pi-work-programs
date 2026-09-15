@@ -55,6 +55,35 @@ pending → ready → implementing → review_pending → reviewing → triaging
 - `close` refuses while any card is not `done`. Closing is only for completed
   programs.
 
+## Operator todos
+
+- Some work needs human hands (credentials, external approvals, secrets,
+  physical access). Park it in `.operator/todo.md` at the repository root
+  instead of guessing or stalling.
+- The extension creates the file with its header the first time a program
+  activates or a worker dispatches; the header's rules bind every writer:
+  append-only, one `## <stream>` heading per work stream (work programs use
+  their slug), items in the file's format naming the program and card, exact
+  commands for every runnable step.
+- Worker, fix, gate-fix, and captain prompts all carry this rule. Reviewers
+  are read-only and never touch the file.
+- Operator edits never pause the merge queue, and open todos never block
+  completion — they are listed in `status`/`doctor`, the session brief, and
+  the completion summary instead.
+
+## Pause and resume
+
+- Soft pause (default) halts the loop without touching running agents: no new
+  workers, reviewers, fixes, or merges are dispatched, in-flight runs keep
+  going, and their results reconcile on resume.
+- Hard pause stops every in-flight run immediately, then rearms its card so
+  resume restarts cleanly (implementing → pending for a fresh worker,
+  reviewing → pending review, fixing keeps its fix intent, an open merge is
+  reconciled again from the preserved tree). A run that cannot be stopped is
+  left running untouched and reconciles on resume.
+- Both modes are recorded in `progress.md` (what was stopped, what was
+  rearmed); resume logs its own line and restarts the drive.
+
 ## Evidence
 
 - Evidence is measured, never assumed. Paste exact command output; name the

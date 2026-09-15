@@ -1,5 +1,6 @@
 import { MAX_DIGEST_CHARS } from "./constants.ts";
 import { boardLine, counts, openDecisions, readyCards } from "./engine/phases.ts";
+import { summarizeOperatorTodos } from "./program/operator-todos.ts";
 import { formatDuration, oneLine, truncateTail } from "./shared/text.ts";
 import type { ProgramLedger } from "./shared/types.ts";
 import { loadResources } from "./protocol/resources.ts";
@@ -9,7 +10,7 @@ const RULES = [
 	"never mark a card done yourself; use work_program actions; ask via contact_supervisor when a plan decision is needed.",
 ].join(" ");
 
-export function buildBrief(ledger: ProgramLedger): string {
+export function buildBrief(ledger: ProgramLedger, cwd?: string): string {
 	const { done, total, blocked } = counts(ledger);
 	const lines: string[] = [];
 	lines.push(
@@ -34,6 +35,12 @@ export function buildBrief(ledger: ProgramLedger): string {
 		for (const decision of decisions) {
 			lines.push(`- ${decision.card ? `card ${decision.card}: ` : ""}${oneLine(decision.message ?? "decision required", 160)}`);
 			if (decision.expectedAction) lines.push(`  ${oneLine(decision.expectedAction, 220)}`);
+		}
+	}
+	if (cwd) {
+		const todos = summarizeOperatorTodos(cwd, ledger.slug);
+		if (todos && todos.open.length > 0) {
+			lines.push(`Operator todos: ${todos.open.length} open — see .operator/todo.md (## ${ledger.slug}).`);
 		}
 	}
 	if (ledger.status === "paused") lines.push("Program is PAUSED.");

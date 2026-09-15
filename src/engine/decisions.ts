@@ -1,4 +1,6 @@
 import type { Decision, ProgramLedger } from "../shared/types.ts";
+import { oneLine } from "../shared/text.ts";
+import type { OperatorTodoItem } from "../program/operator-todos.ts";
 import { counts, nextDecisionId } from "./phases.ts";
 
 export interface DecisionHost {
@@ -89,7 +91,7 @@ export function programGateDecisionMessage(failures: string[]): string {
  * It carries the summary facts and the close question; the agent turns it
  * into a completion summary for the operator and only closes on confirmation.
  */
-export function programCompleteMessage(ledger: ProgramLedger): string {
+export function programCompleteMessage(ledger: ProgramLedger, openTodos: OperatorTodoItem[] = []): string {
 	const { done, total } = counts(ledger);
 	const lines = [
 		`[WORK PROGRAM COMPLETE — ${ledger.slug}]`,
@@ -127,6 +129,10 @@ export function programCompleteMessage(ledger: ProgramLedger): string {
 		lines.push(`Program gate: green (${ledger.programGate.map((gate) => gate.command).join(", ")}).`);
 	} else {
 		lines.push("Program gate: none configured.");
+	}
+	if (openTodos.length > 0) {
+		lines.push("", `Open operator todos (${openTodos.length}) — still needing human hands (.operator/todo.md):`);
+		for (const item of openTodos.slice(0, 10)) lines.push(`- ${oneLine(item.title, 120)}`);
 	}
 	lines.push(
 		"",

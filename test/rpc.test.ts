@@ -120,6 +120,15 @@ describe("RunHeartbeat", () => {
 		rpc.dispose();
 	});
 
+	test("stop resolves when the runner acknowledges", async () => {
+		const pi = new FakePi();
+		installRpcResponder(pi);
+		const rpc = new SubagentsRpc(pi.asExtensionApi());
+		rpc.attach();
+		await rpc.stop("run-3");
+		rpc.dispose();
+	});
+
 	test("heartbeat is unknown when artifacts are gone", async () => {
 		const pi = new FakePi();
 		const rpc = new SubagentsRpc(pi.asExtensionApi());

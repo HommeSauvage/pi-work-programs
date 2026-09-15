@@ -252,6 +252,8 @@ export interface GitOps {
 export interface RunOps {
 	dispatch(request: DispatchRequest): Promise<DispatchResult>;
 	resume(runId: string, message: string): Promise<DispatchResult>;
+	/** Stop a live run immediately. Throws when the run cannot be stopped. */
+	stop(runId: string): Promise<void>;
 	status(runId: string, asyncDir?: string): Promise<RunStatus>;
 	/**
 	 * Read-only liveness snapshot for UI display (status, doctor, TUI widget).

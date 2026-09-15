@@ -26,6 +26,13 @@ import { formatProblems, validatePlanFiles } from "../program/validate.ts";
 import { defaultWorktreeDir } from "../shared/paths.ts";
 import { oneLine, slugify, formatAgo, formatDuration } from "../shared/text.ts";
 import { readTextOrUndefined, writeTextAtomic } from "../shared/fsx.ts";
+import {
+	ensureOperatorTodoFile,
+	operatorTodoPath,
+	parseOperatorTodos,
+	summarizeOperatorTodos,
+	type OperatorTodoSummary,
+} from "../program/operator-todos.ts";
 import type {
 	CardLedger,
 	DriverPorts,
@@ -44,6 +51,7 @@ import {
 	drive,
 	finishManualMerge,
 	rearmPackets,
+	rearmPausedCards,
 } from "./driver.ts";
 import { createDecision } from "./decisions.ts";
 import { counts, openDecisionFor, openDecisions, phaseSymbol } from "./phases.ts";
@@ -220,6 +228,13 @@ export class WorkProgramController {
 			ledger = await adoptProgram({ cwd: this.cwd, settings: this.settings, ref });
 		}
 		this.active = { slug: ref.slug, absDir: ref.absDir, ledger };
+		// The worker briefs point at the operator todo file; make sure it exists
+		// (verbatim header, created once — never touches existing content).
+		await ensureOperatorTodoFile({
+			readFile: (path) => readTextOrUndefined(path),
+			writeFile: (path, content) => writeTextAtomic(path, content),
+			cwd: this.cwd,
+		});
 		this.recoverStuckCards(ledger);
 		rearmPackets(ledger);
 		await this.save();
@@ -284,6 +299,10 @@ export class WorkProgramController {
 			if (!card?.activeRun) continue;
 			if (lines.length >= 5) break;
 			lines.push(`◔ ${card.id} ${card.phase} · ${this.snapshotLine(card)}`);
+		}
+		const todos = summarizeOperatorTodos(this.cwd, this.active.slug);
+		if (todos && todos.open.length > 0 && lines.length < 7) {
+			lines.push(`☐ ${todos.open.length} operator todo(s) — .operator/todo.md`);
 		}
 		for (const decision of openDecisions(this.active.ledger).slice(0, 2)) {
 			lines.push(`! ${decision.message ?? "decision required"}`);
@@ -597,22 +616,64 @@ export class WorkProgramController {
 		return { ok: true, text: `Activated work program ${ref.slug}.` };
 	}
 
-	async pause(): Promise<ActionResult> {
+	async pause(hard = false): Promise<ActionResult> {
 		if (!this.active) return { ok: false, text: "No active work program." };
-		this.active.ledger.status = "paused";
+		const ledger = this.active.ledger;
+		const flying = Object.values(ledger.cards).filter((card) => card.activeRun);
+		if (!hard) {
+			ledger.status = "paused";
+			await this.save();
+			await appendProgress(
+				this.active.absDir,
+				`paused (soft) by operator — ${flying.length} run(s) continue in flight${flying.length > 0 ? ` (${flying.map((card) => `${card.id} ${card.activeRun?.kind}`).join(", ")})` : ""}`,
+			);
+			this.refreshUi();
+			return {
+				ok: true,
+				text: `Paused ${ledger.slug} (soft). In-flight runs keep going; resume reconciles their results.`,
+			};
+		}
+		const stopped: string[] = [];
+		const unstopped: string[] = [];
+		for (const card of flying) {
+			const run = card.activeRun;
+			if (!run) continue;
+			try {
+				await this.runs.stop(run.runId);
+				card.activeRun = undefined;
+				stopped.push(`${card.id} ${run.kind}`);
+			} catch (error) {
+				// Leave the run and phase untouched: a live writer plus a resumed
+				// duplicate would violate one-writer-per-lane. It reconciles on resume.
+				unstopped.push(`${card.id} ${run.kind} (${oneLine(String(error), 100)})`);
+			}
+		}
+		const rearmed = rearmPausedCards(this);
+		ledger.status = "paused";
 		await this.save();
-		await appendProgress(this.active.absDir, "paused by operator");
+		await appendProgress(
+			this.active.absDir,
+				`paused (hard) by operator — stopped ${stopped.length} run(s)${stopped.length > 0 ? ` (${stopped.join(", ")})` : ""}; rearmed: ${rearmed.join(", ") || "none"}${unstopped.length > 0 ? `; could not stop (left running): ${unstopped.join(", ")}` : ""}`,
+			);
 		this.refreshUi();
+		this.sessionCtx?.ui.notify(`Work program: hard-paused ${ledger.slug} — stopped ${stopped.length} run(s)`, "warning");
 		return {
 			ok: true,
-			text: `Paused ${this.active.slug}. In-flight runs keep going; resume reconciles their results.`,
+			text: `Paused ${ledger.slug} (hard). Stopped ${stopped.length} run(s); cards rearmed (${rearmed.join(", ") || "none"}).${unstopped.length > 0 ? ` Could not stop: ${unstopped.join(", ")} — left running, reconciles on resume.` : " Resume to restart."}`,
 		};
 	}
 
 	async resume(): Promise<ActionResult> {
 		if (!this.active) return { ok: false, text: "No active work program." };
 		this.active.ledger.status = "active";
+		// Rearm before syncing: sync may schedule a drive tick, and rearm is
+		// synchronous, so run-less flight phases are normalized first either way.
+		const rearmed = rearmPausedCards(this);
 		await this.syncFromDisk();
+		await appendProgress(
+			this.active.absDir,
+			`resumed by operator${rearmed.length > 0 ? ` — rearmed: ${rearmed.join(", ")}` : ""}`,
+		);
 		await this.save();
 		this.scheduleDrive();
 		this.refreshUi();
@@ -660,6 +721,11 @@ export class WorkProgramController {
 				"",
 				`Merge queue: ${ledger.mergeQueue.join(" → ")}${ledger.mergeQueuePaused ? " (paused — worktree dirty)" : ""}`,
 			);
+		}
+		const todos = await this.operatorTodoSummary();
+		if (todos) {
+			lines.push("", `Operator todos (${ledger.slug}): ${todos.open.length} open`);
+			for (const item of todos.open.slice(0, 5)) lines.push(`  ☐ ${oneLine(item.title, 100)}`);
 		}
 		try {
 			const [unmerged, merging] = await Promise.all([
@@ -727,6 +793,8 @@ export class WorkProgramController {
 					`merge queue: ${ledger.mergeQueue.join(" → ")}${ledger.mergeQueuePaused ? " (paused — worktree dirty)" : ""}`,
 				);
 			}
+			const todos = await this.operatorTodoSummary();
+			if (todos) lines.push(`operator todos (${ledger.slug}): ${todos.open.length} open`);
 			try {
 				const [unmerged, merging] = await Promise.all([
 					this.git.unmergedPaths(this.cwd),
@@ -880,7 +948,19 @@ export class WorkProgramController {
 		if (!this.active) return "";
 		const status = this.active.ledger.status;
 		if (status !== "active" && status !== "paused") return "";
-		return buildBrief(this.active.ledger);
+		return buildBrief(this.active.ledger, this.cwd);
+	}
+
+	/** Open operator todos for the active program's stream, if the file exists. Never throws. */
+	private async operatorTodoSummary(): Promise<OperatorTodoSummary | undefined> {
+		if (!this.active) return undefined;
+		try {
+			const text = await readTextOrUndefined(operatorTodoPath(this.cwd));
+			if (text === undefined) return undefined;
+			return parseOperatorTodos(text, this.active.slug);
+		} catch {
+		return undefined;
+	}
 	}
 
 	/** Read-only liveness line for an in-flight run (file reads only — never disturbs the run). */

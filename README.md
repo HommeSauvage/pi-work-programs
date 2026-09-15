@@ -93,7 +93,7 @@ Switch any time: `work_program({ action: "mode", mode: "captain" })` or `/work-p
 | Resolve a program gate | `work_program({ action: "program_gate", choice })` — `retry` or `block` |
 | Merge a reconciled lane | `work_program({ action: "merge_resolved", card })` |
 | Dispatch manually (session mode) | `work_program({ action: "dispatch", card, role })` — `worker`, `reviewer`, or `reconciler` |
-| Pause / resume | `/work-program pause`, `/work-program resume` |
+| Pause / resume | `/work-program pause` (soft: let runs finish) or `--hard` (stop runs now), `/work-program resume` |
 | Sync edits you made on disk | `work_program({ action: "sync" })` |
 | Check setup | `work_program({ action: "doctor" })` or `/work-program doctor` |
 | Read the full protocol | `work_program({ action: "protocol" })` |
@@ -118,6 +118,7 @@ After `finalize_plan`, Pi stops and shows you the plan. That pause is load-beari
 - Every card declares `Depends on:` explicitly (`—` when none), a `Kind: write|recon`, and a `## State: todo` line. No card starts before its dependencies are `done`.
 - Workers never touch `plan.md` or `progress.md`. The extension is the single writer of program records — it even blocks direct `write`/`edit` calls to `progress.md` while a program is active.
 - When every card is `done`, the program completes: the work-program UI goes quiet and the agent delivers a completion summary, then asks whether to close. Close only on your explicit word — `/work-program close --remove` (or `work_program({ action: "close", remove: true })`) deletes the folder and all card lanes; git history keeps every commit. Until then the records stay put and the program never reactivates on its own.
+- Work that needs human hands lives in `.operator/todo.md` (one `## <stream>` heading per stream; programs use their slug). Workers park items there instead of guessing; open items surface in `status`, `doctor`, and the completion summary, and never block merges or completion.
 
 ## Evidence and review
 

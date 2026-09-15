@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
-import { applyTriage, applyUnblock, drive, finishManualMerge } from "../src/engine/driver.ts";
+import { applyTriage, applyUnblock, drive, finishManualMerge, rearmPausedCards } from "../src/engine/driver.ts";
 import { createTestHost, makeCardText } from "./helpers.ts";
+import type { CardLedger } from "../src/shared/types.ts";
 
 const PROGRAM_DIR = "/repo/.agents/work-programs/test-program";
 
@@ -625,6 +626,127 @@ describe("program completion", () => {
 		const decision = t.ledger.decisions.find((entry) => entry.kind === "gate-failed");
 		expect(decision?.status).toBe("open");
 		expect(t.fake.asked.some((message) => message.includes("WORK PROGRAM COMPLETE"))).toBe(false);
+	});
+});
+
+describe("operator todos", () => {
+	async function driveCardToDone(t: ReturnType<typeof createTestHost>): Promise<void> {
+		await drive(t.host);
+		writeLaneEvidence(t, "01", "evidence");
+		t.completeRun(t.fake.dispatched[0]!.runId, { output: "done" });
+		await drive(t.host);
+		t.completeRun(t.fake.dispatched.at(-1)!.runId, { output: "No issues." });
+		await drive(t.host);
+		applyTriage(t.host, "01", []);
+		await drive(t.host);
+		expect(t.ledger.cards["01"]?.phase).toBe("done");
+	}
+
+	test("worker briefs point at the program's todo stream", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await drive(t.host);
+		const task = t.fake.dispatched[0]?.request.task ?? "";
+		expect(task).toContain(".operator/todo.md");
+		expect(task).toContain("## test-program");
+		// The file is created alongside the first dispatch.
+		expect(t.fake.files.get("/repo/.operator/todo.md")?.startsWith("# Operator todo")).toBe(true);
+	});
+
+	test("operator todo edits do not pause the merge queue", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		t.git.statusOutput = " M .operator/todo.md\n M src/unrelated-note.md";
+		await drive(t.host);
+		writeLaneEvidence(t, "01", "evidence");
+		t.completeRun(t.fake.dispatched[0]!.runId, { output: "done" });
+		await drive(t.host);
+		t.completeRun(t.fake.dispatched.at(-1)!.runId, { output: "No issues." });
+		await drive(t.host);
+		applyTriage(t.host, "01", []);
+		t.git.statusOutput = " M .operator/todo.md";
+		await drive(t.host);
+		// Only the operator file is dirty: the merge proceeds.
+		expect(t.ledger.cards["01"]?.phase).toBe("done");
+		expect(t.ledger.mergeQueuePaused).not.toBe(true);
+	});
+
+	test("the completion packet lists open todos", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		t.fake.files.set(
+			"/repo/.operator/todo.md",
+			["# Operator todo", "", "## test-program", "### [ ] Fetch the prod secret - test-program - 01", ""].join("\n"),
+		);
+		await driveCardToDone(t);
+		await drive(t.host);
+		expect(t.ledger.status).toBe("complete");
+		const packet = t.fake.asked.find((message) => message.includes("WORK PROGRAM COMPLETE"));
+		expect(packet).toContain("Open operator todos (1)");
+		expect(packet).toContain("Fetch the prod secret");
+	});
+});
+
+describe("pause rearm", () => {
+	function setPhase(t: ReturnType<typeof createTestHost>, id: string, phase: CardLedger["phase"]): void {
+		t.ledger.cards[id]!.phase = phase;
+	}
+	function phaseOf(t: ReturnType<typeof createTestHost>, id: string): string {
+		return t.ledger.cards[id]?.phase ?? "?";
+	}
+	test("run-less flight phases rearm to dispatchable phases", () => {
+		const t = createTestHost({ cards: [{ id: "01" }, { id: "02" }, { id: "03" }, { id: "04" }] });
+		setPhase(t, "01", "implementing");
+		setPhase(t, "02", "reviewing");
+		setPhase(t, "03", "fixing");
+		t.ledger.cards["03"]!.fixReason = "review";
+		setPhase(t, "04", "verifying");
+		t.ledger.cards["04"]!.gates = [{ command: "bun test", code: 1, at: Date.now(), tail: "red" }];
+		const notes = rearmPausedCards(t.host);
+		expect(phaseOf(t, "01")).toBe("pending");
+		expect(phaseOf(t, "02")).toBe("review_pending");
+		expect(phaseOf(t, "03")).toBe("fixing");
+		expect(t.ledger.cards["03"]?.fixReason).toBe("review");
+		expect(phaseOf(t, "04")).toBe("fixing");
+		expect(notes).toEqual(["01 implementing→pending", "02 reviewing→review_pending", "04 verifying→fixing"]);
+	});
+
+	test("cards with live runs are left alone", () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		const card = t.ledger.cards["01"]!;
+		card.phase = "implementing";
+		card.activeRun = { kind: "worker", runId: "run-1", startedAt: Date.now() };
+		card.lastError = "old";
+		expect(rearmPausedCards(t.host)).toEqual([]);
+		expect(card.phase).toBe("implementing");
+		expect(card.activeRun?.runId).toBe("run-1");
+		expect(card.lastError).toBe("old");
+	});
+
+	test("a run-less reconciling head with an open merge redispatches the reconciler", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		const card: CardLedger = t.ledger.cards["01"]!;
+		setPhase(t, "01", "reconciling");
+		card.lane = { path: "/wt/test-program/01", branch: "feat/foo-card-01", base: "base0" };
+		card.merge = { state: "conflict", attempts: 1 };
+		t.ledger.mergeQueue.push("01");
+		t.git.unmerged = ["src/x.ts"];
+		await drive(t.host);
+		const reconciler = t.fake.dispatched.at(-1)!;
+		expect(reconciler.request.kind).toBe("reconciler");
+		expect(phaseOf(t, "01")).toBe("reconciling");
+		expect(card.activeRun?.kind).toBe("reconciler");
+	});
+
+	test("a run-less reconciling head with no merge state requeues", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		const card: CardLedger = t.ledger.cards["01"]!;
+		setPhase(t, "01", "reconciling");
+		card.lane = { path: "/wt/test-program/01", branch: "feat/foo-card-01", base: "base0" };
+		card.merge = { state: "conflict", attempts: 1 };
+		t.ledger.mergeQueue.push("01");
+		t.git.unmerged = [];
+		await drive(t.host);
+		// No merge state left: the card rejoins the queue and merges cleanly.
+		expect(phaseOf(t, "01")).toBe("done");
+		expect(t.fake.dispatched.some((entry) => entry.request.kind === "reconciler")).toBe(false);
 	});
 });
 

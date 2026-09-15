@@ -122,6 +122,16 @@ export function installRpcResponder(pi: FakePi, options: { runId?: string; async
 			});
 			return;
 		}
+		if (request.method === "stop") {
+			pi.events.emit(replyEvent, {
+				version: 1,
+				requestId: request.requestId,
+				method: "stop",
+				success: true,
+				data: { text: "stopped" },
+			});
+			return;
+		}
 		pi.events.emit(replyEvent, {
 			version: 1,
 			requestId: request.requestId,

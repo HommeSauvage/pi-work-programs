@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
@@ -28,7 +29,10 @@ export async function ensureDir(path: string): Promise<void> {
 
 export async function writeTextAtomic(path: string, content: string): Promise<void> {
 	await ensureDir(dirname(path));
-	const tempPath = `${path}.tmp-${process.pid}-${Date.now()}`;
+	// Unique per call: concurrent saves (a drive tick racing a tool mutation)
+	// must never share a temp name — same-ms writers used to eat each other's
+	// rename and crash with ENOENT.
+	const tempPath = `${path}.tmp-${process.pid}-${Date.now()}-${randomUUID().slice(0, 8)}`;
 	await writeFile(tempPath, content, "utf8");
 	await rename(tempPath, path);
 }

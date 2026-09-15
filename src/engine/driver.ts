@@ -9,6 +9,12 @@ import {
 } from "../protocol/briefs.ts";
 import { appendHarnessEvidence, gateEvidenceLines, setCardState } from "../program/card-edit.ts";
 import { laneBranch, reviewPath } from "../program/ledger.ts";
+import {
+	ensureOperatorTodoFile,
+	operatorTodoPath,
+	parseOperatorTodos,
+	type OperatorTodoItem,
+} from "../program/operator-todos.ts";
 import { parseEvidence } from "../program/parse.ts";
 import { oneLine, truncateTail } from "../shared/text.ts";
 import type {
@@ -268,7 +274,7 @@ async function startGateFix(
 	}
 	card.fixReason = "gate";
 	card.lastError = undefined;
-	const task = gateFixBrief({ ledger: host.ledger, card, failures: gates, origin });
+	const task = gateFixBrief({ ledger: host.ledger, card, failures: gates, origin, repoRoot: host.cwd });
 	const cwd = card.merge?.state === "merged" ? host.cwd : host.ports.runCwd(host.ledger, card);
 	const dispatched = await dispatchWithInfraRetry(host, card, {
 		kind: "fix",
@@ -463,6 +469,13 @@ export async function startWorkerFor(host: DriverHost, card: CardLedger): Promis
 	const ledger = host.ledger;
 	card.gateAttempts = 0;
 	card.lastError = undefined;
+	// The worker brief points at the operator todo file; make sure it exists.
+	// Best-effort: a missing file never blocks the card (the brief stands alone).
+	await ensureOperatorTodoFile({
+		readFile: (path) => host.ports.readFile(path).then((text) => (text.trim().length > 0 ? text : undefined)),
+		writeFile: (path, content) => host.ports.writeFile(path, content),
+		cwd: host.cwd,
+	});
 	try {
 		await ensureLane(host, card);
 	} catch (error) {
@@ -481,6 +494,7 @@ export async function startWorkerFor(host: DriverHost, card: CardLedger): Promis
 			gates: ledger.gates.card,
 			reviewProfile,
 			reviewPath: path,
+			repoRoot: host.cwd,
 		});
 		const dispatched = await dispatchWithInfraRetry(host, card, {
 			kind: "captain",
@@ -502,6 +516,7 @@ export async function startWorkerFor(host: DriverHost, card: CardLedger): Promis
 		planPath: planPath(host),
 		cwd: host.ports.runCwd(ledger, card),
 		gates: ledger.gates.card,
+		repoRoot: host.cwd,
 	});
 	try {
 		const dispatched = await dispatchWithInfraRetry(host, card, {
@@ -625,6 +640,7 @@ async function dispatchFixes(host: DriverHost): Promise<void> {
 			reviewPath: decision?.reviewPath ?? "",
 			verdicts,
 			gates: ledger.gates.card,
+			repoRoot: host.cwd,
 		});
 		const cwd = host.ports.runCwd(ledger, card);
 		if (card.workerRun) {
@@ -725,6 +741,37 @@ export function rearmPackets(ledger: ProgramLedger): void {
 	}
 }
 
+/**
+ * Rearm cards left run-less in a flight phase (e.g. after a hard pause stopped
+ * their runs). Only touches cards with no active run; cards with live runs
+ * (soft-paused, or runs that could not be stopped) are left alone so their
+ * results reconcile normally. Returns human-readable notes for progress.
+ * Fixing cards keep their fix intent (dispatchFixes re-dispatches from the
+ * resolved triage); reconciling cards are picked back up by the merge queue.
+ */
+export function rearmPausedCards(host: DriverHost): string[] {
+	const notes: string[] = [];
+	for (const card of ledgerCards(host.ledger)) {
+		if (card.activeRun) continue;
+		const from = card.phase;
+		if (from === "implementing") {
+			card.phase = "pending";
+			card.lastError = undefined;
+		} else if (from === "reviewing") {
+			card.phase = "review_pending";
+			card.lastError = undefined;
+		} else if (from === "verifying") {
+			const failed = (card.gates ?? []).some((gate) => gate.code !== 0);
+			card.phase = failed ? "fixing" : "review_pending";
+			card.lastError = undefined;
+		} else {
+			continue;
+		}
+		notes.push(`${card.id} ${from}→${card.phase}`);
+	}
+	return notes;
+}
+
 /** Porcelain entries outside the program's own record folder and lane worktrees. */
 async function foreignChanges(host: DriverHost): Promise<string[]> {
 	const raw = await host.ports.git.statusPorcelain(host.cwd);
@@ -733,6 +780,9 @@ async function foreignChanges(host: DriverHost): Promise<string[]> {
 	const programAbs = host.programDir.replace(/\\/g, "/").replace(/\/+$/, "");
 	const programRel = programAbs.startsWith(`${cwd}/`) ? programAbs.slice(cwd.length + 1) : programAbs;
 	excluded.add(programRel);
+	// The operator todo file is operator-owned scratch space: operator edits must
+	// never pause the merge queue.
+	excluded.add(".operator");
 	for (const id of host.ledger.order) {
 		const lane = host.ledger.cards[id]?.lane;
 		if (!lane) continue;
@@ -778,6 +828,20 @@ async function processMergeQueue(host: DriverHost): Promise<void> {
 			}
 			ledger.mergeQueue.shift();
 			await progress(host, `${card.id} removed from the merge queue (blocked)`);
+			await host.save();
+			continue;
+		}
+		if (card.phase === "reconciling" && !card.activeRun) {
+			// Run-less reconciling head (e.g. its reconciler was stopped by a hard
+			// pause): pick the preserved merge back up instead of parking the queue.
+			const unmergedNow = await host.ports.git.unmergedPaths(host.cwd);
+			const mergingNow = await host.ports.git.merging(host.cwd);
+			if (unmergedNow.length > 0 || mergingNow) {
+				await beginReconcile(host, card, { conflicted: unmergedNow, output: "" }, true);
+				return;
+			}
+			card.phase = "queued";
+			card.merge = { state: "queued", attempts: card.merge?.attempts ?? 0 };
 			await host.save();
 			continue;
 		}
@@ -1030,7 +1094,18 @@ async function completeProgram(host: DriverHost, how: string): Promise<void> {
 		.commitPaths(host.cwd, `wp(${ledger.slug}): program complete`, programRecordPaths(host))
 		.catch(() => undefined);
 	host.ports.notify(`Work program ${ledger.slug} complete`, "info");
-	host.ports.ask(programCompleteMessage(ledger));
+	host.ports.ask(programCompleteMessage(ledger, await openOperatorTodos(host, ledger.slug)));
+}
+
+/** Open operator todos for this program's stream, if the file exists. Never throws. */
+async function openOperatorTodos(host: DriverHost, stream: string): Promise<OperatorTodoItem[]> {
+	try {
+		const text = await host.ports.readFile(operatorTodoPath(host.cwd));
+		if (!text || text.trim().length === 0) return [];
+		return parseOperatorTodos(text, stream).open;
+	} catch {
+		return [];
+	}
 }
 
 /* ---------------------------------------------------------------------------

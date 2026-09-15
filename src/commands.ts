@@ -13,7 +13,7 @@ function completions(prefix: string): Array<{ value: string; label: string }> | 
 export function registerCommands(pi: ExtensionAPI, controller: WorkProgramController): void {
 	pi.registerCommand("work-program", {
 		description:
-			"Work programs: status | list | new <title> | start <slug> | pause | resume | mode <session|managed|captain> | sync | doctor | close [--remove]",
+			"Work programs: status | list | new <title> | start <slug> | pause [--hard] | resume | mode <session|managed|captain> | sync | doctor | close [--remove]",
 		getArgumentCompletions: completions,
 		handler: async (args, ctx) => {
 			const parts = args.trim().split(/\s+/).filter((part) => part.length > 0);
@@ -78,7 +78,8 @@ export function registerCommands(pi: ExtensionAPI, controller: WorkProgramContro
 					return;
 				}
 				case "pause": {
-					const result = await controller.pause();
+					const hard = rest.includes("--hard");
+					const result = await controller.pause(hard);
 					ctx.ui.notify(result.text, result.ok ? "info" : "error");
 					return;
 				}

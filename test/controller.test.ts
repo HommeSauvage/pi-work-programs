@@ -119,6 +119,115 @@ describe("controller guards", () => {
 	});
 });
 
+describe("operator todos", () => {
+	test("activating a program creates the todo file with the verbatim header", async () => {
+		const { controller, cwd } = await setupProgram();
+		const { readFile } = await import("node:fs/promises");
+		const text = await readFile(join(cwd, ".operator", "todo.md"), "utf8");
+		expect(text.startsWith("# Operator todo\n")).toBe(true);
+		expect(text).toContain("NEVER delete or rewrite existing content");
+		expect(controller.getActive()?.slug).toBe("test-program");
+	});
+
+	test("status lists the program stream's open todos", async () => {
+		const { controller, cwd } = await setupProgram();
+		const { mkdir, writeFile } = await import("node:fs/promises");
+		await mkdir(join(cwd, ".operator"), { recursive: true });
+		await writeFile(
+			join(cwd, ".operator", "todo.md"),
+			[
+				"# Operator todo",
+				"",
+				"## test-program",
+				"### [ ] Rotate the prod key - test-program - 01",
+					"Rotate the production API key; the agent has no vault access.",
+					"1. Run `vault rotate prod`.",
+				"### [x] Already done",
+				"",
+				"## other",
+				"### [ ] Not ours",
+				"",
+			].join("\n"),
+			"utf8",
+		);
+		const text = await controller.statusText();
+		expect(text).toContain("Operator todos (test-program): 1 open");
+		expect(text).toContain("Rotate the prod key");
+		expect(text).not.toContain("Not ours");
+		const doctor = await controller.doctor();
+		expect(doctor).toContain("operator todos (test-program): 1 open");
+	});
+});
+
+describe("soft and hard pause", () => {
+	test("soft pause leaves in-flight runs alone and records it", async () => {
+		const { controller, cwd } = await setupProgram();
+		const card = controller.getActive()!.ledger.cards["01"]!;
+		card.phase = "implementing";
+		card.activeRun = { kind: "worker", runId: "run-1", startedAt: Date.now() };
+		const result = await controller.pause();
+		expect(result.ok).toBe(true);
+		expect(result.text).toContain("(soft)");
+		expect(card.activeRun?.runId).toBe("run-1");
+		expect(card.phase).toBe("implementing");
+		expect(controller.getActive()!.ledger.status).toBe("paused");
+		const { readFile } = await import("node:fs/promises");
+		const progress = await readFile(join(cwd, ".agents", "work-programs", "test-program", "progress.md"), "utf8");
+		expect(progress).toContain("paused (soft)");
+		expect(progress).toContain("01 worker");
+	});
+
+	test("hard pause stops runs and rearms their cards", async () => {
+		const { controller, cwd } = await setupProgram();
+		const card = controller.getActive()!.ledger.cards["01"]!;
+		card.phase = "implementing";
+		card.activeRun = { kind: "worker", runId: "run-9", startedAt: Date.now() };
+		const result = await controller.pause(true);
+		expect(result.ok).toBe(true);
+		expect(result.text).toContain("(hard)");
+		expect(card.activeRun).toBeUndefined();
+		expect(card.phase as string).toBe("pending");
+		const { readFile } = await import("node:fs/promises");
+		const progress = await readFile(join(cwd, ".agents", "work-programs", "test-program", "progress.md"), "utf8");
+		expect(progress).toContain("paused (hard)");
+		expect(progress).toContain("stopped 1 run(s) (01 worker)");
+		expect(progress).toContain("01 implementing→pending");
+	});
+
+	test("hard pause leaves runs it cannot stop untouched", async () => {
+		const { controller, cwd } = await setupProgram();
+		Object.assign(controller.runs, {
+			stop: async () => {
+				throw new Error("runner gone");
+			},
+		});
+		const card = controller.getActive()!.ledger.cards["01"]!;
+		card.phase = "fixing";
+		card.fixReason = "review";
+		card.activeRun = { kind: "fix", runId: "run-9", startedAt: Date.now() };
+		const result = await controller.pause(true);
+		expect(result.ok).toBe(true);
+		expect(card.activeRun?.runId).toBe("run-9");
+		expect(card.phase).toBe("fixing");
+		const { readFile } = await import("node:fs/promises");
+		const progress = await readFile(join(cwd, ".agents", "work-programs", "test-program", "progress.md"), "utf8");
+		expect(progress).toContain("could not stop");
+	});
+
+	test("resume rearms stranded cards and logs it", async () => {
+		const { controller, cwd } = await setupProgram();
+		const card = controller.getActive()!.ledger.cards["01"]!;
+		card.phase = "reviewing";
+		const result = await controller.resume();
+		expect(result.ok).toBe(true);
+		expect(controller.getActive()!.ledger.status).toBe("active");
+		const { readFile } = await import("node:fs/promises");
+		const progress = await readFile(join(cwd, ".agents", "work-programs", "test-program", "progress.md"), "utf8");
+		expect(progress).toContain("resumed by operator");
+		expect(progress).toContain("01 reviewing→review_pending");
+	});
+});
+
 describe("completion and close-out", () => {
 	test("close refuses while any card is pending — even with remove", async () => {
 		const { controller } = await setupProgram();

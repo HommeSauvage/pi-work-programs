@@ -21,6 +21,7 @@ interface WorkProgramParams {
 	resolution?: string;
 	choice?: string;
 	remove?: boolean;
+	hard?: boolean;
 	verdicts?: Array<{ finding: string; verdict: string; note?: string }>;
 }
 
@@ -97,6 +98,7 @@ export function registerTools(pi: ExtensionAPI, controller: WorkProgramControlle
 			"Use work_program to inspect and drive a work program; never edit plan.md or progress.md directly.",
 			"finalize_plan only validates and stages a program — it never starts execution. After writing a plan, STOP and wait for the operator to review; only call resume/start/dispatch after the operator explicitly says to start.",
 			"When a work program completes, you receive a summary packet: reply with a completion summary, then ask whether to close the program. Only call close with remove:true after the operator explicitly confirms — never delete program records unprompted.",
+			"Pause is soft by default (in-flight runs finish, resume reconciles); pass hard:true to stop runs immediately and rearm their cards. Resume restarts the drive.",
 			"When a work-program decision packet arrives, answer with the exact work_program call it names (for review triage use action 'triage' with one verdict per finding).",
 		],
 		parameters: Type.Object({
@@ -112,6 +114,9 @@ export function registerTools(pi: ExtensionAPI, controller: WorkProgramControlle
 				Type.String({ description: "cycle_decision: one_more | accept | block; program_gate: retry | block" }),
 			),
 			remove: Type.Optional(Type.Boolean({ description: "close with remove=true deletes the program folder" })),
+			hard: Type.Optional(
+				Type.Boolean({ description: "pause with hard=true stops in-flight runs immediately (default soft: let them finish)" }),
+			),
 			verdicts: Type.Optional(
 				Type.Array(
 					Type.Object({
@@ -179,7 +184,7 @@ export function registerTools(pi: ExtensionAPI, controller: WorkProgramControlle
 					return textResult(result.text, { ok: true });
 				}
 				case "pause": {
-					const result = await controller.pause();
+					const result = await controller.pause(params.hard === true);
 					if (!result.ok) fail(result.text);
 					return textResult(result.text, { ok: true });
 				}

@@ -965,6 +965,67 @@ describe("program reshape (file-driven removal)", () => {
 	});
 });
 
+describe("pause blocks new runs", () => {
+	test("unblock redispatch is refused while paused and dispatches nothing", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await drive(t.host);
+		writeLaneEvidence(t, "01", "evidence");
+		t.completeRun(t.fake.dispatched[0]!.runId, { output: "done" });
+		await drive(t.host);
+		t.completeRun(t.fake.dispatched.at(-1)!.runId, { output: "F1: bug" });
+		await drive(t.host);
+		applyTriage(t.host, "01", [{ finding: "F1", verdict: "approve" }]);
+		const card = t.ledger.cards["01"]!;
+		expect(card.phase).toBe("fixing");
+		// The fix run dispatches, then dies; the operator soft-pauses before answering.
+		await drive(t.host);
+		const fixRun = card.activeRun!.runId;
+		t.failRun(fixRun, "runner died");
+		await drive(t.host);
+		expect(card.phase).toBe("blocked");
+		t.ledger.status = "paused";
+		const before = t.fake.dispatched.length;
+		const resumedBefore = t.fake.resumed.length;
+		const result = await applyUnblock(t.host, "01", "redispatch");
+		expect(result.ok).toBe(false);
+		expect(result.error).toContain("program is paused");
+		expect(result.error).toContain("resume first");
+		expect(t.fake.dispatched.length).toBe(before);
+		expect(t.fake.resumed.length).toBe(resumedBefore);
+	});
+
+	test("unblock done and abandon still work while paused", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		const card = t.ledger.cards["01"]!;
+		card.phase = "blocked";
+		t.ledger.status = "paused";
+		const abandoned = await applyUnblock(t.host, "01", "abandon");
+		expect(abandoned.ok).toBe(true);
+		expect(card.abandoned).toBe(true);
+	});
+
+	test("manual dispatch is refused while paused", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		t.ledger.status = "paused";
+		const result = await dispatchManual(t.host, "01", "worker");
+		expect(result.ok).toBe(false);
+		expect(result.error).toContain("program is paused");
+		expect(t.fake.dispatched).toHaveLength(0);
+	});
+
+	test("resume re-enables redispatch", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		const card = t.ledger.cards["01"]!;
+		card.phase = "blocked";
+		t.ledger.status = "paused";
+		const blocked = await applyUnblock(t.host, "01", "redispatch");
+		expect(blocked.ok).toBe(false);
+		t.ledger.status = "active";
+		const allowed = await applyUnblock(t.host, "01", "redispatch");
+		expect(allowed.ok).toBe(true);
+	});
+});
+
 describe("dispatch failures", () => {
 	test("a failing dispatch blocks the card instead of retrying silently", async () => {
 		const t = createTestHost({ cards: [{ id: "01" }] });

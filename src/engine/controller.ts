@@ -894,6 +894,12 @@ export class WorkProgramController {
 		if (!inMerge) {
 			return { ok: false, text: `Card ${cardId} is ${card.phase}; merge_resolved only applies to a card in a merge.` };
 		}
+		if (this.active.ledger.status !== "active") {
+			return {
+				ok: false,
+				text: `Program is ${this.active.ledger.status}; finalizing a merge can start a gate fix — resume first.`,
+			};
+		}
 		if (this.active.ledger.parallelExecution === "worktrees" && card.lane) {
 			const landed = await this.git.isAncestor(this.cwd, card.lane.branch, "HEAD");
 			if (!landed) {

@@ -218,6 +218,20 @@ function isInfraError(error: unknown): boolean {
 }
 
 /**
+ * Guards every operator-triggered path that would start an agent run. A pause
+ * must mean "no new runs": the drive loop's own status check cannot cover
+ * synchronous tool actions, which otherwise redispatch straight into an
+ * exhausted quota.
+ */
+function requireActiveForDispatch(host: DriverHost): { ok: false; error: string } | undefined {
+	if (host.ledger.status === "active") return undefined;
+	return {
+		ok: false,
+		error: `program is ${host.ledger.status}; this would start a run — resume first (work_program({ action: "resume" })), or use a resolution that does not dispatch (done / abandon)`,
+	};
+}
+
+/**
  * Drop a card's scope deliberately. Terminal, but never destructive: the
  * branch is kept for inspection, the record stays, and completion/close treat
  * it as resolved. Refuses while live cards still depend on it (rewire first),
@@ -1378,6 +1392,10 @@ export async function applyUnblock(
 	if (resolution === "abandon") {
 		return abandonCard(host, card);
 	}
+	// Redispatch can start a run (gate fix, reconciler, fresh worker): refused
+	// while paused so a pause actually stops spending.
+	const dispatchGate = requireActiveForDispatch(host);
+	if (dispatchGate) return dispatchGate;
 	const reviewed = host.ledger.decisions.some(
 		(entry) => entry.card === cardId && entry.kind === "review-triage" && entry.status === "resolved",
 	);
@@ -1500,6 +1518,8 @@ export async function dispatchManual(
 ): Promise<{ ok: boolean; error?: string }> {
 	const card = host.ledger.cards[cardId];
 	if (!card) return { ok: false, error: `unknown card ${cardId}` };
+	const dispatchGate = requireActiveForDispatch(host);
+	if (dispatchGate) return dispatchGate;
 	if (card.activeRun) return { ok: false, error: `card ${cardId} already has an active run` };
 	// An explicit operator dispatch moves the card forward, so it also retires
 	// any open `blocked` record — otherwise the record goes stale and shadows

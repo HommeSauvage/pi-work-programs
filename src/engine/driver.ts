@@ -36,7 +36,7 @@ import {
 	resolveDecision,
 	reviewDecisionMessage,
 } from "./decisions.ts";
-import { openDecisionFor, openDecisions, readyCards, writersInFlight } from "./phases.ts";
+import { openDecisionFor, openDecisionOfKind, openDecisions, readyCards, writersInFlight } from "./phases.ts";
 
 const UNKNOWN_RUN_GRACE_MS = 10 * 60_000;
 
@@ -50,6 +50,7 @@ export interface DriverHost {
 }
 
 const TERMINAL_STATES = new Set(["complete", "failed", "stopped", "paused", "rejected", "not_found"]);
+const MAX_FIX_INFRA_RETRIES = 2;
 const CAPTAIN_OUTPUT_SCHEMA: Record<string, unknown> = {
 	type: "object",
 	properties: {
@@ -133,6 +134,7 @@ export async function drive(host: DriverHost): Promise<void> {
 	}
 
 	await reconcileRuns(host);
+	await resolveStaleBlocks(host);
 	if (ledger.mode === "managed" || ledger.mode === "captain") {
 		await dispatchReadyCards(host);
 		await dispatchReviews(host);
@@ -198,10 +200,33 @@ async function blockCard(host: DriverHost, card: CardLedger, reason: string): Pr
 	host.ports.notify(`Work program: card ${card.id} blocked — ${oneLine(reason, 100)}`, "error");
 }
 
-function isInfraDispatchError(error: unknown): boolean {
+/** Runner/transport flakes (never a code failure): safe to retry without asking. */
+function isInfraError(error: unknown): boolean {
 	return /timed out|timeout|runner startup|control .confirm|no run id|ECONN|EPIPE|EAI_AGAIN|socket hang up|temporarily unavailable/i.test(
 		String(error),
 	);
+}
+
+/**
+ * Resolve `blocked` decisions whose card has already moved on (e.g. an
+ * operator redispatch via `dispatch` advanced the card without resolving the
+ * record). Stale records must never shadow later decisions or re-ask the
+ * operator about a resolved block. Cards still blocked/reconciling keep theirs.
+ */
+async function resolveStaleBlocks(host: DriverHost): Promise<void> {
+	let resolved = 0;
+	for (const decision of host.ledger.decisions) {
+		if (decision.status !== "open" || decision.kind !== "blocked" || !decision.card) continue;
+		const card = host.ledger.cards[decision.card];
+		if (!card) continue;
+		if (card.phase === "blocked" || card.phase === "reconciling") continue;
+		resolveDecision(host, decision.id);
+		resolved += 1;
+	}
+	if (resolved > 0) {
+		await progress(host, `cleared ${resolved} stale blocked decision(s) whose cards moved on`);
+		await host.save();
+	}
 }
 
 /**
@@ -218,7 +243,7 @@ async function dispatchWithInfraRetry(
 		await dispatchRun(host, card, request);
 		return { ok: true };
 	} catch (error) {
-		if (!isInfraDispatchError(error)) return { ok: false, error: oneLine(String(error), 200) };
+		if (!isInfraError(error)) return { ok: false, error: oneLine(String(error), 200) };
 		try {
 			await dispatchRun(host, card, request);
 			await progress(host, `${card.id} dispatch retry succeeded after an infra failure`);
@@ -334,6 +359,19 @@ async function onFixComplete(host: DriverHost, card: CardLedger, status: RunStat
 		return;
 	}
 	if (status.state !== "complete") {
+		// Runner infra flakes (not code failures) retry in place: the run is dead
+		// but the fix intent survives, so the same tick's dispatchFixes picks it
+		// back up (resume-first, then fresh). Capped — then it blocks loudly.
+		if (isInfraError(status.error ?? "") && (card.infraRetries ?? 0) < MAX_FIX_INFRA_RETRIES) {
+			card.infraRetries = (card.infraRetries ?? 0) + 1;
+			await progress(
+				host,
+				`${card.id} fix run hit runner infra (${status.state}${status.error ? `: ${oneLine(status.error, 120)}` : ""}) — auto-retry ${card.infraRetries}/${MAX_FIX_INFRA_RETRIES}`,
+			);
+			await host.save();
+			return;
+		}
+		card.infraRetries = 0;
 		await blockCard(
 			host,
 			card,
@@ -342,6 +380,7 @@ async function onFixComplete(host: DriverHost, card: CardLedger, status: RunStat
 		return;
 	}
 	card.fixReason = undefined;
+	card.infraRetries = 0;
 	const cwd = wasMerged ? host.cwd : host.ports.runCwd(host.ledger, card);
 	const outcome = await runCardGates(host, card, cwd);
 	if (!outcome.ok) {
@@ -615,7 +654,9 @@ async function dispatchFixes(host: DriverHost): Promise<void> {
 	const ledger = host.ledger;
 	for (const card of ledgerCards(ledger)) {
 		if (card.phase !== "fixing" || card.activeRun) continue;
-		if (openDecisionFor(ledger, card.id)) continue;
+		// Only an untriaged review holds fixes back — never a stale record of
+		// another kind (a stale `blocked` decision is cleared via unblock/sweep).
+		if (openDecisionOfKind(ledger, card.id, "review-triage")) continue;
 		if (!card.lane) {
 			try {
 				await ensureLane(host, card);
@@ -1061,7 +1102,9 @@ async function maybeRunProgramGate(host: DriverHost): Promise<void> {
 	const cards = ledgerCards(ledger);
 	if (cards.length === 0) return;
 	if (!cards.every((card) => card.phase === "done")) return;
-	if (openDecisionFor(ledger)) return;
+	// Only an open program-gate decision holds completion: with every card done,
+	// any other open record is stale and must not wedge the program.
+	if (openDecisions(ledger).some((decision) => decision.kind === "gate-failed")) return;
 	const commands = ledger.gates.program;
 	if (commands.length === 0) {
 		await completeProgram(host, "no program gate configured");
@@ -1115,8 +1158,9 @@ async function openOperatorTodos(host: DriverHost, stream: string): Promise<Oper
 export function applyTriage(host: DriverHost, cardId: string, verdicts: FindingVerdict[]): { ok: boolean; error?: string } {
 	const card = host.ledger.cards[cardId];
 	if (!card) return { ok: false, error: `unknown card ${cardId}` };
-	const decision = openDecisionFor(host.ledger, cardId);
-	if (!decision || decision.kind !== "review-triage") {
+	// Kind-scoped: a stale `blocked` record must never shadow the live review.
+	const decision = openDecisionOfKind(host.ledger, cardId, "review-triage");
+	if (!decision) {
 		return { ok: false, error: `card ${cardId} has no open review decision` };
 	}
 	const approved = verdicts.filter((verdict) => verdict.verdict === "approve");
@@ -1146,6 +1190,7 @@ export function applyTriage(host: DriverHost, cardId: string, verdicts: FindingV
 		return { ok: true };
 	}
 	card.phase = "fixing";
+	card.infraRetries = 0;
 	return { ok: true };
 }
 
@@ -1157,6 +1202,15 @@ export async function applyUnblock(
 	const card = host.ledger.cards[cardId];
 	if (!card) return { ok: false, error: `unknown card ${cardId}` };
 	if (card.phase !== "blocked" && card.phase !== "reconciling") {
+		// The card already moved on (e.g. an operator redispatch via `dispatch`),
+		// but a `blocked` record stayed open: clear the orphan without touching
+		// the phase, instead of deadlocking every action on it.
+		const stale = openDecisionOfKind(host.ledger, cardId, "blocked");
+		if (stale) {
+			resolveDecision(host, stale.id);
+			await progress(host, `${cardId} stale blocked decision cleared (card is ${card.phase})`);
+			return { ok: true };
+		}
 		return { ok: false, error: `card ${cardId} is ${card.phase}; only a blocked card can be unblocked` };
 	}
 	const decision = openDecisionFor(host.ledger, cardId);
@@ -1177,6 +1231,7 @@ export async function applyUnblock(
 	card.lastError = undefined;
 	card.activeRun = undefined;
 	card.blockedFrom = undefined;
+	card.infraRetries = 0;
 	if (resolution === "done") {
 		if (!reviewed) {
 			return { ok: false, error: `card ${cardId} has no completed review; use "redispatch" instead` };
@@ -1244,13 +1299,14 @@ export function applyCycleDecision(
 ): { ok: boolean; error?: string } {
 	const card = host.ledger.cards[cardId];
 	if (!card) return { ok: false, error: `unknown card ${cardId}` };
-	const decision = openDecisionFor(host.ledger, cardId);
-	if (!decision || decision.kind !== "cycle-exhausted") {
+	const decision = openDecisionOfKind(host.ledger, cardId, "cycle-exhausted");
+	if (!decision) {
 		return { ok: false, error: `card ${cardId} has no open cycle decision` };
 	}
 	resolveDecision(host, decision.id);
 	if (choice === "one_more") {
 		card.phase = "fixing";
+		card.infraRetries = 0;
 		return { ok: true };
 	}
 	if (choice === "accept") {
@@ -1285,12 +1341,18 @@ export async function dispatchManual(
 	const card = host.ledger.cards[cardId];
 	if (!card) return { ok: false, error: `unknown card ${cardId}` };
 	if (card.activeRun) return { ok: false, error: `card ${cardId} already has an active run` };
+	// An explicit operator dispatch moves the card forward, so it also retires
+	// any open `blocked` record — otherwise the record goes stale and shadows
+	// later decisions (the card advances, the block does not).
+	const staleBlocked = openDecisionOfKind(host.ledger, cardId, "blocked");
 	if (role === "worker") {
 		const depBlocked = card.dependsOn.some((dep) => host.ledger.cards[dep]?.phase !== "done");
 		if (depBlocked) return { ok: false, error: `card ${cardId} has unmet dependencies` };
 		if (card.phase !== "pending" && card.phase !== "ready" && card.phase !== "blocked") {
 			return { ok: false, error: `card ${cardId} is ${card.phase}, not ready for a worker` };
 		}
+		if (staleBlocked) resolveDecision(host, staleBlocked.id);
+		card.infraRetries = 0;
 		await startWorkerFor(host, card);
 		return { ok: true };
 	}
@@ -1300,6 +1362,8 @@ export async function dispatchManual(
 		if (card.phase !== "review_pending") {
 			return { ok: false, error: `card ${cardId} is ${card.phase}; only a pending review can be dispatched` };
 		}
+		if (staleBlocked) resolveDecision(host, staleBlocked.id);
+		card.infraRetries = 0;
 		await startReviewFor(host, card);
 		return { ok: true };
 	}

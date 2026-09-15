@@ -1,8 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
-import { applyTriage, applyUnblock, drive, finishManualMerge, rearmPausedCards } from "../src/engine/driver.ts";
+import { applyTriage, applyUnblock, dispatchManual, drive, finishManualMerge, rearmPausedCards } from "../src/engine/driver.ts";
+import { createDecision } from "../src/engine/decisions.ts";
 import { createTestHost, makeCardText } from "./helpers.ts";
 import type { CardLedger } from "../src/shared/types.ts";
+
+function setPhase(t: ReturnType<typeof createTestHost>, id: string, phase: CardLedger["phase"]): void {
+	t.ledger.cards[id]!.phase = phase;
+}
+function phaseOf(t: ReturnType<typeof createTestHost>, id: string): string {
+	return t.ledger.cards[id]?.phase ?? "?";
+}
 
 const PROGRAM_DIR = "/repo/.agents/work-programs/test-program";
 
@@ -685,12 +693,6 @@ describe("operator todos", () => {
 });
 
 describe("pause rearm", () => {
-	function setPhase(t: ReturnType<typeof createTestHost>, id: string, phase: CardLedger["phase"]): void {
-		t.ledger.cards[id]!.phase = phase;
-	}
-	function phaseOf(t: ReturnType<typeof createTestHost>, id: string): string {
-		return t.ledger.cards[id]?.phase ?? "?";
-	}
 	test("run-less flight phases rearm to dispatchable phases", () => {
 		const t = createTestHost({ cards: [{ id: "01" }, { id: "02" }, { id: "03" }, { id: "04" }] });
 		setPhase(t, "01", "implementing");
@@ -747,6 +749,126 @@ describe("pause rearm", () => {
 		// No merge state left: the card rejoins the queue and merges cleanly.
 		expect(phaseOf(t, "01")).toBe("done");
 		expect(t.fake.dispatched.some((entry) => entry.request.kind === "reconciler")).toBe(false);
+	});
+});
+
+describe("stale blocked decisions", () => {
+	function staleBlock(t: ReturnType<typeof createTestHost>): void {
+		createDecision(
+			{ programDir: t.host.programDir, ledger: t.ledger },
+			{
+				kind: "blocked",
+				card: "01",
+				message: "Card 01 is blocked: fix run ended as failed",
+				expectedAction: `work_program({ action: "unblock", card: "01", resolution: "redispatch" })`,
+			},
+		);
+	}
+
+	test("triage succeeds with a stale blocked record shadowing it", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await drive(t.host);
+		writeLaneEvidence(t, "01", "evidence");
+		t.completeRun(t.fake.dispatched[0]!.runId, { output: "done" });
+		await drive(t.host);
+		t.completeRun(t.fake.dispatched.at(-1)!.runId, { output: "F1: bug" });
+		await drive(t.host);
+		expect(t.ledger.cards["01"]?.phase).toBe("triaging");
+		staleBlock(t);
+		const applied = applyTriage(t.host, "01", [{ finding: "F1", verdict: "approve" }]);
+		expect(applied.ok).toBe(true);
+		expect(t.ledger.cards["01"]?.phase).toBe("fixing");
+	});
+
+	test("unblock on a moved-on card clears the stale record without touching the phase", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		const card = t.ledger.cards["01"]!;
+		card.phase = "triaging";
+		staleBlock(t);
+		const result = await applyUnblock(t.host, "01", "redispatch");
+		expect(result.ok).toBe(true);
+		expect(t.ledger.cards["01"]?.phase).toBe("triaging");
+		expect(t.ledger.decisions.find((d) => d.kind === "blocked")?.status).toBe("resolved");
+	});
+
+	test("the drive sweep clears stale blocks and lets the card proceed", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		t.ledger.cards["01"]!.phase = "implementing";
+		staleBlock(t);
+		await drive(t.host);
+		expect(t.ledger.decisions.find((d) => d.kind === "blocked")?.status).toBe("resolved");
+		expect(t.fake.progress.some((line) => line.includes("stale blocked"))).toBe(true);
+	});
+
+	test("program completion ignores stale blocked records", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		t.ledger.cards["01"]!.phase = "done";
+		staleBlock(t);
+		await drive(t.host);
+		expect(t.ledger.status).toBe("complete");
+	});
+
+	test("manual dispatch retires the open blocked record", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		t.ledger.cards["01"]!.phase = "blocked";
+		staleBlock(t);
+		const result = await dispatchManual(t.host, "01", "worker");
+		expect(result.ok).toBe(true);
+		expect(t.ledger.decisions.find((d) => d.kind === "blocked")?.status).toBe("resolved");
+		expect(phaseOf(t, "01")).toBe("implementing");
+	});
+});
+
+describe("fix runner-flake retries", () => {
+	const RUNNER_FLAKE = "Subagent runner error: Error: Timed out after 30000ms waiting for runner startup control 'confirm'";
+
+	async function driveToFixRun(t: ReturnType<typeof createTestHost>): Promise<string> {
+		await drive(t.host);
+		writeLaneEvidence(t, "01", "evidence");
+		t.completeRun(t.fake.dispatched[0]!.runId, { output: "done" });
+		await drive(t.host);
+		t.completeRun(t.fake.dispatched.at(-1)!.runId, { output: "F1: bug" });
+		await drive(t.host);
+		applyTriage(t.host, "01", [{ finding: "F1", verdict: "approve" }]);
+		await drive(t.host);
+		const fixRun = t.ledger.cards["01"]?.activeRun?.runId;
+		if (!fixRun) throw new Error("fix was not dispatched");
+		return fixRun;
+	}
+
+	test("a runner-flaked fix retries in place instead of blocking", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		t.failRun(await driveToFixRun(t), RUNNER_FLAKE);
+		await drive(t.host);
+		const card = t.ledger.cards["01"]!;
+		expect(card.phase).toBe("fixing");
+		expect(card.activeRun?.kind).toBe("fix");
+		expect(card.infraRetries).toBe(1);
+		expect(t.fake.progress.some((line) => line.includes("auto-retry 1/2"))).toBe(true);
+	});
+
+	test("repeated flakes block loudly after the cap", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		t.failRun(await driveToFixRun(t), RUNNER_FLAKE);
+		await drive(t.host);
+		t.failRun(t.ledger.cards["01"]!.activeRun!.runId, RUNNER_FLAKE);
+		await drive(t.host);
+		expect(t.ledger.cards["01"]?.infraRetries).toBe(2);
+		t.failRun(t.ledger.cards["01"]!.activeRun!.runId, RUNNER_FLAKE);
+		await drive(t.host);
+		const card = t.ledger.cards["01"]!;
+		expect(card.phase).toBe("blocked");
+		expect(card.lastError).toContain("ended as failed");
+		expect(card.fixReason).toBe("review");
+	});
+
+	test("a real code failure still blocks immediately", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		t.failRun(await driveToFixRun(t), "assertion failed in applyUsage");
+		await drive(t.host);
+		const card = t.ledger.cards["01"]!;
+		expect(card.phase).toBe("blocked");
+		expect(card.infraRetries ?? 0).toBe(0);
 	});
 });
 

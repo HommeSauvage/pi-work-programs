@@ -25,6 +25,21 @@ export function openDecisionFor(ledger: ProgramLedger, cardId?: string): Decisio
 	return ledger.decisions.find((decision) => decision.status === "open" && (cardId === undefined || decision.card === cardId));
 }
 
+/**
+ * Kind-scoped variant: actions must look up the decision kind they own, never
+ * the first open record. A stale `blocked` decision (its card long moved on)
+ * must not shadow a later review-triage, cycle, or gate decision.
+ */
+export function openDecisionOfKind(
+	ledger: ProgramLedger,
+	cardId: string | undefined,
+	kind: Decision["kind"],
+): Decision | undefined {
+	return ledger.decisions.find(
+		(decision) => decision.status === "open" && decision.kind === kind && (cardId === undefined || decision.card === cardId),
+	);
+}
+
 export function openDecisions(ledger: ProgramLedger): Decision[] {
 	return ledger.decisions.filter((decision) => decision.status === "open");
 }

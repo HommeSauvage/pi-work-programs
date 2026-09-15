@@ -78,6 +78,8 @@ export interface CardLedger {
 	lastError?: string;
 	/** Phase the card was in when it became blocked (routes redispatch back to fixing). */
 	blockedFrom?: CardPhase;
+	/** Consecutive runner-infra auto-retries consumed by the current fix round. */
+	infraRetries?: number;
 	updatedAt: number;
 }
 

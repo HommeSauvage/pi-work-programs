@@ -117,7 +117,7 @@ After `finalize_plan`, Pi stops and shows you the plan. That pause is load-beari
 - `plan.md` must make sense with zero conversation history. Its first line carries the machine config (`<!-- wp: {...} -->`); leave it alone.
 - Every card declares `Depends on:` explicitly (`—` when none), a `Kind: write|recon`, and a `## State: todo` line. No card starts before its dependencies are `done`.
 - Workers never touch `plan.md` or `progress.md`. The extension is the single writer of program records — it even blocks direct `write`/`edit` calls to `progress.md` while a program is active.
-- Completed programs stay in the tree until you explicitly close them: `/work-program close` (add `--remove` to delete the folder).
+- When every card is `done`, the program completes: the work-program UI goes quiet and the agent delivers a completion summary, then asks whether to close. Close only on your explicit word — `/work-program close --remove` (or `work_program({ action: "close", remove: true })`) deletes the folder and all card lanes; git history keeps every commit. Until then the records stay put and the program never reactivates on its own.
 
 ## Evidence and review
 

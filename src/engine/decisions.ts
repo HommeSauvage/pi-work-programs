@@ -1,5 +1,5 @@
 import type { Decision, ProgramLedger } from "../shared/types.ts";
-import { nextDecisionId } from "./phases.ts";
+import { counts, nextDecisionId } from "./phases.ts";
 
 export interface DecisionHost {
 	programDir: string;
@@ -82,4 +82,58 @@ export function gateDecisionMessage(cardId: string, failures: string[]): string 
 
 export function programGateDecisionMessage(failures: string[]): string {
 	return `The program gate failed: ${failures.join("; ")}`;
+}
+
+/**
+ * Handoff packet sent to the session agent the moment a program completes.
+ * It carries the summary facts and the close question; the agent turns it
+ * into a completion summary for the operator and only closes on confirmation.
+ */
+export function programCompleteMessage(ledger: ProgramLedger): string {
+	const { done, total } = counts(ledger);
+	const lines = [
+		`[WORK PROGRAM COMPLETE — ${ledger.slug}]`,
+		"",
+		`${ledger.title}: ${done}/${total} cards done. The work-program UI is now cleared; the records stay at ${ledger.dir} until closed.`,
+		"",
+		"Cards:",
+	];
+	for (const id of ledger.order) {
+		const card = ledger.cards[id];
+		if (!card) continue;
+		const landing = card.merge?.commit ? `merged ${card.merge.commit.slice(0, 7)}` : "done";
+		lines.push(`- ${card.id} ${card.title} — ${landing} (${card.cycles} review cycle(s))`);
+	}
+	const triaged = ledger.decisions.filter(
+		(decision) => decision.kind === "review-triage" && decision.status === "resolved" && decision.verdicts,
+	);
+	if (triaged.length > 0) {
+		let approved = 0;
+		let rejected = 0;
+		let deferred = 0;
+		for (const decision of triaged) {
+			for (const verdict of decision.verdicts ?? []) {
+				if (verdict.verdict === "approve") approved += 1;
+				else if (verdict.verdict === "reject") rejected += 1;
+				else deferred += 1;
+			}
+		}
+		lines.push(
+			"",
+			`Reviews: ${triaged.length} triage decision(s) resolved — ${approved} approved / ${rejected} rejected / ${deferred} deferred.`,
+		);
+	}
+	if (ledger.programGate && ledger.programGate.length > 0) {
+		lines.push(`Program gate: green (${ledger.programGate.map((gate) => gate.command).join(", ")}).`);
+	} else {
+		lines.push("Program gate: none configured.");
+	}
+	lines.push(
+		"",
+		"Now:",
+		"1. Reply with a completion summary for the operator (what shipped per card, review stats, record location).",
+		'2. Ask: "Should I close the work program? Closing deletes the program folder and all card lanes — the git history keeps every commit."',
+		'3. Only after the operator explicitly confirms, call work_program({ action: "close", remove: true }). If they keep talking or say no, do nothing — the completed program stays quiet and will not reactivate on its own.',
+	);
+	return lines.join("\n");
 }

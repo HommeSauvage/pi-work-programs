@@ -266,6 +266,13 @@ export class WorkProgramController {
 			ui.setWidget("work-program", undefined);
 			return;
 		}
+		if (this.active.ledger.status !== "active" && this.active.ledger.status !== "paused") {
+			// Completed programs go quiet: the agent delivers the summary + close
+			// question as a normal message, and the records wait for an explicit close.
+			ui.setStatus("work-program", undefined);
+			ui.setWidget("work-program", undefined);
+			return;
+		}
 		const { done, total, blocked } = counts(this.active.ledger);
 		ui.setStatus(
 			"work-program",
@@ -834,8 +841,11 @@ export class WorkProgramController {
 		if (!this.active) return { ok: false, text: "No active work program." };
 		const ledger = this.active.ledger;
 		const pending = ledger.order.filter((id) => ledger.cards[id]?.phase !== "done");
-		if (pending.length > 0 && !remove) {
-			return { ok: false, text: `Cannot close: cards not done: ${pending.join(", ")}.` };
+		if (pending.length > 0) {
+			return {
+				ok: false,
+				text: `Cannot close: cards not done: ${pending.join(", ")}. Closing is only for completed programs — finish the cards first. Program records are untouched.`,
+			};
 		}
 		ledger.status = "complete";
 		await this.save();
@@ -867,7 +877,10 @@ export class WorkProgramController {
 	}
 
 	contextBrief(): string {
-		return this.active ? buildBrief(this.active.ledger) : "";
+		if (!this.active) return "";
+		const status = this.active.ledger.status;
+		if (status !== "active" && status !== "paused") return "";
+		return buildBrief(this.active.ledger);
 	}
 
 	/** Read-only liveness line for an in-flight run (file reads only — never disturbs the run). */

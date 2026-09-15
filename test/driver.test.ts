@@ -579,6 +579,55 @@ describe("paused runs", () => {
 		expect(card.lane?.branch).toBe("feat/foo-card-01");
 	});
 });
+describe("program completion", () => {
+	async function driveCardToDone(t: ReturnType<typeof createTestHost>): Promise<void> {
+		await drive(t.host);
+		writeLaneEvidence(t, "01", "evidence");
+		t.completeRun(t.fake.dispatched[0]!.runId, { output: "done" });
+		await drive(t.host);
+		t.completeRun(t.fake.dispatched.at(-1)!.runId, { output: "No issues." });
+		await drive(t.host);
+		expect(t.ledger.cards["01"]?.phase).toBe("triaging");
+		applyTriage(t.host, "01", []);
+		await drive(t.host);
+		expect(t.ledger.cards["01"]?.phase).toBe("done");
+	}
+
+	test("completing with no program gate sends the summary + close packet", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await driveCardToDone(t);
+		await drive(t.host);
+		expect(t.ledger.status).toBe("complete");
+		expect(t.fake.progress.some((line) => line.includes("complete (no program gate configured)"))).toBe(true);
+		expect(t.git.commits.some((message) => message.includes("program complete"))).toBe(true);
+		const packet = t.fake.asked.find((message) => message.includes("WORK PROGRAM COMPLETE"));
+		expect(packet).toBeDefined();
+		expect(packet).toContain("1/1 cards done");
+		expect(packet).toContain("Should I close the work program?");
+		expect(packet).toContain('work_program({ action: "close", remove: true })');
+	});
+
+	test("a green program gate completes with the gate named", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }], gates: { program: ["bun gate"] } });
+		await driveCardToDone(t);
+		await drive(t.host);
+		expect(t.ledger.status).toBe("complete");
+		const packet = t.fake.asked.find((message) => message.includes("WORK PROGRAM COMPLETE"));
+		expect(packet).toContain("Program gate: green (bun gate).");
+	});
+
+	test("a red program gate opens a decision and stays active", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }], gates: { program: ["bun gate"] } });
+		t.fake.gateResults.set("bun gate", [{ command: "bun gate", code: 1, at: Date.now(), tail: "red" }]);
+		await driveCardToDone(t);
+		await drive(t.host);
+		expect(t.ledger.status).toBe("active");
+		const decision = t.ledger.decisions.find((entry) => entry.kind === "gate-failed");
+		expect(decision?.status).toBe("open");
+		expect(t.fake.asked.some((message) => message.includes("WORK PROGRAM COMPLETE"))).toBe(false);
+	});
+});
+
 describe("dispatch failures", () => {
 	test("a failing dispatch blocks the card instead of retrying silently", async () => {
 		const t = createTestHost({ cards: [{ id: "01" }] });

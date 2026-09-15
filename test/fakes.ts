@@ -133,8 +133,15 @@ export function installRpcResponder(pi: FakePi, options: { runId?: string; async
 }
 
 
-export function fakeSessionContext(input: { cwd: string; entries?: unknown[] }): ExtensionContext {
-	const ui = {
+export interface StubUi {
+	notify: (message: string, level?: string) => void;
+	setStatus: (key: string, value: string | undefined) => void;
+	setWidget: (key: string, value: string[] | undefined) => void;
+	theme: { fg: (color: string, text: string) => string };
+}
+
+export function fakeSessionContext(input: { cwd: string; entries?: unknown[]; ui?: StubUi }): ExtensionContext {
+	const ui: StubUi = input.ui ?? {
 		notify: () => {},
 		setStatus: () => {},
 		setWidget: () => {},

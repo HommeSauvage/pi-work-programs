@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { WorkProgramController } from "../src/engine/controller.ts";
 import { makeCardText } from "./helpers.ts";
-import { FakePi, fakeSessionContext, installRpcResponder } from "./fakes.ts";
+import { FakePi, fakeSessionContext, installRpcResponder, type StubUi } from "./fakes.ts";
 
 const tempDirs: string[] = [];
 let previousAgentDir: string | undefined;
@@ -20,7 +20,22 @@ afterEach(async () => {
 	for (const dir of tempDirs.splice(0)) await rm(dir, { recursive: true, force: true });
 });
 
-async function setupProgram(): Promise<{ controller: WorkProgramController; cwd: string; pi: FakePi }> {
+function recordingUi(): { ui: StubUi; calls: Array<{ method: string; key?: string; value?: unknown }> } {
+	const calls: Array<{ method: string; key?: string; value?: unknown }> = [];
+	const ui: StubUi = {
+		notify: () => {},
+		setStatus: (key, value) => {
+			calls.push({ method: "setStatus", key, value });
+		},
+		setWidget: (key, value) => {
+			calls.push({ method: "setWidget", key, value });
+		},
+		theme: { fg: (_color: string, text: string) => text },
+	};
+	return { ui, calls };
+}
+
+async function setupProgram(ui?: StubUi): Promise<{ controller: WorkProgramController; cwd: string; pi: FakePi }> {
 	const root = await mkdtemp(join(tmpdir(), "wp-controller-"));
 	tempDirs.push(root);
 	const agentDir = join(root, "agent");
@@ -46,7 +61,7 @@ async function setupProgram(): Promise<{ controller: WorkProgramController; cwd:
 	const pi = new FakePi();
 	installRpcResponder(pi);
 	const controller = new WorkProgramController(pi.asExtensionApi());
-	await controller.initialize(fakeSessionContext({ cwd }));
+	await controller.initialize(fakeSessionContext({ cwd, ...(ui ? { ui } : {}) }));
 	const started = await controller.startProgram("test-program");
 	expect(started.ok).toBe(true);
 	return { controller, cwd, pi };
@@ -101,6 +116,69 @@ describe("controller guards", () => {
 		const result = await controller.unblock("01", "done");
 		expect(result.ok).toBe(false);
 		expect(result.text).toContain("only a blocked card");
+	});
+});
+
+describe("completion and close-out", () => {
+	test("close refuses while any card is pending — even with remove", async () => {
+		const { controller } = await setupProgram();
+		const kept = await controller.closeProgram(false);
+		expect(kept.ok).toBe(false);
+		expect(kept.text).toContain("not done");
+		const removed = await controller.closeProgram(true);
+		expect(removed.ok).toBe(false);
+		expect(removed.text).toContain("not done");
+		// Records are untouched and the program is still active.
+		expect(controller.getActive()?.slug).toBe("test-program");
+	});
+
+	test("close keeps the folder by default and deletes it with remove", async () => {
+		const { controller, cwd } = await setupProgram();
+		const card = controller.getActive()!.ledger.cards["01"]!;
+		card.phase = "done";
+		const kept = await controller.closeProgram(false);
+		expect(kept.ok).toBe(true);
+		expect(controller.getActive()?.slug).toBe("test-program");
+		const programDir = join(cwd, ".agents", "work-programs", "test-program");
+		const { stat } = await import("node:fs/promises");
+		await stat(join(programDir, "plan.md"));
+		const removed = await controller.closeProgram(true);
+		expect(removed.ok).toBe(true);
+		expect(controller.getActive()).toBeUndefined();
+		await expect(stat(programDir)).rejects.toThrow();
+	});
+
+	test("a completed program clears the work-program UI", async () => {
+		const { ui, calls } = recordingUi();
+		const { controller } = await setupProgram(ui);
+		const ledger = controller.getActive()!.ledger;
+		ledger.cards["01"]!.phase = "done";
+		ledger.status = "complete";
+		calls.length = 0;
+		const closed = await controller.closeProgram(false);
+		expect(closed.ok).toBe(true);
+		const widgets = calls.filter((call) => call.method === "setWidget");
+		const statuses = calls.filter((call) => call.method === "setStatus");
+		expect(widgets.length).toBeGreaterThan(0);
+		expect(statuses.length).toBeGreaterThan(0);
+		expect(widgets.at(-1)).toEqual({ method: "setWidget", key: "work-program", value: undefined });
+		expect(statuses.at(-1)).toEqual({ method: "setStatus", key: "work-program", value: undefined });
+	});
+
+	test("completed programs do not auto-activate in a new session", async () => {
+		const { controller, cwd } = await setupProgram();
+		const ledger = controller.getActive()!.ledger;
+		ledger.cards["01"]!.phase = "done";
+		ledger.status = "complete";
+		const closed = await controller.closeProgram(false);
+		expect(closed.ok).toBe(true);
+		// A fresh controller on the same project leaves the completed program alone.
+		const pi = new FakePi();
+		installRpcResponder(pi);
+		const next = new WorkProgramController(pi.asExtensionApi());
+		await next.initialize(fakeSessionContext({ cwd }));
+		expect(next.getActive()).toBeUndefined();
+		next.shutdown();
 	});
 });
 

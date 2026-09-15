@@ -96,6 +96,7 @@ export function registerTools(pi: ExtensionAPI, controller: WorkProgramControlle
 		promptGuidelines: [
 			"Use work_program to inspect and drive a work program; never edit plan.md or progress.md directly.",
 			"finalize_plan only validates and stages a program — it never starts execution. After writing a plan, STOP and wait for the operator to review; only call resume/start/dispatch after the operator explicitly says to start.",
+			"When a work program completes, you receive a summary packet: reply with a completion summary, then ask whether to close the program. Only call close with remove:true after the operator explicitly confirms — never delete program records unprompted.",
 			"When a work-program decision packet arrives, answer with the exact work_program call it names (for review triage use action 'triage' with one verdict per finding).",
 		],
 		parameters: Type.Object({

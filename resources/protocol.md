@@ -39,6 +39,22 @@ pending → ready → implementing → review_pending → reviewing → triaging
 - Review/fix cycles are capped; on exhaustion the program asks for a decision
   instead of silently accepting or looping forever.
 
+## Completion and close-out
+
+- When every card is `done` (and the program gate, if configured, is green),
+  the program completes: the work-program UI is cleared and the session agent
+  receives a summary packet with per-card outcomes, review stats, and the
+  record location.
+- The agent replies with a completion summary and asks whether to close the
+  program. Closing deletes the program folder and all card lanes; the git
+  history keeps every commit.
+- Close happens only on explicit operator confirmation
+  (`work_program({ action: "close", remove: true })`). If the operator keeps
+  talking or says no, the completed program stays quiet — records kept, no
+  reactivation — until they say otherwise.
+- `close` refuses while any card is not `done`. Closing is only for completed
+  programs.
+
 ## Evidence
 
 - Evidence is measured, never assumed. Paste exact command output; name the

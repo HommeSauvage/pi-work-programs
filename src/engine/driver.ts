@@ -25,6 +25,7 @@ import {
 	createDecision,
 	cycleDecisionMessage,
 	packetText,
+	programCompleteMessage,
 	programGateDecisionMessage,
 	resolveDecision,
 	reviewDecisionMessage,
@@ -999,12 +1000,7 @@ async function maybeRunProgramGate(host: DriverHost): Promise<void> {
 	if (openDecisionFor(ledger)) return;
 	const commands = ledger.gates.program;
 	if (commands.length === 0) {
-		ledger.status = "complete";
-		await progress(host, `program complete (no program gate configured)`);
-		await host.ports.git
-			.commitPaths(host.cwd, `wp(${ledger.slug}): program complete`, programRecordPaths(host))
-			.catch(() => undefined);
-		host.ports.notify(`Work program ${ledger.slug} complete`, "info");
+		await completeProgram(host, "no program gate configured");
 		return;
 	}
 	const results: GateResult[] = [];
@@ -1021,12 +1017,20 @@ async function maybeRunProgramGate(host: DriverHost): Promise<void> {
 		});
 		return;
 	}
+	await completeProgram(host, "program gate green");
+}
+
+/** Finalize a completed program: record it, clear the way for the UI to go quiet,
+ *  and hand the session agent a summary + close question (answered on confirm only). */
+async function completeProgram(host: DriverHost, how: string): Promise<void> {
+	const ledger = host.ledger;
 	ledger.status = "complete";
-	await progress(host, `program complete (program gate green)`);
+	await progress(host, `program complete (${how})`);
 	await host.ports.git
 		.commitPaths(host.cwd, `wp(${ledger.slug}): program complete`, programRecordPaths(host))
 		.catch(() => undefined);
 	host.ports.notify(`Work program ${ledger.slug} complete`, "info");
+	host.ports.ask(programCompleteMessage(ledger));
 }
 
 /* ---------------------------------------------------------------------------

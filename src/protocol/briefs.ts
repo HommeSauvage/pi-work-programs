@@ -161,6 +161,7 @@ export function captainBrief(input: {
 	reviewProfile: "light" | "enhanced";
 	reviewPath: string;
 	repoRoot: string;
+	maxCycles?: number;
 }): string {
 	const { ledger, card } = input;
 	const gates = input.gates.length > 0 ? input.gates.map((gate) => `\`${gate}\``).join(", ") : "(none configured)";
@@ -177,7 +178,7 @@ export function captainBrief(input: {
 		"1. Dispatch a fresh worker (subagent tool, agent \"worker\", context fresh) with the exact card scope; it must produce a commit and Evidence.",
 		"2. Dispatch a fresh, read-only reviewer (agent \"reviewer\", context fresh) over the lane diff; write its findings to the review output path.",
 		"3. Triage each finding: approve, reject, or defer it. Approved findings go back to the SAME worker (resume it when possible).",
-		"4. Repeat at most " + input.ledger.maxCycles + " review cycles, then stop and report a blocker.",
+		"4. Repeat at most " + (input.maxCycles ?? input.ledger.maxCycles) + " review cycles, then stop and report a blocker.",
 		`5. Run the card gates (${gates}); the gate result is authoritative.`,
 		"",
 		"Hard rules:",

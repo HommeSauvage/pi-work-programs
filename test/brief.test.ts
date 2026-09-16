@@ -59,10 +59,30 @@ describe("buildBrief", () => {
 		const root = await mkdtemp(join(tmpdir(), "wp-brief-"));
 		try {
 			await mkdir(join(root, ".operator"), { recursive: true });
-			await writeFile(join(root, ".operator", "todo.md"), "## demo\n### [ ] Human step\n", "utf8");
+			const { addTodo, emptyTodoStore, serializeTodoStore } = await import("../src/program/operator-todos.ts");
+			const store = emptyTodoStore();
+			addTodo(store, { title: "Human step", stream: "demo", blocking: false });
+			await writeFile(join(root, ".operator", "todos.json"), serializeTodoStore(store), "utf8");
 			const brief = buildBrief(program(), root);
-			expect(brief).toContain("Operator todos: 1 open");
-			expect(brief).toContain("## demo");
+			expect(brief).toContain("Operator todos: 1 open (0 blocking)");
+			// Advisory titles stay in `status`; the brief only shouts about blockers.
+			expect(brief).not.toContain("Human step");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("shouts about blocking todos with their cards", async () => {
+		const root = await mkdtemp(join(tmpdir(), "wp-brief-"));
+		try {
+			await mkdir(join(root, ".operator"), { recursive: true });
+			const { addTodo, emptyTodoStore, serializeTodoStore } = await import("../src/program/operator-todos.ts");
+			const store = emptyTodoStore();
+			addTodo(store, { title: "Prod secret", stream: "demo", card: "02", blocking: true });
+			await writeFile(join(root, ".operator", "todos.json"), serializeTodoStore(store), "utf8");
+			const brief = buildBrief(program(), root);
+			expect(brief).toContain("1 blocking");
+			expect(brief).toContain("blocks card 02");
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}

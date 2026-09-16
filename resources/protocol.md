@@ -15,9 +15,11 @@ lanes. The program folder holds the records; the extension holds the process.
   .runtime/        machine state (gitignored): ledger, review texts
 ```
 
-- `plan.md` must make sense with zero conversation history.
-- Every card declares its dependencies explicitly. No card starts before its
-  dependencies are `done`.
+- `plan.md` must make sense with zero conversation history. Program defaults
+  (mode, parallelism, review profile, max cycles, models) live in its YAML
+  front matter; per-card overrides live in each card file's front matter.
+- Every card declares its dependencies explicitly (`dependsOn` front matter).
+  No card starts before its dependencies are `done`.
 - Completed programs stay in the tree until the user explicitly closes them out.
 
 ## Card lifecycle
@@ -66,7 +68,7 @@ Cards can be folded, added, or dropped without hand-editing the ledger. The
 plan and card files stay the source of truth; `sync` reconciles.
 
 - **Folding cards** (e.g. 9 cards down to 5): move the scope into the surviving
-  card files, rewire `Depends on:` so nothing points at a card you are deleting,
+  card files, rewire front-matter `dependsOn` so nothing points at a card you are deleting,
   delete the dead files and their plan rows, then run
   `work_program({ action: "sync" })`.
 - Sync drops a removed card when it is safe: no live dependents, no live run,
@@ -88,18 +90,24 @@ plan and card files stay the source of truth; `sync` reconciles.
 ## Operator todos
 
 - Some work needs human hands (credentials, external approvals, secrets,
-  physical access). Park it in `.operator/todo.md` at the repository root
-  instead of guessing or stalling.
-- The extension creates the file with its header the first time a program
-  activates or a worker dispatches; the header's rules bind every writer:
-  append-only, one `## <stream>` heading per work stream (work programs use
-  their slug), items in the file's format naming the program and card, exact
-  commands for every runnable step.
-- Worker, fix, gate-fix, and captain prompts all carry this rule. Reviewers
-  are read-only and never touch the file.
-- Operator edits never pause the merge queue, and open todos never block
-  completion — they are listed in `status`/`doctor`, the session brief, and
-  the completion summary instead.
+  physical access). Record it as a structured todo instead of guessing or
+  stalling — never hand-edit `.operator/todos.json` or `.operator/todo.md`.
+- Todos live in `.operator/todos.json` (one `op-NN` id each, with title, why,
+  exact steps/commands, and a blocking flag). Manage them entirely from chat:
+  `todos` lists, `todo_add` creates, `todo_update` rewrites (title, body,
+  steps), `todo_done` completes, `todo_drop` discards.
+- A **blocking** todo parks its card: no worker, reviewer, fix, or merge is
+  dispatched for it, in-flight completions park instead of advancing, and the
+  card shows as blocked with `→ todo_done op-NN when finished`. The operator
+  gets an immediate wake-up plus `! op-NN blocks <card>` lines in the brief,
+  status, and TUI widget. `todo_done`/`todo_drop` rearm the card on its own.
+- Advisory (non-blocking) todos never hold a card: they are listed in
+  `status`/`doctor`, the session brief, and the completion summary instead.
+- Worker, fix, gate-fix, and captain prompts carry the parking rule: blocked
+  workers append to the `.operator/todo.md` inbox (with a `Blocking: yes/no`
+  line) and escalate via `contact_supervisor` — the drive imports inbox
+  entries into the store automatically. Reviewers are read-only and never
+  touch either file.
 
 ## Pause and resume
 
@@ -137,8 +145,15 @@ plan and card files stay the source of truth; `sync` reconciles.
 
 - The orchestrator can change program behaviour mid-flight instead of working
   around it: `work_program({ action: "config", maxCycles, onExhausted,
-  reviewProfile, maxParallel, parallelExecution, mode, workerModel,
-  workerThinking, reviewerModel, reviewerThinking })`.
+  reviewProfile, maxParallel, parallelExecution, mode, workerAgent,
+  workerModel, workerThinking, reviewerAgent, reviewerModel,
+  reviewerThinking })`.
+- One card is retuned the same way with `card` set: `work_program({
+  action: "config", card: "05", maxCycles: 5, reviewProfile: "enhanced"
+  })`. Card models work the same way (`workerModel`, `reviewerModel`,
+  `thinking`); an empty string clears a card override so it inherits the
+  program default. Always use `config` with `card` — never hand-edit card
+  front matter.
 - `maxCycles` is **review cycles before the harness asks** (default 3). Setting
   it low does not silence the question — it makes the question arrive sooner.
   The question is binary: `accept` (land it, with the unfixed findings recorded
@@ -149,12 +164,13 @@ plan and card files stay the source of truth; `sync` reconciles.
   in the same call; `"block"` pre-answers with a park; `"ask"` (default) raises
   the decision.
 - The change applies to the live ledger, is written back into `plan.md`'s
-  machine comment (so `sync` and session reload keep it), and lands in
-  `progress.md` as `config updated — maxCycles 3→2`.
+  front matter (so `sync` and session reload keep it), and lands in
+  `progress.md` as `config updated — maxCycles 3→2`. Card-scoped changes
+  persist into that card file's front matter the same way.
 - `mode` is still refused while runs are in flight (pause first); every other
   knob applies immediately.
 - Card **scope** is reshaped through the files, not through this action: edit
-  the card/plan text (fold, rewire `Depends on:`, delete or add cards) and run
+  the card/plan text (fold, rewire front-matter `dependsOn`, delete or add cards) and run
   `sync` — see Reshaping the program.
 
 ## Decisions and wake-ups
@@ -227,7 +243,13 @@ Two profiles are available, verbatim from the operator's work-program prompts:
   fail-fast guidelines, and required human callouts.
 
 The profile is chosen per program and may be overridden per card
-(`Review: enhanced`).
+(card front matter `review: enhanced`, or `work_program({ action: "config",
+card: "05", reviewProfile: "enhanced" })`).
+
+At creation time, set `review` and `maxCycles` on every card from difficulty
+(trivial: light/1-2, standard: light/3, tricky: enhanced/3-5, critical:
+enhanced/5). Leave card models unset to inherit the program/global defaults
+unless the operator explicitly asked for card-specific models.
 
 ## Parallel execution and lanes
 

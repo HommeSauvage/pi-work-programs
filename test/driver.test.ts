@@ -690,7 +690,7 @@ describe("operator todos", () => {
 		const t = createTestHost({ cards: [{ id: "01" }] });
 		t.fake.files.set(
 			"/repo/.operator/todo.md",
-			["# Operator todo", "", "## test-program", "### [ ] Fetch the prod secret - test-program - 01", ""].join("\n"),
+			["# Operator todo", "", "## test-program", "### [ ] Fetch the prod secret - test-program - 01", "Blocking: no", ""].join("\n"),
 		);
 		await driveCardToDone(t);
 		await drive(t.host);

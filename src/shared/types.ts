@@ -60,6 +60,14 @@ export interface CardLedger {
 	dependsOn: string[];
 	kind: CardKind;
 	reviewProfile?: ReviewProfile;
+	/** Per-card review-cycle cap (falls back to the program maxCycles). */
+	maxCycles?: number;
+	workerAgent?: string;
+	workerModel?: string;
+	workerThinking?: string;
+	reviewerAgent?: string;
+	reviewerModel?: string;
+	reviewerThinking?: string;
 	workerRun?: string;
 	reviewRun?: string;
 	fixRuns?: string[];
@@ -86,6 +94,8 @@ export interface CardLedger {
 	holdReason?: string;
 	/** Consecutive quota holds consumed for the current pause (extension cap). */
 	holdCount?: number;
+	/** Open blocking operator todos (`op-NN` ids) parking this card. */
+	waitingOn?: string[];
 	/** Operator-dropped scope: terminal, kept in records, excluded from completion gating. */
 	abandoned?: boolean;
 	/** Findings approved at the review-cycle cap and carried into the merge unfixed. */
@@ -162,8 +172,26 @@ export interface ParsedCard {
 	hasDependsDeclaration: boolean;
 	kind: CardKind;
 	reviewProfile?: ReviewProfile;
+	maxCycles?: number;
+	workerAgent?: string;
+	workerModel?: string;
+	workerThinking?: string;
+	reviewerAgent?: string;
+	reviewerModel?: string;
+	reviewerThinking?: string;
 	state: string;
 	evidence: string;
+}
+
+export interface CardConfigPatch {
+	reviewProfile?: ReviewProfile;
+	maxCycles?: number;
+	workerAgent?: string;
+	workerModel?: string;
+	workerThinking?: string;
+	reviewerAgent?: string;
+	reviewerModel?: string;
+	reviewerThinking?: string;
 }
 
 export interface ParsedPlan {

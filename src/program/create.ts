@@ -5,7 +5,6 @@ import type { CardLedger, ParsedCard, ProgramLedger, WorkProgramSettings } from 
 import { compareCardIds, cardFromParsed, saveLedger } from "./ledger.ts";
 import { resolveProgramDir } from "../shared/paths.ts";
 import { loadResources } from "../protocol/resources.ts";
-import { formatPlanConfig } from "../config.ts";
 
 export interface ProgramRef {
 	slug: string;
@@ -49,8 +48,12 @@ export function renderPlanScaffold(input: {
 	date: string;
 }): string {
 	const template = loadResources().planTemplate;
+	const frontmatter = input.configComment.trim().startsWith("---")
+		? input.configComment.trim().replace(/^---+\n/, "").replace(/\n---+\s*$/, "")
+		: input.configComment;
 	return template
-		.replace("{{WP_CONFIG}}", input.configComment)
+		.replace("{{WP_FRONTMATTER}}", frontmatter)
+		.replace("{{WP_CONFIG}}", frontmatter)
 		.replaceAll("{{TITLE}}", input.title)
 		.replaceAll("{{BRIEF}}", input.brief.trim().length > 0 ? input.brief.trim() : "TODO")
 		.replaceAll("{{DATE}}", input.date)
@@ -173,7 +176,17 @@ export async function syncCards(
 		existing.path = parsed.path;
 		existing.dependsOn = parsed.dependsOn.sort(compareCardIds);
 		existing.kind = parsed.kind;
+		// Front matter is the source of truth: a defined value sets the override,
+		// an absent value clears it so the card inherits the program default.
 		if (parsed.reviewProfile) existing.reviewProfile = parsed.reviewProfile;
+		else delete existing.reviewProfile;
+		if (parsed.maxCycles !== undefined) existing.maxCycles = parsed.maxCycles;
+		else delete existing.maxCycles;
+		for (const key of ["workerAgent", "workerModel", "workerThinking", "reviewerAgent", "reviewerModel", "reviewerThinking"] as const) {
+			const value = parsed[key];
+			if (value) existing[key] = value;
+			else delete existing[key];
+		}
 	}
 	for (const [id, card] of Object.entries(ledger.cards)) {
 		if (seen.has(id)) continue;

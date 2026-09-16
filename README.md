@@ -83,16 +83,18 @@ Switch any time: `work_program({ action: "mode", mode: "captain" })` or `/work-p
 | Want | Say, or call |
 |------|--------------|
 | Propose a program | "Should this be a work program?" — Pi calls `suggest_work_program`, then writes the plan and cards |
-| Validate the plan | `work_program({ action: "finalize_plan" })` — strict: every card needs `Depends on:`, every dependency must exist, graph must be acyclic |
+| Validate the plan | `work_program({ action: "finalize_plan" })` — strict: every card needs `dependsOn` front matter, every dependency must exist, graph must be acyclic |
 | Start execution | "Start the program." — only on your explicit word, Pi calls `work_program({ action: "resume" })` |
 | Check status | "What's the program status?" or `work_program({ action: "status" })` |
 | List programs | `work_program({ action: "list" })` or `/work-program list` |
 | Triage a review | Answer the decision packet with `work_program({ action: "triage", card, verdicts })` — one verdict per finding |
 | Unblock a card | `work_program({ action: "unblock", card, resolution })` — `redispatch` retries the pending fix when one exists (and re-adopts an abandoned card), `done` marks it finished, `abandon` drops its scope (branch kept, excluded from completion) |
 | Resolve an exhausted cycle | `work_program({ action: "cycle_decision", card, choice })` — `accept` (land it; unfixed findings recorded on the card) or `block`. Extra review rounds are not offered |
-| Retune a running program | `work_program({ action: "config", maxCycles, onExhausted, reviewProfile, maxParallel, workerModel, reviewerModel, … })` — applies live and persists into plan.md, so it survives sync and reload |
+| Retune a running program | `work_program({ action: "config", maxCycles, onExhausted, reviewProfile, maxParallel, workerModel, reviewerModel, … })` — applies live and persists into plan.md front matter, so it survives sync and reload |
+| Retune one card | `work_program({ action: "config", card: "05", maxCycles: 5, reviewProfile: "enhanced" })` — applies live and persists into that card's front matter (empty-string model clears the override) |
 | Resolve a program gate | `work_program({ action: "program_gate", choice })` — `retry` or `block` |
 | Merge a reconciled lane | `work_program({ action: "merge_resolved", card })` |
+| Operator todos | `work_program({ action: "todos" })` to list, `todo_add` to create (blocking parks the card), `todo_update` to rewrite, `todo_done`/`todo_drop` to resolve (card resumes on its own) |
 | Dispatch manually (session mode) | `work_program({ action: "dispatch", card, role })` — `worker`, `reviewer`, or `reconciler` |
 | Pause / resume | `/work-program pause` (soft: let runs finish) or `--hard` (stop runs now), `/work-program resume` |
 | Sync edits you made on disk | `work_program({ action: "sync" })` |
@@ -115,10 +117,10 @@ After `finalize_plan`, Pi stops and shows you the plan. That pause is load-beari
   .runtime/        machine state (gitignored): ledger, review texts
 ```
 
-- `plan.md` must make sense with zero conversation history. Its first line carries the machine config (`<!-- wp: {...} -->`); leave it alone.
-- Every card declares `Depends on:` explicitly (`—` when none), a `Kind: write|recon`, and a `## State: todo` line. No card starts before its dependencies are `done`.
+- `plan.md` must make sense with zero conversation history. Program defaults (mode, parallelism, review profile, max cycles, models) live in its YAML front matter — retune via `work_program config`, never by hand-editing.
+- Every card declares `dependsOn` front matter explicitly (`[]` when none), `kind: write|recon`, `review: light|enhanced` + `maxCycles` set from difficulty, and a `## State: todo` line. No card starts before its dependencies are `done`.
 - Workers never touch `plan.md` or `progress.md`. The extension is the single writer of program records — it even blocks direct `write`/`edit` calls to `progress.md` while a program is active.
-- Reshape freely: fold scope into surviving cards, rewire `Depends on:`, delete dead card files and their plan rows, then `work_program({ action: "sync" })`. Safe removals are dropped (empty lanes cleaned); unsafe ones are kept and explained (done records, live dependents, lanes holding work). To drop an unfinished card deliberately, `unblock … resolution: "abandon"` — the branch is kept and the card stops counting against completion.
+- Reshape freely: fold scope into surviving cards, rewire front-matter `dependsOn`, delete dead card files and their plan rows, then `work_program({ action: "sync" })`. Retune cards via `work_program({ action: "config", card })` — never hand-edit front matter. Safe removals are dropped (empty lanes cleaned); unsafe ones are kept and explained (done records, live dependents, lanes holding work). To drop an unfinished card deliberately, `unblock … resolution: "abandon"` — the branch is kept and the card stops counting against completion.
 - Program records live outside git when the repo ignores them (e.g. `.agents/` is gitignored): cards still reach `done` on disk, the merge still lands, and the harness warns once that records stay untracked instead of failing.
 - When every card is `done`, the program completes: the work-program UI goes quiet and the agent delivers a completion summary, then asks whether to close. Close only on your explicit word — `/work-program close --remove` (or `work_program({ action: "close", remove: true })`) deletes the folder and all card lanes; git history keeps every commit. Until then the records stay put and the program never reactivates on its own.
 - Provider/runner blips (502/503/504, admission or capacity outages, runner-startup timeouts) retry in place up to twice before blocking; a review-run failure re-enters review rather than re-running implementation, and a lane that already carries committed work skips the worker entirely.
@@ -126,13 +128,13 @@ After `finalize_plan`, Pi stops and shows you the plan. That pause is load-beari
 - The drive ticks on a 20-second safety timer (plus events) and drains until quiescent, so a merge can never strand the cards it unblocks; `start` on the loaded program resumes it.
 - Provider/runner blips (502/503/504, admission or capacity outages, runner-startup timeouts) retry in place up to twice before blocking; a review-run failure re-enters review rather than re-running implementation, and a lane that already carries committed work skips the worker entirely.
 - Provider quota/rate-limit failures **hold** the card until the reset time named in the error (parsed and quoted in `progress.md`) instead of raising a decision the supervisor can only answer with "wait". Repeats extend the hold up to a cap; an unknown reset falls back to a normal block.
-- Work that needs human hands lives in `.operator/todo.md` (one `## <stream>` heading per stream; programs use their slug). Workers park items there instead of guessing; open items surface in `status`, `doctor`, and the completion summary, and never block merges or completion.
+- Work that needs human hands lives in `.operator/todos.json` as structured todos (`op-NN` ids, managed entirely from chat: `todos`, `todo_add`, `todo_update`, `todo_done`, `todo_drop` — never hand-edit). A **blocking** todo parks its card (wake-up + `! op-NN blocks <card>` in brief/status/widget) until `todo_done`/`todo_drop` rearms it; advisory todos surface in `status`, `doctor`, and the completion summary without holding anything.
 
 ## Evidence and review
 
 Evidence is measured, never assumed. The worker pastes exact command output and the commit SHA it was measured at into the card's `## Evidence` section. When gates are configured, the harness runs them itself and its result is authoritative; worker-pasted evidence is supplementary. A card is done only when its gate is green (or no gate applies) and its review has been triaged.
 
-Two review profiles, per program with per-card override (`Review: enhanced`):
+Two review profiles, per program with per-card override (card front matter `review: enhanced`, or `work_program({ action: "config", card, reviewProfile })`):
 
 | Profile | What it is |
 |---------|------------|
@@ -161,6 +163,7 @@ Two tools, `suggest_work_program` (propose + scaffold) and `work_program` (drive
 | `status`, `list`, `protocol`, `doctor` | Inspect: board + counts, known programs, full protocol text, dependency diagnosis |
 | `create`, `start`, `finalize_plan` | Shape: scaffold from title+brief, attach to a slug, validate plan + cards |
 | `pause`, `resume`, `mode`, `sync` | Control: hold/resume the loop, switch mode, re-read disk edits |
+| `todos`, `todo_add`, `todo_update`, `todo_done`, `todo_drop` | Operator todos: list, create (blocking parks the card), rewrite, resolve (card resumes on its own) |
 | `dispatch`, `triage`, `unblock` | Drive cards: start a role run, verdict every finding, resolve a block |
 | `cycle_decision`, `program_gate` | Decide: exhausted review loop, program-level gate failure |
 | `merge_resolved`, `close` | Finish: accept a reconciled merge, close (optionally delete) the program |
@@ -169,7 +172,7 @@ One command mirrors the common half: `/work-program status | list | new <title> 
 
 ## Configuration
 
-Defaults live in settings under `workPrograms` (user or project `settings.json`); per-program overrides live in the `<!-- wp: {...} -->` line at the top of `plan.md`:
+Defaults live in settings under `workPrograms` (user or project `settings.json`); per-program overrides live in the YAML front matter at the top of `plan.md` (legacy `<!-- wp: {...} -->` comments still read, but new writes use front matter). Per-card overrides (`review`, `maxCycles`, `workerModel`, `reviewerModel`, …) live in each card file's front matter:
 
 | Key | Default | What it does |
 |-----|---------|--------------|

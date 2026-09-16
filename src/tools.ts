@@ -27,10 +27,18 @@ interface WorkProgramParams {
 	reviewProfile?: string;
 	maxParallel?: number;
 	parallelExecution?: string;
+	workerAgent?: string;
 	workerModel?: string;
 	workerThinking?: string;
+	reviewerAgent?: string;
 	reviewerModel?: string;
 	reviewerThinking?: string;
+	id?: string;
+	body?: string;
+	steps?: Array<{ text: string; command?: string; dangerous?: boolean }>;
+	blocking?: boolean;
+	note?: string;
+	reason?: string;
 	verdicts?: Array<{ finding: string; verdict: string; note?: string }>;
 }
 
@@ -52,6 +60,11 @@ const ACTIONS = [
 	"program_gate",
 	"merge_resolved",
 	"config",
+	"todos",
+	"todo_add",
+	"todo_update",
+	"todo_done",
+	"todo_drop",
 	"close",
 	"doctor",
 ] as const;
@@ -102,19 +115,21 @@ export function registerTools(pi: ExtensionAPI, controller: WorkProgramControlle
 		name: "work_program",
 		label: "Work Program",
 		description:
-			"Drive and inspect the active work program. Actions: status, protocol, list, create, start, finalize_plan, sync, pause, resume, mode, config, dispatch, triage, unblock, cycle_decision, program_gate, merge_resolved, close, doctor.",
+			"Drive and inspect the active work program. Actions: status, protocol, list, create, start, finalize_plan, sync, pause, resume, mode, config, todos, todo_add, todo_update, todo_done, todo_drop, dispatch, triage, unblock, cycle_decision, program_gate, merge_resolved, close, doctor.",
 		promptSnippet: "Inspect or drive the active work program (status, dispatch, triage, finalize plan)",
 		promptGuidelines: [
 			"Use work_program to inspect and drive a work program; never edit plan.md or progress.md directly.",
 			"finalize_plan only validates and stages a program — it never starts execution. After writing a plan, STOP and wait for the operator to review; only call resume/start/dispatch after the operator explicitly says to start.",
 			"When a work program completes, you receive a summary packet: reply with a completion summary, then ask whether to close the program. Only call close with remove:true after the operator explicitly confirms — never delete program records unprompted.",
 			"Pause is soft by default (in-flight runs finish, resume reconciles); pass hard:true to stop runs immediately and rearm their cards. Resume restarts the drive.",
-			"The program is retunable while it runs: work_program({ action: \"config\", maxCycles, onExhausted, reviewProfile, maxParallel, parallelExecution, workerModel, reviewerModel }) updates the live ledger and persists into plan.md, so it survives sync and reload. Use it instead of answering cycle decisions one by one (onExhausted: \"accept\" also resolves the open ones), and instead of editing plan.md by hand.",
+			"The program is retunable while it runs: work_program({ action: \"config\", maxCycles, onExhausted, reviewProfile, maxParallel, parallelExecution, workerAgent, workerModel, workerThinking, reviewerAgent, reviewerModel, reviewerThinking }) updates the live ledger and persists into plan.md front matter, so it survives sync and reload. Use it instead of answering cycle decisions one by one (onExhausted: \"accept\" also resolves the open ones), and instead of editing plan.md by hand.",
+			"Retune one card the same way with card set: work_program({ action: \"config\", card: \"05\", maxCycles: 5, reviewProfile: \"enhanced\" }) updates the live ledger row and persists into that card file's front matter. Card models work the same way (workerModel, reviewerModel, thinking); pass an empty string to clear a card override so it inherits the program default. Never hand-edit card front matter — always use config with card.",
 			"When a work-program decision packet arrives, answer with the exact work_program call it names (for review triage use action 'triage' with one verdict per finding).",
+			"Operator todos are chat-driven: list with todos, create with todo_add (blocking parks the card until resolved), rewrite with todo_update (title, body, steps), resolve with todo_done (the card resumes on its own) or todo_drop. Present open todos conversationally (title, why, exact steps/commands) instead of quoting storage. Never write or edit .operator/todos.json or .operator/todo.md directly — always use the todo actions.",
 		],
 		parameters: Type.Object({
 			action: Type.String({ description: `One of: ${ACTIONS.join(", ")}` }),
-			card: Type.Optional(Type.String({ description: "Card id for dispatch/triage/unblock/cycle/merge actions" })),
+			card: Type.Optional(Type.String({ description: "Card id for dispatch/triage/unblock/cycle/merge actions; for config, scopes the patch to one card's front matter" })),
 			role: Type.Optional(Type.String({ description: "dispatch role: worker | reviewer | reconciler" })),
 			slug: Type.Optional(Type.String({ description: "Program slug for start" })),
 			title: Type.Optional(Type.String({ description: "Title for create" })),
@@ -137,10 +152,26 @@ export function registerTools(pi: ExtensionAPI, controller: WorkProgramControlle
 			reviewProfile: Type.Optional(Type.String({ description: "config: light | enhanced review profile" })),
 			maxParallel: Type.Optional(Type.Number({ description: "config: how many cards may run at once (1-32)" })),
 			parallelExecution: Type.Optional(Type.String({ description: "config: worktrees | direct" })),
-			workerModel: Type.Optional(Type.String({ description: "config: model for worker runs" })),
-			workerThinking: Type.Optional(Type.String({ description: "config: thinking level for worker runs" })),
-			reviewerModel: Type.Optional(Type.String({ description: "config: model for reviewer runs" })),
-			reviewerThinking: Type.Optional(Type.String({ description: "config: thinking level for reviewer runs" })),
+			workerAgent: Type.Optional(Type.String({ description: "config: worker subagent (program-level, or per-card with card set)" })),
+			workerModel: Type.Optional(Type.String({ description: "config: model for worker runs (empty string clears a card override)" })),
+			workerThinking: Type.Optional(Type.String({ description: "config: thinking level for worker runs (empty string clears a card override)" })),
+			reviewerAgent: Type.Optional(Type.String({ description: "config: reviewer subagent (program-level, or per-card with card set)" })),
+			reviewerModel: Type.Optional(Type.String({ description: "config: model for reviewer runs (empty string clears a card override)" })),
+			reviewerThinking: Type.Optional(Type.String({ description: "config: thinking level for reviewer runs (empty string clears a card override)" })),
+			id: Type.Optional(Type.String({ description: "todo id (op-NN) for todo_update/todo_done/todo_drop" })),
+			body: Type.Optional(Type.String({ description: "todo_add/todo_update: why, context, details" })),
+			steps: Type.Optional(
+				Type.Array(
+					Type.Object({
+						text: Type.String({ description: "Step instruction" }),
+						command: Type.Optional(Type.String({ description: "Exact command to run" })),
+						dangerous: Type.Optional(Type.Boolean({ description: "Fails dangerously — operator must STOP and read" })),
+					}),
+				),
+			),
+			blocking: Type.Optional(Type.Boolean({ description: "todo_add/todo_update: true parks the card until resolved (default when a live card is named)" })),
+			note: Type.Optional(Type.String({ description: "todo_done: what was done / where it lives" })),
+			reason: Type.Optional(Type.String({ description: "todo_drop: why this is no longer needed" })),
 			verdicts: Type.Optional(
 				Type.Array(
 					Type.Object({
@@ -227,17 +258,62 @@ export function registerTools(pi: ExtensionAPI, controller: WorkProgramControlle
 				}
 				case "config": {
 					const patch: Record<string, unknown> = {};
+					if (params.card !== undefined) patch.card = params.card;
 					if (params.maxCycles !== undefined) patch.maxCycles = params.maxCycles;
 					if (params.onExhausted !== undefined) patch.onExhausted = params.onExhausted;
 					if (params.reviewProfile !== undefined) patch.reviewProfile = params.reviewProfile;
 					if (params.maxParallel !== undefined) patch.maxParallel = params.maxParallel;
 					if (params.parallelExecution !== undefined) patch.parallelExecution = params.parallelExecution;
 					if (params.mode !== undefined) patch.mode = params.mode;
+					if (params.workerAgent !== undefined) patch.workerAgent = params.workerAgent;
 					if (params.workerModel !== undefined) patch.workerModel = params.workerModel;
 					if (params.workerThinking !== undefined) patch.workerThinking = params.workerThinking;
+					if (params.reviewerAgent !== undefined) patch.reviewerAgent = params.reviewerAgent;
 					if (params.reviewerModel !== undefined) patch.reviewerModel = params.reviewerModel;
 					if (params.reviewerThinking !== undefined) patch.reviewerThinking = params.reviewerThinking;
 					const result = await controller.setConfig(patch as Parameters<typeof controller.setConfig>[0]);
+					if (!result.ok) fail(result.text);
+					return textResult(result.text, { ok: true });
+				}
+				case "todos": {
+					const result = await controller.todoList();
+					if (!result.ok) fail(result.text);
+					return textResult(result.text, { ok: true });
+				}
+				case "todo_add": {
+					if (!params.title) fail("todo_add requires title");
+					const result = await controller.todoAdd({
+						title: params.title,
+						...(params.body !== undefined ? { body: params.body } : {}),
+						...(params.steps !== undefined ? { steps: params.steps } : {}),
+						...(params.card !== undefined ? { card: params.card } : {}),
+						...(params.blocking !== undefined ? { blocking: params.blocking } : {}),
+					});
+					if (!result.ok) fail(result.text);
+					return textResult(result.text, { ok: true });
+				}
+				case "todo_update": {
+					if (!params.id) fail("todo_update requires id");
+					const result = await controller.todoUpdate({
+						id: params.id,
+						...(params.title !== undefined ? { title: params.title } : {}),
+						...(params.body !== undefined ? { body: params.body } : {}),
+						...(params.steps !== undefined ? { steps: params.steps } : {}),
+						...(params.card !== undefined ? { card: params.card } : {}),
+						...(params.blocking !== undefined ? { blocking: params.blocking } : {}),
+					});
+					if (!result.ok) fail(result.text);
+					return textResult(result.text, { ok: true });
+				}
+				case "todo_done": {
+					if (!params.id) fail("todo_done requires id");
+					const result = await controller.todoDone({ id: params.id, ...(params.note !== undefined ? { note: params.note } : {}) });
+					if (!result.ok) fail(result.text);
+					return textResult(result.text, { ok: true });
+				}
+				case "todo_drop": {
+					if (!params.id) fail("todo_drop requires id");
+					const result = await controller.todoDrop({ id: params.id, ...(params.reason !== undefined ? { reason: params.reason } : {}) });
 					if (!result.ok) fail(result.text);
 					return textResult(result.text, { ok: true });
 				}

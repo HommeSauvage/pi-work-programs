@@ -9,12 +9,30 @@ import {
 	workerBrief,
 } from "../protocol/briefs.ts";
 import { appendHarnessEvidence, gateEvidenceLines, setCardState } from "../program/card-edit.ts";
-import { laneBranch, reviewPath } from "../program/ledger.ts";
 import {
+	effectiveMaxCycles,
+	effectiveReviewerAgent,
+	effectiveReviewerModel,
+	effectiveReviewerThinking,
+	effectiveReviewProfile,
+	effectiveWorkerAgent,
+	effectiveWorkerModel,
+	effectiveWorkerThinking,
+	laneBranch,
+	reviewPath,
+} from "../program/ledger.ts";
+import {
+	emptyTodoStore,
 	ensureOperatorTodoFile,
+	importInboxTodos,
+	openTodos,
 	operatorTodoPath,
-	parseOperatorTodos,
+	operatorTodosJsonPath,
+	parseTodoStore,
+	serializeTodoStore,
 	type OperatorTodoItem,
+	type TodoItem,
+	type TodoStore,
 } from "../program/operator-todos.ts";
 import { parseEvidence } from "../program/parse.ts";
 import { oneLine, truncateTail } from "../shared/text.ts";
@@ -169,19 +187,21 @@ export async function drive(host: DriverHost): Promise<void> {
 		// event left to trigger another tick.
 		// Cards whose merge was already attempted this tick: a parked failure must
 		// wait for the next tick instead of retrying immediately.
+		const gate = await syncTodoStore(host);
 		const attemptedMerges = new Set<string>();
 		for (let pass = 0; pass < MAX_DRIVE_PASSES; pass += 1) {
 			const before = stateSignature(host);
-			await reconcileRuns(host);
+			await reconcileRuns(host, gate);
 			await resolveStaleBlocks(host);
+			await resumeWaitingCards(host, gate);
 			if (ledger.mode === "managed" || ledger.mode === "captain") {
-				await dispatchReadyCards(host);
-				await dispatchReviews(host);
-				await dispatchFixes(host);
+				await dispatchReadyCards(host, gate);
+				await dispatchReviews(host, gate);
+				await dispatchFixes(host, gate);
 			}
-			await finishApprovedCards(host);
+			await finishApprovedCards(host, gate);
 			await ensurePackets(host);
-			await processMergeQueue(host, attemptedMerges);
+			await processMergeQueue(host, gate, attemptedMerges);
 			if (stateSignature(host) === before) break;
 		}
 		await maybeRunProgramGate(host);
@@ -197,7 +217,7 @@ export async function drive(host: DriverHost): Promise<void> {
 	host.refreshUi();
 }
 
-async function reconcileRuns(host: DriverHost): Promise<void> {
+async function reconcileRuns(host: DriverHost, gate: TodoGate): Promise<void> {
 	for (const card of ledgerCards(host.ledger)) {
 		const active = activeRunOf(card);
 		if (!active) continue;
@@ -215,19 +235,19 @@ async function reconcileRuns(host: DriverHost): Promise<void> {
 		card.activeRun = undefined;
 		switch (active.kind) {
 			case "worker":
-				await onWorkerComplete(host, card, status, active.runId);
+				await onWorkerComplete(host, gate, card, status, active.runId);
 				break;
 			case "reviewer":
 				await onReviewerComplete(host, card, status, active.runId);
 				break;
 			case "fix":
-				await onFixComplete(host, card, status, active.runId);
+				await onFixComplete(host, gate, card, status, active.runId);
 				break;
 			case "captain":
-				await onCaptainComplete(host, card, status, active.runId);
+				await onCaptainComplete(host, gate, card, status, active.runId);
 				break;
 			case "reconciler":
-				await onReconcilerComplete(host, card, status, active.runId);
+				await onReconcilerComplete(host, gate, card, status, active.runId);
 				break;
 		}
 		await host.save();
@@ -247,6 +267,229 @@ async function blockCard(host: DriverHost, card: CardLedger, reason: string): Pr
 	});
 	await progress(host, `${card.id} blocked — ${oneLine(reason, 120)}`);
 	host.ports.notify(`Work program: card ${card.id} blocked — ${oneLine(reason, 100)}`, "error");
+}
+
+/* ---------------------------------------------------------------------------
+ * Operator todos: structured waiting
+ *
+ * `.operator/todos.json` is the single source of truth (extension-owned).
+ * `.operator/todo.md` is only the workers' append-only inbox — subagent
+ * children have no tools, so they cannot call the todo actions; the drive
+ * imports new inbox entries here automatically. A blocking todo that names a
+ * card parks it: dispatches skip it, completions park instead of advancing,
+ * and `todo_done` / `todo_drop` rearm it automatically.
+ * ------------------------------------------------------------------------- */
+
+export const WAITING_PREFIX = "waiting on operator";
+
+/** Phases a card may be parked from without losing decision or merge state. */
+const PARKABLE_PHASES = new Set(["pending", "ready", "review_pending", "approved", "queued"]);
+
+function parkablePhase(card: CardLedger): boolean {
+	if (PARKABLE_PHASES.has(card.phase)) return true;
+	// A fix that has not dispatched yet keeps its intent via blockedFrom.
+	return card.phase === "fixing" && !card.activeRun;
+}
+
+export function waitingReason(items: TodoItem[]): string {
+	const first = items[0];
+	const base = first ? `${WAITING_PREFIX} todo ${first.id}: ${oneLine(first.title, 90)}` : WAITING_PREFIX;
+	return items.length > 1 ? `${base} (+${items.length - 1} more)` : base;
+}
+
+export interface TodoGate {
+	store: TodoStore;
+	stream: string;
+	/** Open blocking todos by card id (active stream only). */
+	byCard: Map<string, TodoItem[]>;
+	/** True when the store file must be (re)written. */
+	dirty: boolean;
+}
+
+export function buildTodoGate(store: TodoStore, stream: string): TodoGate {
+	const byCard = new Map<string, TodoItem[]>();
+	for (const item of store.items) {
+		if (item.stream !== stream || item.state !== "open" || !item.blocking || !item.card) continue;
+		const list = byCard.get(item.card) ?? [];
+		list.push(item);
+		byCard.set(item.card, list);
+	}
+	return { store, stream, byCard, dirty: false };
+}
+
+export function todosBlockingCard(gate: TodoGate, cardId: string): TodoItem[] {
+	return gate.byCard.get(cardId) ?? [];
+}
+
+function todoAskText(ledger: ProgramLedger, card: CardLedger, items: TodoItem[]): string {
+	const lines = [
+		`[WORK PROGRAM] Card ${card.id} needs a human before it can proceed (${ledger.slug}).`,
+		"",
+	];
+	for (const item of items.slice(0, 3)) {
+		lines.push(`${item.id}: ${item.title}`);
+		if (item.body) lines.push(oneLine(item.body, 220));
+		for (const step of item.steps.slice(0, 6)) {
+			lines.push(`- ${oneLine(step.text, 160)}${step.command ? ` — \`${step.command}\`` : ""}${step.dangerous ? " (STOP — may fail dangerously)" : ""}`);
+		}
+		lines.push(`When finished: work_program({ action: "todo_done", id: "${item.id}" }) — the card resumes on its own. To rewrite it first: work_program({ action: "todo_update", id: "${item.id}", title: "...", steps: [{ "text": "..." }] }).`);
+		lines.push("");
+	}
+	return lines.join("\n");
+}
+
+/**
+ * Park a card on open blocking todos. Quiescent cards transition to blocked
+ * (decision points at `todo_done`); in-flight cards only record `waitingOn`
+ * and the completion guards park them when the run lands.
+ */
+export async function parkForTodos(
+	host: DriverHost,
+	gate: TodoGate,
+	card: CardLedger,
+	items: TodoItem[],
+	opts: { announce?: boolean; force?: boolean } = {},
+): Promise<void> {
+	if (items.length === 0) return;
+	const ids = items.map((item) => item.id);
+	card.waitingOn = Array.from(new Set([...(card.waitingOn ?? []), ...ids]));
+	// Completion paths force the transition (the run has landed, so no decision
+	// or merge is in flight); everywhere else only quiescent phases move.
+	if (!opts.force && !parkablePhase(card)) {
+		if (opts.announce === true) {
+			host.ports.notify(`Work program: card ${card.id} will wait on operator todo ${ids.join(", ")} once its run lands`, "warning");
+			host.ports.ask(todoAskText(host.ledger, card, items));
+		}
+		await host.save();
+		return;
+	}
+	if (card.phase !== "blocked") card.blockedFrom = card.phase;
+	card.phase = "blocked";
+	card.lastError = waitingReason(items);
+	cancelOpenDecisionsFor(host, card.id, card.lastError);
+	createDecision(host, {
+		kind: "blocked",
+		card: card.id,
+		message: `Card ${card.id} is ${card.lastError}.`,
+		expectedAction: `work_program({ action: "todo_done", id: "${ids[0]}" }) when finished${ids.length > 1 ? ` (also ${ids.slice(1).join(", ")})` : ""} — or work_program({ action: "unblock", card: "${card.id}", resolution: "redispatch" }) to override`,
+	});
+	if (opts.announce === true) {
+		const decision = openDecisionFor(host.ledger, card.id);
+		if (decision) decision.packetSent = true;
+	}
+	await progress(host, `${card.id} waiting on ${ids.join(", ")} — ${oneLine(items[0]?.title ?? "", 100)}`);
+	host.ports.notify(`Work program: card ${card.id} is waiting on operator todo ${ids.join(", ")} — ${oneLine(items[0]?.title ?? "", 90)}`, "warning");
+	if (opts.announce === true) host.ports.ask(todoAskText(host.ledger, card, items));
+	await host.save();
+}
+
+/**
+ * Rearm cards whose blocking todos are all resolved, and park quiescent cards
+ * that newly show open blocking todos. Covers tool mutations and hand-edited
+ * JSON alike — the store is truth, the ledger follows.
+ */
+export async function resumeWaitingCards(host: DriverHost, gate: TodoGate): Promise<void> {
+	for (const card of ledgerCards(host.ledger)) {
+		if (isAbandonedCard(card)) {
+			delete card.waitingOn;
+			continue;
+		}
+		const open = todosBlockingCard(gate, card.id);
+		if (open.length > 0) {
+			card.waitingOn = open.map((item) => item.id);
+			if (!(card.phase === "blocked" && card.lastError?.startsWith(WAITING_PREFIX))) {
+				await parkForTodos(host, gate, card, open, {});
+			}
+			continue;
+		}
+		if (!card.waitingOn || card.waitingOn.length === 0) continue;
+		delete card.waitingOn;
+		if (card.merge?.state === "merged") {
+			const decision = openDecisionFor(host.ledger, card.id);
+			if (decision) resolveDecision(host, decision.id);
+			card.lastError = undefined;
+			await finishManualMerge(host, card);
+			await progress(host, `${card.id} operator todos resolved — merge finalized`);
+			continue;
+		}
+		if (card.phase === "blocked" && card.lastError?.startsWith(WAITING_PREFIX)) {
+			const from = card.blockedFrom;
+			card.phase =
+				from === "reviewing"
+					? "review_pending"
+					: from === "verifying" || from === "fixing"
+						? "fixing"
+						: from === "approved" || from === "queued"
+							? "approved"
+							: "pending";
+			card.blockedFrom = undefined;
+			card.lastError = undefined;
+			const decision = openDecisionFor(host.ledger, card.id);
+			if (decision) resolveDecision(host, decision.id);
+			await progress(host, `${card.id} operator todos resolved — rearmed to ${card.phase}`);
+		}
+	}
+	await host.save();
+}
+
+async function ensureTodoStoreFile(host: DriverHost): Promise<TodoStore> {
+	const path = operatorTodosJsonPath(host.cwd);
+	let raw = "";
+	try {
+		raw = await host.ports.readFile(path);
+	} catch {
+		raw = "";
+	}
+	if (raw.trim().length > 0) return parseTodoStore(raw);
+	const store = emptyTodoStore();
+	await host.ports.writeFile(path, serializeTodoStore(store));
+	return store;
+}
+
+/**
+ * Load the todo store, import new worker-inbox entries, persist when changed,
+ * and park + announce for brand-new blocking todos. Once per drive tick.
+ */
+export async function syncTodoStore(host: DriverHost): Promise<TodoGate> {
+	const store = await ensureTodoStoreFile(host);
+	let dirty = false;
+	let md = "";
+	try {
+		md = await host.ports.readFile(operatorTodoPath(host.cwd));
+	} catch {
+		md = "";
+	}
+	if (md.trim().length > 0) {
+		const result = importInboxTodos(md, store, (cardId) => {
+			const card = host.ledger.cards[cardId];
+			return card !== undefined && card.phase !== "done" && !isAbandonedCard(card);
+		});
+		if (result.imported > 0) dirty = true;
+	}
+	// Announce open unannounced items of this stream — covers fresh imports and
+	// items another program's session imported first (hashes are global).
+	const gate = buildTodoGate(store, host.ledger.slug);
+	const announcedCards = new Set<string>();
+	for (const item of store.items) {
+		if (item.stream !== host.ledger.slug || item.state !== "open" || item.announced === true) continue;
+		item.announced = true;
+		dirty = true;
+		if (item.blocking && item.card) {
+			if (announcedCards.has(item.card)) continue;
+			announcedCards.add(item.card);
+			const card = host.ledger.cards[item.card];
+			if (card && !isAbandonedCard(card)) {
+				await parkForTodos(host, gate, card, todosBlockingCard(gate, item.card), { announce: true });
+			}
+		} else {
+			host.ports.notify(`Work program: new operator todo ${item.id}: ${oneLine(item.title, 100)}`, "info");
+		}
+	}
+	if (dirty) {
+		await host.ports.writeFile(operatorTodosJsonPath(host.cwd), serializeTodoStore(store));
+		await host.save();
+	}
+	return buildTodoGate(store, host.ledger.slug);
 }
 
 /**
@@ -363,7 +606,7 @@ async function abandonCard(host: DriverHost, card: CardLedger): Promise<{ ok: bo
 	if (dependents.length > 0) {
 		return {
 			ok: false,
-			error: `card ${cardId} is still a dependency of ${dependents.join(", ")}; rewire those cards (edit their \`Depends on:\` and sync) before abandoning it`,
+			error: `card ${cardId} is still a dependency of ${dependents.join(", ")}; rewire those cards (edit their front-matter \`dependsOn\` and sync) before abandoning it`,
 		};
 	}
 	if (card.lane) {
@@ -574,7 +817,7 @@ async function laneAlreadyImplemented(host: DriverHost, card: CardLedger): Promi
 	}
 }
 
-async function onWorkerComplete(host: DriverHost, card: CardLedger, status: RunStatus, runId: string): Promise<void> {
+async function onWorkerComplete(host: DriverHost, gate: TodoGate, card: CardLedger, status: RunStatus, runId: string): Promise<void> {
 	if (status.state === "paused") {
 		await blockCard(host, card, `worker run ${runId} paused by operator — redispatch to continue from the lane state`);
 		return;
@@ -585,15 +828,25 @@ async function onWorkerComplete(host: DriverHost, card: CardLedger, status: RunS
 		// validate it (gate + review) instead of asking for another worker.
 		if (outcome !== "salvaged") return;
 	}
+	const waiting = todosBlockingCard(gate, card.id);
 	const text = await readCardText(host, card);
 	if (!parseEvidence(text)) {
+		// A worker stopped by a human need parks on the todo, not on missing evidence.
+		if (waiting.length > 0) {
+			await parkForTodos(host, gate, card, waiting, { force: true });
+			return;
+		}
 		await blockCard(host, card, "worker finished without an `## Evidence` section");
 		return;
 	}
 	card.workerSummary = status.output ? truncateTail(status.output, 6_000) : "";
 	const outcome = await runCardGates(host, card, host.ports.runCwd(host.ledger, card));
 	if (!outcome.ok) {
-		await startGateFix(host, card, outcome.gates, "implementation");
+		await startGateFix(host, card, outcome.gates, "implementation", gate);
+		return;
+	}
+	if (waiting.length > 0) {
+		await parkForTodos(host, gate, card, waiting, { force: true });
 		return;
 	}
 	card.phase = "review_pending";
@@ -608,7 +861,16 @@ async function startGateFix(
 	card: CardLedger,
 	gates: GateResult[],
 	origin: "implementation" | "merge" | "captain",
+	gate?: TodoGate,
 ): Promise<void> {
+	if (gate) {
+		const waiting = todosBlockingCard(gate, card.id);
+		if (waiting.length > 0) {
+			// Gate fixes run after a run landed: force the park (no attempt consumed).
+			await parkForTodos(host, gate, card, waiting, { force: true });
+			return;
+		}
+	}
 	const attempts = (card.gateAttempts ?? 0) + 1;
 	card.gateAttempts = attempts;
 	if (attempts > 3) {
@@ -621,11 +883,11 @@ async function startGateFix(
 	const cwd = card.merge?.state === "merged" ? host.cwd : host.ports.runCwd(host.ledger, card);
 	const dispatched = await dispatchWithInfraRetry(host, card, {
 		kind: "fix",
-		agent: host.ledger.workerAgent,
+		agent: effectiveWorkerAgent(host.ledger, card),
 		task,
 		cwd,
-		model: host.ledger.workerModel,
-		thinking: host.ledger.workerThinking,
+		model: effectiveWorkerModel(host.ledger, card),
+		thinking: effectiveWorkerThinking(host.ledger, card),
 		label: `wp ${host.ledger.slug} card ${card.id} gate fix`,
 	});
 	if (!dispatched.ok) {
@@ -654,7 +916,7 @@ async function onReviewerComplete(host: DriverHost, card: CardLedger, status: Ru
 	if (written.length === 0) await host.ports.writeFile(path, `${review}\n`);
 	card.cycles = cycle;
 	card.phase = "triaging";
-	const profile = card.reviewProfile ?? host.ledger.reviewProfile;
+	const profile = effectiveReviewProfile(host.ledger, card);
 	createDecision(host, {
 		kind: "review-triage",
 		card: card.id,
@@ -666,7 +928,7 @@ async function onReviewerComplete(host: DriverHost, card: CardLedger, status: Ru
 	await progress(host, `${card.id} review ${cycle} ready — awaiting triage`);
 }
 
-async function onFixComplete(host: DriverHost, card: CardLedger, status: RunStatus, runId: string): Promise<void> {
+async function onFixComplete(host: DriverHost, gate: TodoGate, card: CardLedger, status: RunStatus, runId: string): Promise<void> {
 	const wasMerged = card.merge?.state === "merged";
 	if (status.state === "paused") {
 		await blockCard(host, card, `fix run ${runId} paused by operator — redispatch to retry the pending fixes`);
@@ -681,12 +943,16 @@ async function onFixComplete(host: DriverHost, card: CardLedger, status: RunStat
 	const cwd = wasMerged ? host.cwd : host.ports.runCwd(host.ledger, card);
 	const outcome = await runCardGates(host, card, cwd);
 	if (!outcome.ok) {
-		await startGateFix(host, card, outcome.gates, wasMerged ? "merge" : "implementation");
+		await startGateFix(host, card, outcome.gates, wasMerged ? "merge" : "implementation", gate);
 		return;
 	}
 	if (wasMerged) {
 		await markDoneAndCommit(host, card, [`merge: recorded manually (${(card.merge?.commit ?? "").slice(0, 7)})`]);
 		await finalizeMergedCard(host, card, card.merge?.commit ?? "");
+		return;
+	}
+	if (todosBlockingCard(gate, card.id).length > 0) {
+		await parkForTodos(host, gate, card, todosBlockingCard(gate, card.id), { force: true });
 		return;
 	}
 	card.phase = "review_pending";
@@ -696,7 +962,7 @@ async function onFixComplete(host: DriverHost, card: CardLedger, status: RunStat
 	await progress(host, `${card.id} fixes applied — re-review queued`);
 }
 
-async function onCaptainComplete(host: DriverHost, card: CardLedger, status: RunStatus, runId: string): Promise<void> {
+async function onCaptainComplete(host: DriverHost, gate: TodoGate, card: CardLedger, status: RunStatus, runId: string): Promise<void> {
 	if (status.state === "paused") {
 		await blockCard(host, card, `captain run ${runId} paused by operator — redispatch to restart the card loop`);
 		return;
@@ -730,7 +996,11 @@ async function onCaptainComplete(host: DriverHost, card: CardLedger, status: Run
 	}
 	const outcome = await runCardGates(host, card, host.ports.runCwd(host.ledger, card));
 	if (!outcome.ok) {
-		await startGateFix(host, card, outcome.gates, "captain");
+		await startGateFix(host, card, outcome.gates, "captain", gate);
+		return;
+	}
+	if (todosBlockingCard(gate, card.id).length > 0) {
+		await parkForTodos(host, gate, card, todosBlockingCard(gate, card.id), { force: true });
 		return;
 	}
 	card.phase = "approved";
@@ -826,7 +1096,7 @@ export async function startWorkerFor(host: DriverHost, card: CardLedger): Promis
 		return;
 	}
 	if (ledger.mode === "captain") {
-		const reviewProfile = card.reviewProfile ?? ledger.reviewProfile;
+		const reviewProfile = effectiveReviewProfile(ledger, card);
 		const path = reviewPath(host.programDir, card.id, card.cycles + 1);
 		const task = captainBrief({
 			ledger,
@@ -838,6 +1108,7 @@ export async function startWorkerFor(host: DriverHost, card: CardLedger): Promis
 			reviewProfile,
 			reviewPath: path,
 			repoRoot: host.cwd,
+			maxCycles: effectiveMaxCycles(ledger, card),
 		});
 		const dispatched = await dispatchWithInfraRetry(host, card, {
 			kind: "captain",
@@ -864,11 +1135,11 @@ export async function startWorkerFor(host: DriverHost, card: CardLedger): Promis
 	try {
 		const dispatched = await dispatchWithInfraRetry(host, card, {
 			kind: "worker",
-			agent: ledger.workerAgent,
+			agent: effectiveWorkerAgent(ledger, card),
 			task,
 			cwd: host.ports.runCwd(ledger, card),
-			model: ledger.workerModel,
-			thinking: ledger.workerThinking,
+			model: effectiveWorkerModel(ledger, card),
+			thinking: effectiveWorkerThinking(ledger, card),
 			label: `wp ${ledger.slug} card ${card.id}`,
 		});
 		if (!dispatched.ok) {
@@ -879,7 +1150,7 @@ export async function startWorkerFor(host: DriverHost, card: CardLedger): Promis
 	}
 }
 
-async function dispatchReadyCards(host: DriverHost): Promise<void> {
+async function dispatchReadyCards(host: DriverHost, gate: TodoGate): Promise<void> {
 	const ledger = host.ledger;
 	const capacity = ledger.parallelExecution === "direct" ? 1 : ledger.maxParallel;
 	const ready = readyCards(ledger);
@@ -888,6 +1159,8 @@ async function dispatchReadyCards(host: DriverHost): Promise<void> {
 	let slots = Math.max(0, capacity - inFlight);
 	for (const card of ready) {
 		if (slots <= 0) break;
+		// Waiting on a human: hold the slot for cards that can proceed.
+		if (todosBlockingCard(gate, card.id).length > 0) continue;
 		slots -= 1;
 		await startWorkerFor(host, card);
 		if (card.phase === "blocked") continue;
@@ -898,7 +1171,7 @@ async function dispatchReadyCards(host: DriverHost): Promise<void> {
 
 export async function startReviewFor(host: DriverHost, card: CardLedger): Promise<void> {
 	const ledger = host.ledger;
-	const profile = card.reviewProfile ?? ledger.reviewProfile;
+	const profile = effectiveReviewProfile(ledger, card);
 	const cwd = host.ports.runCwd(ledger, card);
 	const base = card.lane?.base ?? (await host.ports.git.head(cwd));
 	const branch = card.lane?.branch ?? (await host.ports.git.currentBranch(cwd));
@@ -928,11 +1201,11 @@ export async function startReviewFor(host: DriverHost, card: CardLedger): Promis
 	try {
 		await dispatchRun(host, card, {
 			kind: "reviewer",
-			agent: ledger.reviewerAgent,
+			agent: effectiveReviewerAgent(ledger, card),
 			task,
 			cwd,
-			model: ledger.reviewerModel,
-			thinking: ledger.reviewerThinking,
+			model: effectiveReviewerModel(ledger, card),
+			thinking: effectiveReviewerThinking(ledger, card),
 			label: `wp ${ledger.slug} card ${card.id} review`,
 		});
 	} catch (error) {
@@ -942,24 +1215,26 @@ export async function startReviewFor(host: DriverHost, card: CardLedger): Promis
 	await progress(host, `${card.id} review ${card.cycles + 1} dispatched (${profile})`);
 }
 
-async function dispatchReviews(host: DriverHost): Promise<void> {
+async function dispatchReviews(host: DriverHost, gate: TodoGate): Promise<void> {
 	const ledger = host.ledger;
 	const reviewing = ledgerCards(ledger).filter((card) => card.phase === "reviewing").length;
 	let slots = Math.max(0, ledger.maxParallel - reviewing);
 	for (const card of ledgerCards(ledger)) {
 		if (card.phase !== "review_pending") continue;
 		if (isHeld(card)) continue;
+		if (todosBlockingCard(gate, card.id).length > 0) continue;
 		if (slots <= 0) break;
 		slots -= 1;
 		await startReviewFor(host, card);
 	}
 }
 
-async function dispatchFixes(host: DriverHost): Promise<void> {
+async function dispatchFixes(host: DriverHost, gate: TodoGate): Promise<void> {
 	const ledger = host.ledger;
 	for (const card of ledgerCards(ledger)) {
 		if (card.phase !== "fixing" || card.activeRun) continue;
 		if (isHeld(card)) continue;
+		if (todosBlockingCard(gate, card.id).length > 0) continue;
 		// Only an untriaged review holds fixes back — never a stale record of
 		// another kind (a stale `blocked` decision is cleared via unblock/sweep).
 		if (openDecisionOfKind(ledger, card.id, "review-triage")) continue;
@@ -1016,11 +1291,11 @@ async function dispatchFixes(host: DriverHost): Promise<void> {
 		}
 		const dispatched = await dispatchWithInfraRetry(host, card, {
 			kind: "fix",
-			agent: ledger.workerAgent,
+			agent: effectiveWorkerAgent(ledger, card),
 			task,
 			cwd,
-			model: ledger.workerModel,
-			thinking: ledger.workerThinking,
+			model: effectiveWorkerModel(ledger, card),
+			thinking: effectiveWorkerThinking(ledger, card),
 			label: `wp ${ledger.slug} card ${card.id} review fixes`,
 		});
 		if (!dispatched.ok) {
@@ -1031,9 +1306,11 @@ async function dispatchFixes(host: DriverHost): Promise<void> {
 	}
 }
 
-async function finishApprovedCards(host: DriverHost): Promise<void> {
+async function finishApprovedCards(host: DriverHost, gate: TodoGate): Promise<void> {
 	for (const card of ledgerCards(host.ledger)) {
 		if (card.phase !== "approved") continue;
+		// Approved but waiting on a human: hold the merge until the todo resolves.
+		if (todosBlockingCard(gate, card.id).length > 0) continue;
 		await finishCard(host, card);
 	}
 }
@@ -1195,7 +1472,7 @@ async function foreignChanges(host: DriverHost): Promise<string[]> {
 		});
 }
 
-async function processMergeQueue(host: DriverHost, attempted: Set<string> = new Set()): Promise<void> {
+async function processMergeQueue(host: DriverHost, gate: TodoGate, attempted: Set<string> = new Set()): Promise<void> {
 	const ledger = host.ledger;
 	if (ledger.parallelExecution !== "worktrees") return;
 	while (ledger.mergeQueue.length > 0) {
@@ -1206,6 +1483,8 @@ async function processMergeQueue(host: DriverHost, attempted: Set<string> = new 
 			ledger.mergeQueue.shift();
 			continue;
 		}
+		// Waiting on a human: hold the merge until the todo resolves.
+		if (todosBlockingCard(gate, headId).length > 0) return;
 		if (card.phase === "done") {
 			ledger.mergeQueue.shift();
 			continue;
@@ -1260,7 +1539,7 @@ async function processMergeQueue(host: DriverHost, attempted: Set<string> = new 
 		if (await host.ports.git.merging(host.cwd)) {
 			// A previous tick merged but never committed (commit crashed after a
 			// good merge): resume at the commit step instead of re-merging.
-			await finishMergeCommit(host, card);
+			await finishMergeCommit(host, card, gate);
 			return;
 		}
 		const result = await host.ports.git.mergeNoCommit(host.cwd, card.lane.branch);
@@ -1279,7 +1558,7 @@ async function processMergeQueue(host: DriverHost, attempted: Set<string> = new 
 			await host.save();
 			continue;
 		}
-		await finishMergeCommit(host, card);
+		await finishMergeCommit(host, card, gate);
 		if (card.merge?.state === "merged") continue;
 		// Parked (commit failure) or handed to a gate fix: stop draining the queue.
 		return;
@@ -1342,9 +1621,9 @@ async function beginReconcile(
 /** Complete a clean merge: commit it, gate it, record it — parking (never
  *  crash-looping) when the commit step fails. Bounded: past the cap the card
  *  blocks loudly with a decision instead of retrying forever. */
-async function finishMergeCommit(host: DriverHost, card: CardLedger): Promise<void> {
+async function finishMergeCommit(host: DriverHost, card: CardLedger, gate: TodoGate): Promise<void> {
 	try {
-		await completeMerge(host, card);
+		await completeMerge(host, card, gate);
 	} catch (error) {
 		const attempts = (card.merge?.attempts ?? 0) + 1;
 		card.merge = { state: "merging", attempts };
@@ -1359,7 +1638,7 @@ async function finishMergeCommit(host: DriverHost, card: CardLedger): Promise<vo
 	}
 }
 
-async function onReconcilerComplete(host: DriverHost, card: CardLedger, status: RunStatus, runId: string): Promise<void> {
+async function onReconcilerComplete(host: DriverHost, gate: TodoGate, card: CardLedger, status: RunStatus, runId: string): Promise<void> {
 	if (status.state === "paused") {
 		await blockCard(
 			host,
@@ -1384,7 +1663,7 @@ async function onReconcilerComplete(host: DriverHost, card: CardLedger, status: 
 		// Commit only what the merge staged — never `add`, so stray files stay out.
 		await host.ports.git.commitMerge(host.cwd);
 	}
-	await finishMergeCommit(host, card);
+	await finishMergeCommit(host, card, gate);
 }
 
 function recordPaths(host: DriverHost, card: CardLedger): string[] {
@@ -1414,14 +1693,36 @@ async function markDoneAndCommit(host: DriverHost, card: CardLedger, extraLines:
 	return commitRecordPaths(host, card, `wp(${host.ledger.slug}): card ${card.id} done`, recordPaths(host, card));
 }
 
-async function completeMerge(host: DriverHost, card: CardLedger): Promise<void> {
+async function completeMerge(host: DriverHost, card: CardLedger, gate: TodoGate): Promise<void> {
 	// Commit exactly what the merge staged (never `add`), tolerating an
 	// open-but-empty merge instead of failing the card.
 	const commit = await host.ports.git.commitMerge(host.cwd);
 	card.merge = { state: "merged", commit, attempts: card.merge?.attempts ?? 1 };
 	const outcome = await runCardGates(host, card, host.cwd);
 	if (!outcome.ok) {
-		await startGateFix(host, card, outcome.gates, "merge");
+		await startGateFix(host, card, outcome.gates, "merge", gate);
+		return;
+	}
+	// The merge is committed; a human need now parks the record instead of landing it.
+	const waiting = todosBlockingCard(gate, card.id);
+	if (waiting.length > 0) {
+		await parkForTodos(host, gate, card, waiting, {});
+		// parkForTodos skips non-parkable phases (merging): force the record park —
+		// the resume sweep finalizes this exact state via finishManualMerge.
+		if (card.phase !== "blocked") {
+			card.blockedFrom = "merging";
+			card.phase = "blocked";
+			card.lastError = waitingReason(waiting);
+			cancelOpenDecisionsFor(host, card.id, card.lastError);
+			createDecision(host, {
+				kind: "blocked",
+				card: card.id,
+				message: `Card ${card.id} is ${card.lastError} (merge ${commit.slice(0, 7)} committed, not yet recorded).`,
+				expectedAction: `work_program({ action: "todo_done", id: "${waiting[0]?.id}" }) when finished — or work_program({ action: "unblock", card: "${card.id}", resolution: "redispatch" }) to override`,
+			});
+			await progress(host, `${card.id} waiting on ${waiting.map((item) => item.id).join(", ")} — merge recorded on todo resolution`);
+			await host.save();
+		}
 		return;
 	}
 	await markDoneAndCommit(host, card, [
@@ -1459,12 +1760,12 @@ async function finalizeMergedCard(host: DriverHost, card: CardLedger, commit: st
 }
 
 /** Finalize a merge that a human or the orchestrator already resolved and committed. */
-export async function finishManualMerge(host: DriverHost, card: CardLedger): Promise<void> {
+export async function finishManualMerge(host: DriverHost, card: CardLedger, gate?: TodoGate): Promise<void> {
 	const commit = await host.ports.git.head(host.cwd);
 	card.merge = { state: "merged", commit, attempts: card.merge?.attempts ?? 1 };
 	const outcome = await runCardGates(host, card, host.cwd);
 	if (!outcome.ok) {
-		await startGateFix(host, card, outcome.gates, "merge");
+		await startGateFix(host, card, outcome.gates, "merge", gate);
 		return;
 	}
 	await markDoneAndCommit(host, card, [`merge: recorded manually (${commit.slice(0, 7)})`]);
@@ -1521,12 +1822,12 @@ async function completeProgram(host: DriverHost, how: string): Promise<void> {
 	host.ports.ask(programCompleteMessage(ledger, await openOperatorTodos(host, ledger.slug)));
 }
 
-/** Open operator todos for this program's stream, if the file exists. Never throws. */
+/** Open operator todos for this program's stream, if the store exists. Never throws. */
 async function openOperatorTodos(host: DriverHost, stream: string): Promise<OperatorTodoItem[]> {
 	try {
-		const text = await host.ports.readFile(operatorTodoPath(host.cwd));
+		const text = await host.ports.readFile(operatorTodosJsonPath(host.cwd));
 		if (!text || text.trim().length === 0) return [];
-		return parseOperatorTodos(text, stream).open;
+		return openTodos(parseTodoStore(text), stream).map((item) => ({ title: item.title, done: false }));
 	} catch {
 		return [];
 	}
@@ -1550,14 +1851,15 @@ export function applyTriage(host: DriverHost, cardId: string, verdicts: FindingV
 		card.phase = "approved";
 		return { ok: true };
 	}
-	if (card.cycles >= host.ledger.maxCycles) {
+	const cap = effectiveMaxCycles(host.ledger, card);
+	if (card.cycles >= cap) {
 		if (host.ledger.onExhausted === "accept") {
 			card.phase = "approved";
 			return { ok: true };
 		}
 		if (host.ledger.onExhausted === "block") {
 			card.phase = "blocked";
-			card.lastError = `review cycle limit (${host.ledger.maxCycles}) reached with approved findings`;
+			card.lastError = `review cycle limit (${cap}) reached with approved findings`;
 			return { ok: true };
 		}
 		card.phase = "triaging";
@@ -1565,7 +1867,7 @@ export function applyTriage(host: DriverHost, cardId: string, verdicts: FindingV
 			kind: "cycle-exhausted",
 			card: cardId,
 			summary: `${approved.length} approved finding(s) remain`,
-			message: cycleDecisionMessage(cardId, host.ledger.maxCycles),
+			message: cycleDecisionMessage(cardId, cap),
 			expectedAction: `work_program({ action: "cycle_decision", card: "${cardId}", choice: "accept" | "block" })`,
 		});
 		return { ok: true };
@@ -1596,6 +1898,9 @@ export async function applyUnblock(
 	}
 	const decision = openDecisionFor(host.ledger, cardId);
 	if (decision) resolveDecision(host, decision.id);
+	// An explicit operator override also releases todo waiting (the drive would
+	// otherwise re-park the card on the next tick while the todos stay open).
+	delete card.waitingOn;
 	if (resolution === "abandon") {
 		return abandonCard(host, card);
 	}

@@ -62,14 +62,26 @@ export default function workProgramsExtension(pi: ExtensionAPI): void {
 		if (event.toolName !== "write" && event.toolName !== "edit") return;
 		const input = event.input as { path?: string };
 		const path = typeof input.path === "string" ? input.path : "";
-		if (path.length === 0 || !path.endsWith("progress.md")) return;
+		if (path.length === 0) return;
 		const active = controller.getActive();
 		if (!active) return;
-		if (!path.includes(active.slug)) return;
-		return {
-			block: true,
-			reason:
-				"progress.md is owned by pi-work-programs; the extension records card, review, and merge events automatically.",
-		};
+		if (path.endsWith("progress.md")) {
+			if (!path.includes(active.slug)) return;
+			return {
+				block: true,
+				reason:
+					"progress.md is owned by pi-work-programs; the extension records card, review, and merge events automatically.",
+			};
+		}
+		// The todo store is single-writer (drive + todo actions). Workers append to
+		// .operator/todo.md (imported automatically); everyone else uses todos,
+		// todo_add, todo_update, todo_done, todo_drop.
+		if (path.includes(".operator") && path.endsWith("todos.json")) {
+			return {
+				block: true,
+				reason:
+				"todos.json is owned by pi-work-programs; use work_program todos/todo_add/todo_update/todo_done/todo_drop instead (workers: append to .operator/todo.md, it is imported automatically).",
+			};
+		}
 	});
 }

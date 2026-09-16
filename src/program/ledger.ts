@@ -69,6 +69,13 @@ export function cardFromParsed(parsed: ParsedCard, planText: string): CardLedger
 		updatedAt: Date.now(),
 	};
 	if (parsed.reviewProfile) card.reviewProfile = parsed.reviewProfile;
+	if (parsed.maxCycles !== undefined) card.maxCycles = parsed.maxCycles;
+	if (parsed.workerAgent) card.workerAgent = parsed.workerAgent;
+	if (parsed.workerModel) card.workerModel = parsed.workerModel;
+	if (parsed.workerThinking) card.workerThinking = parsed.workerThinking;
+	if (parsed.reviewerAgent) card.reviewerAgent = parsed.reviewerAgent;
+	if (parsed.reviewerModel) card.reviewerModel = parsed.reviewerModel;
+	if (parsed.reviewerThinking) card.reviewerThinking = parsed.reviewerThinking;
 	if (mapped === "adopted-unknown") {
 		card.lastError = `adopted in state "${parsed.state || "unknown"}"; needs a decision (redispatch, mark done, or abandon)`;
 	}
@@ -174,5 +181,38 @@ export function configOverridesFromPlan(planText: string): ProgramConfigOverride
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Per-card effective values: card front matter wins, program ledger is the fallback. */
+export function effectiveReviewProfile(ledger: ProgramLedger, card: CardLedger): ProgramLedger["reviewProfile"] {
+	return card.reviewProfile ?? ledger.reviewProfile;
+}
+
+export function effectiveMaxCycles(ledger: ProgramLedger, card: CardLedger): number {
+	return card.maxCycles ?? ledger.maxCycles;
+}
+
+export function effectiveWorkerAgent(ledger: ProgramLedger, card: CardLedger): string {
+	return card.workerAgent ?? ledger.workerAgent;
+}
+
+export function effectiveWorkerModel(ledger: ProgramLedger, card: CardLedger): string | undefined {
+	return card.workerModel ?? ledger.workerModel;
+}
+
+export function effectiveWorkerThinking(ledger: ProgramLedger, card: CardLedger): string | undefined {
+	return card.workerThinking ?? ledger.workerThinking;
+}
+
+export function effectiveReviewerAgent(ledger: ProgramLedger, card: CardLedger): string {
+	return card.reviewerAgent ?? ledger.reviewerAgent;
+}
+
+export function effectiveReviewerModel(ledger: ProgramLedger, card: CardLedger): string | undefined {
+	return card.reviewerModel ?? ledger.reviewerModel;
+}
+
+export function effectiveReviewerThinking(ledger: ProgramLedger, card: CardLedger): string | undefined {
+	return card.reviewerThinking ?? ledger.reviewerThinking;
 }
 

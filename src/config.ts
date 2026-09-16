@@ -8,6 +8,8 @@ import type {
 import { projectSettingsPath, userSettingsPath } from "./shared/paths.ts";
 import { readJson } from "./shared/fsx.ts";
 import { asNumber, asString, isRecord, parseStringArray } from "./shared/text.ts";
+import { mergeFrontmatterData, parseFrontmatter, setFrontmatter } from "./shared/frontmatter.ts";
+import type { CardConfigPatch } from "./shared/types.ts";
 
 export const DEFAULT_SETTINGS: WorkProgramSettings = {
 	dir: ".agents/work-programs",
@@ -114,7 +116,7 @@ export async function loadSettings(cwd: string, configDirName: string): Promise<
 
 const CONFIG_COMMENT_RE = /<!--\s*wp:\s*(\{[\s\S]*?\})\s*-->/;
 
-export function parsePlanConfig(planText: string): Record<string, unknown> {
+export function parsePlanCommentConfig(planText: string): Record<string, unknown> {
 	const match = CONFIG_COMMENT_RE.exec(planText.slice(0, 8_192));
 	if (!match?.[1]) return {};
 	try {
@@ -123,6 +125,15 @@ export function parsePlanConfig(planText: string): Record<string, unknown> {
 	} catch {
 		return {};
 	}
+}
+
+/** Program config: YAML front matter first, legacy `<!-- wp: -->` comment as fallback. */
+export function parsePlanConfig(planText: string): Record<string, unknown> {
+	const { data } = parseFrontmatter(planText);
+	const legacy = parsePlanCommentConfig(planText);
+	if (Object.keys(data).length === 0) return legacy;
+	if (Object.keys(legacy).length === 0) return data;
+	return mergeFrontmatterData(legacy, data);
 }
 
 export function formatPlanConfig(overrides: ProgramConfigOverrides): string {
@@ -215,10 +226,39 @@ function matchesPackage(entry: string, name: string): boolean {
 	return trimmed.replace(/\/+$/, "").split("/").pop() === name;
 }
 
+/** Canonical front-matter shape for the program config in plan.md. */
+export function overridesToPlanFrontmatter(overrides: ProgramConfigOverrides): Record<string, unknown> {
+	const data: Record<string, unknown> = {};
+	if (overrides.mode) data.mode = overrides.mode;
+	if (overrides.maxParallel !== undefined) data.maxParallel = overrides.maxParallel;
+	if (overrides.parallelExecution) data.parallelExecution = overrides.parallelExecution;
+	if (overrides.laneBranchPattern) data.laneBranchPattern = overrides.laneBranchPattern;
+	const review: Record<string, unknown> = {};
+	if (overrides.reviewProfile) review.profile = overrides.reviewProfile;
+	if (overrides.maxCycles !== undefined) review.maxCycles = overrides.maxCycles;
+	if (Object.keys(review).length > 0) data.review = review;
+	const gates: Record<string, unknown> = {};
+	if (overrides.gates?.card) gates.card = overrides.gates.card;
+	if (overrides.gates?.program) gates.program = overrides.gates.program;
+	if (Object.keys(gates).length > 0) data.gates = gates;
+	const worker: Record<string, unknown> = {};
+	if (overrides.workerAgent) worker.agent = overrides.workerAgent;
+	if (overrides.workerModel) worker.model = overrides.workerModel;
+	if (overrides.workerThinking) worker.thinking = overrides.workerThinking;
+	if (Object.keys(worker).length > 0) data.worker = worker;
+	const reviewer: Record<string, unknown> = {};
+	if (overrides.reviewerAgent) reviewer.agent = overrides.reviewerAgent;
+	if (overrides.reviewerModel) reviewer.model = overrides.reviewerModel;
+	if (overrides.reviewerThinking) reviewer.thinking = overrides.reviewerThinking;
+	if (Object.keys(reviewer).length > 0) data.reviewer = reviewer;
+	return data;
+}
+
 /**
- * Merge a runtime config patch into the plan's machine comment so the change
- * survives `sync` and session reload. Unknown keys already in the comment are
- * preserved; the patch wins where it speaks.
+ * Merge a runtime config patch into the plan's front matter so the change
+ * survives `sync` and session reload. Unknown keys already in the front
+ * matter are preserved; the patch wins where it speaks. Legacy `<!-- wp: -->`
+ * comments are removed on write (they stay readable for old programs).
  */
 export function mergePlanConfig(planText: string, patch: ProgramConfigOverrides): string {
 	const existing = parsePlanConfig(planText);
@@ -230,10 +270,10 @@ export function mergePlanConfig(planText: string, patch: ProgramConfigOverrides)
 	const review = isPlainRecord(existing.review) ? existing.review : undefined;
 	const worker = isPlainRecord(existing.worker) ? existing.worker : undefined;
 	const reviewer = isPlainRecord(existing.reviewer) ? existing.reviewer : undefined;
-	const profile = asString(review?.profile) ?? asString(existing.reviewProfile);
-	if (profile && isReviewProfile(profile)) current.reviewProfile = profile;
-	const maxCycles = asNumber(review?.maxCycles) ?? asNumber(existing.maxCycles);
-	if (maxCycles !== undefined) current.maxCycles = maxCycles;
+	const _profile = asString(review?.profile) ?? asString(existing.reviewProfile);
+	if (_profile && isReviewProfile(_profile)) current.reviewProfile = _profile;
+	const _maxCycles = asNumber(review?.maxCycles) ?? asNumber(existing.maxCycles);
+	if (_maxCycles !== undefined) current.maxCycles = _maxCycles;
 	if (worker) {
 		const agent = asString(worker.agent);
 		if (agent) current.workerAgent = agent;
@@ -249,15 +289,102 @@ export function mergePlanConfig(planText: string, patch: ProgramConfigOverrides)
 		if (thinking) current.reviewerThinking = thinking;
 	}
 	const merged: ProgramConfigOverrides = { ...current, ...patch };
-	const comment = formatPlanConfig(merged);
-	const match = CONFIG_COMMENT_RE.exec(planText.slice(0, 8_192));
-	if (!match) {
-		// No comment yet: put one on the first line, keeping the title below.
-		return `${comment}\n${planText}`;
+	const { data: existingFront } = parseFrontmatter(planText);
+	const patchFront = overridesToPlanFrontmatter(patch);
+	// Seed missing program keys from the merged view so a first write migrates
+	// the legacy comment into front matter without losing values.
+	const seedFront = overridesToPlanFrontmatter(merged);
+	let next = mergeFrontmatterData(existingFront, seedFront);
+	next = mergeFrontmatterData(next, patchFront);
+	// Empty-string clears: drop the nested key so the program inherits the global default.
+	const clearNested: Array<[keyof ProgramConfigOverrides, string, string]> = [
+		["workerAgent", "worker", "agent"],
+		["workerModel", "worker", "model"],
+		["workerThinking", "worker", "thinking"],
+		["reviewerAgent", "reviewer", "agent"],
+		["reviewerModel", "reviewer", "model"],
+		["reviewerThinking", "reviewer", "thinking"],
+	];
+	for (const [patchKey, mapKey, childKey] of clearNested) {
+		if ((patch as Record<string, unknown>)[patchKey] === "") {
+			const map = next[mapKey];
+			if (typeof map === "object" && map !== null && !Array.isArray(map)) {
+				delete (map as Record<string, unknown>)[childKey];
+			}
+		}
 	}
-	return planText.replace(CONFIG_COMMENT_RE, comment);
+	// Drop empty maps the patch cleared (e.g. workerModel: "" clears the override).
+	for (const key of ["worker", "reviewer", "review", "gates"]) {
+		const entry = next[key];
+		if (typeof entry === "object" && entry !== null && !Array.isArray(entry) && Object.keys(entry as Record<string, unknown>).length === 0) {
+			delete next[key];
+		}
+	}
+	const withoutComment = planText.replace(CONFIG_COMMENT_RE, "").replace(/^\n+/, "");
+	return setFrontmatter(withoutComment, next);
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Canonical front-matter keys for a card. Flat model keys keep hand-edits small. */
+export function cardPatchToFrontmatter(patch: CardConfigPatch): Record<string, unknown> {
+	const data: Record<string, unknown> = {};
+	if (patch.reviewProfile) data.review = patch.reviewProfile;
+	if (patch.maxCycles !== undefined) data.maxCycles = patch.maxCycles;
+	if (patch.workerAgent) data.workerAgent = patch.workerAgent;
+	if (patch.workerModel) data.workerModel = patch.workerModel;
+	if (patch.workerThinking) data.workerThinking = patch.workerThinking;
+	if (patch.reviewerAgent) data.reviewerAgent = patch.reviewerAgent;
+	if (patch.reviewerModel) data.reviewerModel = patch.reviewerModel;
+	if (patch.reviewerThinking) data.reviewerThinking = patch.reviewerThinking;
+	return data;
+}
+
+/** Normalize a card patch: empty strings clear the override (inherit the program default). */
+export function normalizeCardPatch(raw: Record<string, unknown>): CardConfigPatch {
+	const patch: CardConfigPatch = {};
+	const profileRaw = raw.reviewProfile ?? raw.review;
+	if (typeof profileRaw === "string") {
+		if (isReviewProfile(profileRaw)) patch.reviewProfile = profileRaw;
+		else if (profileRaw.trim() === "") (patch as Record<string, unknown>).reviewProfile = undefined;
+	}
+	if (raw.maxCycles !== undefined) {
+		const num = typeof raw.maxCycles === "number" ? raw.maxCycles : Number(raw.maxCycles);
+		if (Number.isFinite(num)) patch.maxCycles = Math.max(0, Math.min(32, Math.floor(num)));
+	}
+	for (const key of ["workerAgent", "workerModel", "workerThinking", "reviewerAgent", "reviewerModel", "reviewerThinking"] as const) {
+		const value = raw[key];
+		if (typeof value === "string" && value.trim().length > 0) patch[key] = value.trim();
+	}
+	return patch;
+}
+
+/** Merge a card patch into the card file's front matter, preserving the body.
+ *  `undefined` (or empty string) in the patch clears that override so the
+ *  card inherits the program default.
+ */
+export function mergeCardFrontmatter(cardText: string, patch: CardConfigPatch & Record<string, undefined | unknown>): string {
+	const { data: existing } = parseFrontmatter(cardText);
+	const patchFront = cardPatchToFrontmatter(patch);
+	const next = mergeFrontmatterData(existing, patchFront);
+	// Map CardConfigPatch keys onto their front-matter keys for explicit clears.
+	const clearMap: Record<string, string> = {
+		reviewProfile: "review",
+		maxCycles: "maxCycles",
+		workerAgent: "workerAgent",
+		workerModel: "workerModel",
+		workerThinking: "workerThinking",
+		reviewerAgent: "reviewerAgent",
+		reviewerModel: "reviewerModel",
+		reviewerThinking: "reviewerThinking",
+		review: "review",
+	};
+	for (const [patchKey, frontKey] of Object.entries(clearMap)) {
+		if (!(patchKey in patch)) continue;
+		const value = (patch as Record<string, unknown>)[patchKey];
+		if (value === undefined || (typeof value === "string" && value.trim() === "")) delete next[frontKey];
+	}
+	return setFrontmatter(cardText, next);
 }

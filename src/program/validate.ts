@@ -30,7 +30,7 @@ export function validatePlanFiles(planText: string, cardFiles: Array<{ path: str
 		if (seenIds.has(card.id)) problems.push(`duplicate card id ${card.id}`);
 		seenIds.add(card.id);
 		if (!card.hasDependsDeclaration) {
-			problems.push(`card ${card.id} (${card.path}) has no explicit \`Depends on:\` declaration`);
+			problems.push(`card ${card.id} (${card.path}) has no explicit \`dependsOn\` front matter (or legacy \`Depends on:\` line)`);
 		}
 		if (card.state === "") problems.push(`card ${card.id} (${card.path}) has no \`State:\` line`);
 		if (!/^##\s+Steps\b/im.test(byPath.get(card.path) ?? "")) {

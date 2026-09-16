@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { WorkProgramController } from "./engine/controller.ts";
 import type { Mode } from "./shared/types.ts";
 
-const ACTIONS = ["status", "list", "new", "start", "pause", "resume", "mode", "sync", "doctor", "close"] as const;
+const ACTIONS = ["status", "list", "new", "start", "pause", "resume", "mode", "sync", "todos", "doctor", "close"] as const;
 
 function completions(prefix: string): Array<{ value: string; label: string }> | null {
 	const items = ACTIONS.map((action) => ({ value: action, label: action }));
@@ -24,7 +24,7 @@ function startResumeNudge(controller: WorkProgramController, verb: string): stri
 export function registerCommands(pi: ExtensionAPI, controller: WorkProgramController): void {
 	pi.registerCommand("work-program", {
 		description:
-			"Work programs: status | list | new <title> | start <slug> | pause [--hard] | resume | mode <session|managed|captain> | sync | doctor | close [--remove]",
+			"Work programs: status | list | new <title> | start <slug> | pause [--hard] | resume | mode <session|managed|captain> | sync | todos | doctor | close [--remove]",
 		getArgumentCompletions: completions,
 		handler: async (args, ctx) => {
 			const parts = args.trim().split(/\s+/).filter((part) => part.length > 0);
@@ -113,6 +113,11 @@ export function registerCommands(pi: ExtensionAPI, controller: WorkProgramContro
 				}
 				case "sync": {
 					const result = await controller.syncFromDisk();
+					ctx.ui.notify(result.text, result.ok ? "info" : "error");
+					return;
+				}
+				case "todos": {
+					const result = await controller.todoList();
 					ctx.ui.notify(result.text, result.ok ? "info" : "error");
 					return;
 				}

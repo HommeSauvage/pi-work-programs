@@ -5,14 +5,17 @@ import { DECISION_CUSTOM_TYPE, DRIVE_TICK_MS, SESSION_ENTRY_TYPE } from "../cons
 import {
 	DEFAULT_SETTINGS,
 	applyOverrides,
-	formatPlanConfig,
 	isMode,
 	isPackageConfigured,
 	isParallelExecution,
 	isReviewProfile,
 	loadSettings,
+	mergeCardFrontmatter,
 	mergePlanConfig,
+	normalizeCardPatch,
+	overridesToPlanFrontmatter,
 } from "../config.ts";
+import { stringifyFrontmatter } from "../shared/frontmatter.ts";
 import { buildBrief, planInstructions } from "../brief.ts";
 import { loadResources } from "../protocol/resources.ts";
 import {
@@ -38,11 +41,20 @@ import { oneLine, slugify, formatAgo, formatDuration } from "../shared/text.ts";
 import { readTextOrUndefined, writeTextAtomic } from "../shared/fsx.ts";
 import { PLAN_FILE } from "../constants.ts";
 import {
+	addTodo as storeAddTodo,
+	closeTodo as storeCloseTodo,
 	ensureOperatorTodoFile,
-	operatorTodoPath,
-	parseOperatorTodos,
-	summarizeOperatorTodos,
-	type OperatorTodoSummary,
+	formatTodoList,
+	normalizeTodoSteps,
+	openBlockingForCard,
+	operatorTodosJsonPath,
+	parseTodoStore,
+	serializeTodoStore,
+	summarizeTodosSync,
+	updateTodo as storeUpdateTodo,
+	type TodoStep,
+	type TodoStore,
+	type TodoSummary,
 } from "../program/operator-todos.ts";
 import type {
 	CardLedger,
@@ -60,12 +72,16 @@ import {
 	applyProgramGateDecision,
 	applyTriage,
 	applyUnblock,
+	buildTodoGate,
 	dispatchManual,
 	drive,
 	finishManualMerge,
+	parkForTodos,
 	planCardRemoval,
 	rearmPackets,
 	rearmPausedCards,
+	resumeWaitingCards,
+	syncTodoStore,
 } from "./driver.ts";
 import { createDecision, resolveDecision } from "./decisions.ts";
 import { counts, isAbandonedCard, isHeld, openDecisionFor, openDecisions, phaseSymbol } from "./phases.ts";
@@ -98,16 +114,22 @@ export function appendAcceptedFindings(cardText: string, findings: string[]): st
 	return `${cardText.trimEnd()}\n${block}`;
 }
 
-/** Runtime knobs an orchestrator may retune while the program runs. */
+/** Runtime knobs an orchestrator may retune while the program runs.
+ *  With `card` set, the patch applies to one card's front matter instead of
+ *  the program (reviewProfile, maxCycles, worker/reviewer agent+model+thinking).
+ */
 export interface ProgramConfigPatch {
+	card?: string;
 	mode?: Mode;
 	reviewProfile?: ReviewProfile;
 	maxCycles?: number;
 	onExhausted?: "ask" | "accept" | "block";
 	maxParallel?: number;
 	parallelExecution?: ParallelExecution;
+	workerAgent?: string;
 	workerModel?: string;
 	workerThinking?: string;
+	reviewerAgent?: string;
 	reviewerModel?: string;
 	reviewerThinking?: string;
 }
@@ -125,6 +147,9 @@ const MODE_LABELS: Array<{ mode: Mode; label: string }> = [
 
 /** Suggested next step for a blocked card, shown in status/doctor Issues. */
 function unblockHint(card: CardLedger): string {
+	if (card.waitingOn !== undefined && card.waitingOn.length > 0) {
+		return ` → todo_done ${card.waitingOn.join("/")} when finished`;
+	}
 	if (card.fixReason !== undefined || card.blockedFrom === "fixing" || card.blockedFrom === "verifying") {
 		return ` → redispatch retries the pending ${card.fixReason ?? "fix"}`;
 	}
@@ -361,20 +386,25 @@ export class WorkProgramController {
 			return;
 		}
 		const { done, total, blocked, abandoned } = counts(this.active.ledger);
+		const todoSummary = summarizeTodosSync(this.cwd, this.active.slug);
+		const blockingTodos = todoSummary?.blocking ?? [];
 		ui.setStatus(
 			"work-program",
-			`wp ${this.active.slug} ${done}/${total}${abandoned > 0 ? ` · ${abandoned} dropped` : ""}${blocked > 0 ? ` · ${blocked} blocked` : ""}${this.deps && !this.deps.ok ? " · blocked (deps)" : ""}`,
+			`wp ${this.active.slug} ${done}/${total}${abandoned > 0 ? ` · ${abandoned} dropped` : ""}${blocked > 0 ? ` · ${blocked} blocked` : ""}${blockingTodos.length > 0 ? ` · !${blockingTodos.length} todo${blockingTodos.length === 1 ? "" : "s"}` : ""}${this.deps && !this.deps.ok ? " · blocked (deps)" : ""}`,
 		);
 		const lines = [`${this.active.slug} · ${this.active.ledger.mode}`, this.boardText()];
+		// Blocking human input leads: it is the one thing agents cannot resolve.
+		for (const item of blockingTodos.slice(0, 2)) {
+			lines.push(`! ${item.id} blocks ${item.card ?? "—"}: ${oneLine(item.title, 48)}`);
+		}
 		for (const id of this.active.ledger.order) {
 			const card = this.active.ledger.cards[id];
 			if (!card?.activeRun) continue;
 			if (lines.length >= 5) break;
 			lines.push(`◔ ${card.id} ${card.phase} · ${this.snapshotLine(card)}`);
 		}
-		const todos = summarizeOperatorTodos(this.cwd, this.active.slug);
-		if (todos && todos.open.length > 0 && lines.length < 7) {
-			lines.push(`☐ ${todos.open.length} operator todo(s) — .operator/todo.md`);
+		if (todoSummary && blockingTodos.length === 0 && todoSummary.open.length > 0 && lines.length < 7) {
+			lines.push(`☐ ${todoSummary.open.length} operator todo(s) — work_program todos`);
 		}
 		for (const decision of openDecisions(this.active.ledger).slice(0, 2)) {
 			lines.push(`! ${decision.message ?? "decision required"}`);
@@ -585,7 +615,7 @@ export class WorkProgramController {
 			slug,
 			title: input.title,
 			brief: input.brief,
-			configComment: formatPlanConfig(overrides),
+			configComment: stringifyFrontmatter(overridesToPlanFrontmatter(overrides)),
 		});
 		const settings = applyOverrides(this.settings, overrides);
 		const ledger = buildLedger({
@@ -676,9 +706,18 @@ export class WorkProgramController {
 		if (overrides.mode) active.ledger.mode = overrides.mode;
 		if (overrides.maxParallel !== undefined) active.ledger.maxParallel = settings.maxParallel;
 		if (overrides.parallelExecution) active.ledger.parallelExecution = overrides.parallelExecution;
+		if (overrides.laneBranchPattern) active.ledger.laneBranchPattern = overrides.laneBranchPattern;
 		if (overrides.reviewProfile) active.ledger.reviewProfile = settings.review.profile;
 		if (overrides.maxCycles !== undefined) active.ledger.maxCycles = settings.review.maxCycles;
+		active.ledger.workerAgent = settings.worker.agent;
+		active.ledger.workerModel = settings.worker.model;
+		active.ledger.workerThinking = settings.worker.thinking;
+		active.ledger.reviewerAgent = settings.review.agent;
+		active.ledger.reviewerModel = settings.reviewer.model;
+		active.ledger.reviewerThinking = settings.reviewer.thinking;
 		active.ledger.gates = { card: [...settings.gates.card], program: [...settings.gates.program] };
+		// Import worker-inbox todos (blocking ones park + announce via the drive path).
+		await syncTodoStore(this);
 		await this.save();
 		this.scheduleDrive();
 		const problems = validation.problems.length > 0 ? `\n${formatProblems(validation.problems, [])}` : "";
@@ -786,13 +825,14 @@ export class WorkProgramController {
 
 	/**
 	 * Retune a running program: review rounds, profile, parallelism, mode, models.
-	 * Applies to the live ledger, persists into the plan's machine comment (so
+	 * Applies to the live ledger, persists into the plan's front matter (so
 	 * `sync` and reload keep it), records a progress line, and — when
 	 * `onExhausted: "accept"` is set — resolves open cycle decisions instead of
 	 * making the orchestrator answer them one by one.
 	 */
 	async setConfig(patch: ProgramConfigPatch): Promise<ActionResult> {
 		if (!this.active) return { ok: false, text: "No active work program." };
+		if (patch.card !== undefined) return this.setCardConfig(patch.card, patch);
 		const ledger = this.active.ledger;
 		const overrides: ProgramConfigOverrides = {};
 		const changes: string[] = [];
@@ -845,24 +885,32 @@ export class WorkProgramController {
 			}
 			overrides.parallelExecution = patch.parallelExecution;
 		}
+		if (patch.workerAgent !== undefined) {
+			changes.push(`workerAgent ${ledger.workerAgent}→${patch.workerAgent}`);
+			overrides.workerAgent = patch.workerAgent;
+		}
 		if (patch.workerModel !== undefined) {
-			changes.push(`workerModel ${ledger.workerModel ?? "(default)"}→${patch.workerModel}`);
+			changes.push(`workerModel ${ledger.workerModel ?? "(default)"}→${patch.workerModel === "" ? "(default)" : patch.workerModel}`);
 			overrides.workerModel = patch.workerModel;
 		}
 		if (patch.workerThinking !== undefined) {
-			changes.push(`workerThinking ${ledger.workerThinking ?? "(default)"}→${patch.workerThinking}`);
+			changes.push(`workerThinking ${ledger.workerThinking ?? "(default)"}→${patch.workerThinking === "" ? "(default)" : patch.workerThinking}`);
 			overrides.workerThinking = patch.workerThinking;
 		}
+		if (patch.reviewerAgent !== undefined) {
+			changes.push(`reviewerAgent ${ledger.reviewerAgent}→${patch.reviewerAgent}`);
+			overrides.reviewerAgent = patch.reviewerAgent;
+		}
 		if (patch.reviewerModel !== undefined) {
-			changes.push(`reviewerModel ${ledger.reviewerModel ?? "(default)"}→${patch.reviewerModel}`);
+			changes.push(`reviewerModel ${ledger.reviewerModel ?? "(default)"}→${patch.reviewerModel === "" ? "(default)" : patch.reviewerModel}`);
 			overrides.reviewerModel = patch.reviewerModel;
 		}
 		if (patch.reviewerThinking !== undefined) {
-			changes.push(`reviewerThinking ${ledger.reviewerThinking ?? "(default)"}→${patch.reviewerThinking}`);
+			changes.push(`reviewerThinking ${ledger.reviewerThinking ?? "(default)"}→${patch.reviewerThinking === "" ? "(default)" : patch.reviewerThinking}`);
 			overrides.reviewerThinking = patch.reviewerThinking;
 		}
 		if (Object.keys(overrides).length === 0 && patch.onExhausted === undefined) {
-			return { ok: false, text: "Nothing to change; pass at least one of maxCycles, onExhausted, reviewProfile, maxParallel, parallelExecution, mode, workerModel, workerThinking, reviewerModel, reviewerThinking." };
+			return { ok: false, text: "Nothing to change; pass at least one of maxCycles, onExhausted, reviewProfile, maxParallel, parallelExecution, mode, workerAgent, workerModel, workerThinking, reviewerAgent, reviewerModel, reviewerThinking." };
 		}
 
 		// Apply to the live ledger via the same normalization the plan path uses.
@@ -873,10 +921,12 @@ export class WorkProgramController {
 		if (overrides.reviewProfile) ledger.reviewProfile = settings.review.profile;
 		if (overrides.maxCycles !== undefined) ledger.maxCycles = settings.review.maxCycles;
 		if (patch.onExhausted !== undefined) ledger.onExhausted = patch.onExhausted;
-		if (patch.workerModel !== undefined) ledger.workerModel = patch.workerModel;
-		if (patch.workerThinking !== undefined) ledger.workerThinking = patch.workerThinking;
-		if (patch.reviewerModel !== undefined) ledger.reviewerModel = patch.reviewerModel;
-		if (patch.reviewerThinking !== undefined) ledger.reviewerThinking = patch.reviewerThinking;
+		if (patch.workerAgent !== undefined) ledger.workerAgent = settings.worker.agent;
+		if (patch.workerModel !== undefined) ledger.workerModel = patch.workerModel === "" ? undefined : patch.workerModel;
+		if (patch.workerThinking !== undefined) ledger.workerThinking = patch.workerThinking === "" ? undefined : patch.workerThinking;
+		if (patch.reviewerAgent !== undefined) ledger.reviewerAgent = settings.review.agent;
+		if (patch.reviewerModel !== undefined) ledger.reviewerModel = patch.reviewerModel === "" ? undefined : patch.reviewerModel;
+		if (patch.reviewerThinking !== undefined) ledger.reviewerThinking = patch.reviewerThinking === "" ? undefined : patch.reviewerThinking;
 
 		// Persist into the plan so sync/reload keep the change.
 		const planText = await readPlan(this.active.absDir);
@@ -908,6 +958,273 @@ export class WorkProgramController {
 			ok: true,
 			text: `Config updated: ${changes.length > 0 ? changes.join(", ") : "(no effective change)"}.${accepted > 0 ? ` Accepted ${accepted} open cycle decision(s).` : ""}`,
 		};
+	}
+
+	/**
+	 * Retune one card: reviewProfile, maxCycles, worker/reviewer agent+model+thinking.
+	 * Applies to the live ledger row and persists into the card file's front
+	 * matter (so `sync` and reload keep it). An empty-string model/thinking
+	 * clears the override so the card inherits the program default.
+	 */
+	async setCardConfig(cardId: string, patch: ProgramConfigPatch): Promise<ActionResult> {
+		if (!this.active) return { ok: false, text: "No active work program." };
+		const card = this.active.ledger.cards[cardId];
+		if (!card) return { ok: false, text: `Unknown card ${cardId}.` };
+		for (const key of ["mode", "maxParallel", "parallelExecution", "onExhausted"] as const) {
+			if (patch[key] !== undefined) {
+				return { ok: false, text: `${key} is program-level; omit card to set it (work_program({ action: "config", ${key}: ... }))` };
+			}
+		}
+		const changes: string[] = [];
+	const frontPatch: Record<string, unknown> = {};
+		if (patch.reviewProfile !== undefined) {
+			if (!isReviewProfile(patch.reviewProfile)) return { ok: false, text: "reviewProfile must be light | enhanced" };
+			const before = card.reviewProfile ?? this.active.ledger.reviewProfile;
+			if (before !== patch.reviewProfile) changes.push(`card ${cardId} review ${before}→${patch.reviewProfile}`);
+			card.reviewProfile = patch.reviewProfile;
+			frontPatch.review = patch.reviewProfile;
+		}
+		if (patch.maxCycles !== undefined) {
+			const cycles = Math.floor(patch.maxCycles);
+			if (!Number.isFinite(cycles) || cycles < 0 || cycles > 32) {
+				return { ok: false, text: "maxCycles must be a number between 0 and 32" };
+			}
+			const before = card.maxCycles ?? this.active.ledger.maxCycles;
+			if (before !== cycles) changes.push(`card ${cardId} maxCycles ${before}→${cycles}`);
+			card.maxCycles = cycles;
+			frontPatch.maxCycles = cycles;
+		}
+		const modelKeys = ["workerAgent", "workerModel", "workerThinking", "reviewerAgent", "reviewerModel", "reviewerThinking"] as const;
+		let sawModelKey = false;
+		for (const key of modelKeys) {
+			const value = patch[key];
+			if (value === undefined) continue;
+			sawModelKey = true;
+			const trimmed = value.trim();
+			if (trimmed === "") {
+				delete card[key];
+				frontPatch[key] = undefined;
+				changes.push(`card ${cardId} ${key} cleared (inherits program default)`);
+				continue;
+			}
+			if ((card[key] ?? "") !== trimmed) changes.push(`card ${cardId} ${key} ${card[key] ?? "(default)"}→${trimmed}`);
+			card[key] = trimmed;
+			frontPatch[key] = trimmed;
+		}
+		if (changes.length === 0 && !sawModelKey && patch.reviewProfile === undefined && patch.maxCycles === undefined) {
+			return { ok: false, text: `Nothing to change for card ${cardId}; pass reviewProfile, maxCycles, workerModel, workerThinking, reviewerModel, reviewerThinking (empty string clears a model override).` };
+		}
+		card.updatedAt = Date.now();
+		// Persist into the card file so sync/reload keep the change.
+		try {
+			const cardPath = join(this.active.absDir, card.path);
+			const text = (await readTextOrUndefined(cardPath)) ?? "";
+			if (text.trim().length > 0) {
+				const normalized = normalizeCardPatch(frontPatch);
+				const fullPatch: Record<string, unknown> = { ...normalized };
+				// Preserve explicit clears: normalize drops empty strings, so re-add undefined.
+				for (const [key, value] of Object.entries(frontPatch)) {
+					if (value === undefined) fullPatch[key] = undefined;
+				}
+				await writeTextAtomic(cardPath, mergeCardFrontmatter(text, fullPatch as Parameters<typeof mergeCardFrontmatter>[1]));
+			}
+		} catch (error) {
+			return { ok: false, text: `Card ${cardId} ledger updated but the card file could not be written: ${oneLine(String(error), 140)}` };
+		}
+		await this.save();
+		await appendProgress(this.active.absDir, `[card ${cardId}] config updated — ${changes.join(", ") || "(no effective change)"}`);
+		this.refreshUi();
+		this.scheduleDrive();
+		return { ok: true, text: `Card ${cardId} updated: ${changes.join(", ") || "(no effective change)"}.` };
+	}
+
+	/* ---- operator todos (structured, chat-driven) ---- */
+
+	private todoStorePath(): string {
+		return operatorTodosJsonPath(this.cwd);
+	}
+
+	private async readTodoStore(): Promise<TodoStore> {
+		return parseTodoStore(await readTextOrUndefined(this.todoStorePath()));
+	}
+
+	private async writeTodoStore(store: TodoStore): Promise<void> {
+		await writeTextAtomic(this.todoStorePath(), serializeTodoStore(store));
+	}
+
+	private liveTodoCard(cardId: string): CardLedger | undefined {
+		const card = this.active?.ledger.cards[cardId];
+		if (!card || card.phase === "done" || isAbandonedCard(card)) return undefined;
+		return card;
+	}
+
+	async todoList(): Promise<ActionResult> {
+		if (!this.active) return { ok: false, text: "No active work program." };
+		return { ok: true, text: formatTodoList(await this.readTodoStore(), this.active.slug) };
+	}
+
+	async todoAdd(input: {
+		title: string;
+		body?: string;
+		steps?: unknown;
+		card?: string;
+		blocking?: boolean;
+	}): Promise<ActionResult> {
+		if (!this.active) return { ok: false, text: "No active work program." };
+		const ledger = this.active.ledger;
+		const title = input.title?.trim() ?? "";
+		if (title.length === 0) return { ok: false, text: "todo_add requires a non-empty title" };
+		if (title.length > 200) return { ok: false, text: "title must be 200 characters or fewer" };
+		const body = (input.body ?? "").trim().slice(0, 4000);
+		if (input.steps !== undefined && !Array.isArray(input.steps)) {
+			return { ok: false, text: "steps must be an array of { text, command?, dangerous? }" };
+		}
+		const steps = normalizeTodoSteps(input.steps) ?? [];
+		let card: CardLedger | undefined;
+		if (input.card !== undefined) {
+			card = ledger.cards[input.card];
+			if (!card) return { ok: false, text: `Unknown card ${input.card}.` };
+		}
+		const live = card !== undefined && card.phase !== "done" && !isAbandonedCard(card);
+		const blocking = input.blocking ?? live;
+		if (blocking && !card) return { ok: false, text: "blocking todos need a card — pass card, or set blocking: false" };
+		if (blocking && !live) return { ok: false, text: `card ${card?.id} is ${card?.phase}; only a live card can be blocked` };
+		const store = await this.readTodoStore();
+		const item = storeAddTodo(store, {
+			title,
+			body,
+			steps,
+			stream: this.active.slug,
+			...(card ? { card: card.id } : {}),
+			blocking,
+		});
+		// Created live in conversation: no separate wake-up needed.
+		item.announced = true;
+		await this.writeTodoStore(store);
+		if (card && blocking) {
+			card.waitingOn = Array.from(new Set([...(card.waitingOn ?? []), item.id]));
+			await parkForTodos(this, buildTodoGate(store, ledger.slug), card, openBlockingForCard(store, ledger.slug, card.id), {});
+		}
+		await this.save();
+		await appendProgress(
+			this.active.absDir,
+			card ? `[card ${card.id}] todo ${item.id} added (blocking): ${oneLine(title, 100)}` : `[program] todo ${item.id} added: ${oneLine(title, 100)}`,
+		);
+		this.refreshUi();
+		this.scheduleDrive();
+		return {
+			ok: true,
+			text: `Todo ${item.id} added${card && blocking ? ` — card ${card.id} parked until it resolves (todo_done ${item.id} when finished)` : ""}.`,
+		};
+	}
+
+	async todoUpdate(input: {
+		id: string;
+		title?: string;
+		body?: string;
+		steps?: unknown;
+		card?: string;
+		blocking?: boolean;
+	}): Promise<ActionResult> {
+		if (!this.active) return { ok: false, text: "No active work program." };
+		const ledger = this.active.ledger;
+		const store = await this.readTodoStore();
+		const item = store.items.find((entry) => entry.id === input.id);
+		if (!item) return { ok: false, text: `Unknown todo ${input.id}. Use todos to list.` };
+		if (item.stream !== this.active.slug) {
+			return { ok: false, text: `Todo ${input.id} belongs to stream ${item.stream}; switch programs first.` };
+		}
+		if (item.state !== "open") return { ok: false, text: `Todo ${input.id} is already ${item.state}.` };
+		const patch: { title?: string; body?: string; steps?: TodoStep[]; card?: string; blocking?: boolean } = {};
+		const changes: string[] = [];
+		if (input.title !== undefined) {
+			const title = input.title.trim();
+			if (title.length === 0) return { ok: false, text: "title cannot be empty" };
+			if (title.length > 200) return { ok: false, text: "title must be 200 characters or fewer" };
+			if (title !== item.title) changes.push("title");
+			patch.title = title;
+		}
+		if (input.body !== undefined) {
+			patch.body = input.body.trim().slice(0, 4000);
+			if (patch.body !== item.body) changes.push("body");
+		}
+		if (input.steps !== undefined) {
+			if (!Array.isArray(input.steps)) return { ok: false, text: "steps must be an array of { text, command?, dangerous? }" };
+			patch.steps = normalizeTodoSteps(input.steps) ?? [];
+			changes.push(`steps (${patch.steps.length})`);
+		}
+		if (input.card !== undefined) {
+			if (input.card.length > 0) {
+				if (!ledger.cards[input.card]) return { ok: false, text: `Unknown card ${input.card}.` };
+				if (input.card !== item.card) changes.push(`card ${item.card ?? "—"}→${input.card}`);
+				patch.card = input.card;
+			} else {
+				if (item.card) changes.push(`card ${item.card}→—`);
+				patch.card = "";
+			}
+		}
+		if (input.blocking !== undefined) {
+			if (input.blocking !== item.blocking) changes.push(input.blocking ? "blocking on" : "blocking off");
+			patch.blocking = input.blocking;
+		}
+		if (changes.length === 0) return { ok: false, text: `Nothing to change for ${input.id}; pass title, body, steps, card, or blocking.` };
+		const targetCard = patch.card !== undefined ? (patch.card.length > 0 ? patch.card : undefined) : item.card;
+		const wantBlocking = patch.blocking ?? item.blocking;
+		if (wantBlocking) {
+			if (!targetCard) return { ok: false, text: `blocking todos need a card — pass card, or set blocking: false` };
+			if (!this.liveTodoCard(targetCard)) {
+				return { ok: false, text: `card ${targetCard} is not live; only a live card can be blocked` };
+			}
+		}
+		storeUpdateTodo(store, item.id, patch);
+		item.announced = true;
+		await this.writeTodoStore(store);
+		const gate = buildTodoGate(store, ledger.slug);
+		if (wantBlocking && targetCard) {
+			const card = ledger.cards[targetCard];
+			if (card) {
+				card.waitingOn = Array.from(new Set([...(card.waitingOn ?? []), item.id]));
+				await parkForTodos(this, gate, card, openBlockingForCard(store, ledger.slug, card.id), {});
+			}
+		}
+		// Release cards that no longer have open blocking todos (e.g. the old
+		// card after a move, or this card after blocking was switched off).
+		await resumeWaitingCards(this, gate);
+		await this.save();
+		await appendProgress(this.active.absDir, `[card ${targetCard ?? "—"}] todo ${item.id} updated — ${changes.join(", ")}`);
+		this.refreshUi();
+		this.scheduleDrive();
+		return { ok: true, text: `Todo ${item.id} updated: ${changes.join(", ")}.` };
+	}
+
+	private async closeTodo(id: string, state: "done" | "dropped", verb: string, note: string | undefined): Promise<ActionResult> {
+		if (!this.active) return { ok: false, text: "No active work program." };
+		const store = await this.readTodoStore();
+		const item = store.items.find((entry) => entry.id === id);
+		if (!item) return { ok: false, text: `Unknown todo ${id}. Use todos to list.` };
+		if (item.stream !== this.active.slug) {
+			return { ok: false, text: `Todo ${id} belongs to stream ${item.stream}; switch programs first.` };
+		}
+		if (item.state === state) return { ok: true, text: `Todo ${id} is already ${state}.` };
+		storeCloseTodo(store, id, state);
+		await this.writeTodoStore(store);
+		await resumeWaitingCards(this, buildTodoGate(store, this.active.slug));
+		await this.save();
+		await appendProgress(
+			this.active.absDir,
+			`[card ${item.card ?? "—"}] todo ${id} ${verb}${note?.trim() ? ` — ${oneLine(note.trim(), 120)}` : ""}`,
+		);
+		this.refreshUi();
+		this.scheduleDrive();
+		return { ok: true, text: `Todo ${id} ${verb}.${item.card ? " Waiting cards resume on their own." : ""}` };
+	}
+
+	async todoDone(input: { id: string; note?: string }): Promise<ActionResult> {
+		return this.closeTodo(input.id, "done", "done", input.note);
+	}
+
+	async todoDrop(input: { id: string; reason?: string }): Promise<ActionResult> {
+		return this.closeTodo(input.id, "dropped", "dropped", input.reason);
 	}
 
 	async statusText(): Promise<string> {
@@ -950,9 +1267,15 @@ export class WorkProgramController {
 			);
 		}
 		const todos = await this.operatorTodoSummary();
-		if (todos) {
-			lines.push("", `Operator todos (${ledger.slug}): ${todos.open.length} open`);
-			for (const item of todos.open.slice(0, 5)) lines.push(`  ☐ ${oneLine(item.title, 100)}`);
+		if (todos && todos.open.length > 0) {
+			lines.push("", `Operator todos (${ledger.slug}): ${todos.open.length} open${todos.blocking.length > 0 ? `, ${todos.blocking.length} blocking` : ""} — work_program({ action: "todos" }) to list`);
+			for (const item of todos.open.slice(0, 6)) {
+				lines.push(
+					item.blocking
+						? `  ! ${item.id} BLOCKS card ${item.card ?? "—"}: ${oneLine(item.title, 90)} — todo_done ${item.id} when finished`
+						: `  · ${item.id}: ${oneLine(item.title, 90)}`,
+				);
+			}
 		}
 		try {
 			const [unmerged, merging] = await Promise.all([
@@ -1021,7 +1344,12 @@ export class WorkProgramController {
 				);
 			}
 			const todos = await this.operatorTodoSummary();
-			if (todos) lines.push(`operator todos (${ledger.slug}): ${todos.open.length} open`);
+			if (todos && todos.open.length > 0) {
+				lines.push(`operator todos (${ledger.slug}): ${todos.open.length} open, ${todos.blocking.length} blocking`);
+				for (const item of todos.blocking.slice(0, 3)) {
+					lines.push(`  ! ${item.id} blocks card ${item.card ?? "—"}: ${oneLine(item.title, 90)}`);
+				}
+			}
 			try {
 				const [unmerged, merging] = await Promise.all([
 					this.git.unmergedPaths(this.cwd),
@@ -1230,12 +1558,10 @@ export class WorkProgramController {
 	}
 
 	/** Open operator todos for the active program's stream, if the file exists. Never throws. */
-	private async operatorTodoSummary(): Promise<OperatorTodoSummary | undefined> {
+	private async operatorTodoSummary(): Promise<TodoSummary | undefined> {
 		if (!this.active) return undefined;
 		try {
-			const text = await readTextOrUndefined(operatorTodoPath(this.cwd));
-			if (text === undefined) return undefined;
-			return parseOperatorTodos(text, this.active.slug);
+			return summarizeTodosSync(this.cwd, this.active.slug) ?? undefined;
 		} catch {
 		return undefined;
 	}

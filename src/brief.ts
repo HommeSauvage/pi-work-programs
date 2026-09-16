@@ -1,6 +1,6 @@
 import { MAX_DIGEST_CHARS } from "./constants.ts";
 import { boardLine, counts, openDecisions, readyCards } from "./engine/phases.ts";
-import { summarizeOperatorTodos } from "./program/operator-todos.ts";
+import { summarizeTodosSync } from "./program/operator-todos.ts";
 import { formatDuration, oneLine, truncateTail } from "./shared/text.ts";
 import type { ProgramLedger } from "./shared/types.ts";
 import { loadResources } from "./protocol/resources.ts";
@@ -38,9 +38,14 @@ export function buildBrief(ledger: ProgramLedger, cwd?: string): string {
 		}
 	}
 	if (cwd) {
-		const todos = summarizeOperatorTodos(cwd, ledger.slug);
+		const todos = summarizeTodosSync(cwd, ledger.slug);
 		if (todos && todos.open.length > 0) {
-			lines.push(`Operator todos: ${todos.open.length} open — see .operator/todo.md (## ${ledger.slug}).`);
+			lines.push(
+				`Operator todos: ${todos.open.length} open (${todos.blocking.length} blocking) — work_program({ action: "todos" }) to list.`,
+			);
+			for (const item of todos.blocking.slice(0, 3)) {
+				lines.push(`! ${item.id} blocks card ${item.card ?? "—"}: ${oneLine(item.title, 110)}`);
+			}
 		}
 	}
 	if (ledger.status === "paused") lines.push("Program is PAUSED.");
@@ -55,8 +60,8 @@ export function planInstructions(programDir: string): string {
 		`Work program scaffold created at ${programDir}.`,
 		"",
 		"Now write the program records. Execution must NOT start without the operator's explicit approval:",
-		"1. Complete `plan.md`: north star, why, locked decisions, the phases/cards table, and done-when. Keep the machine config comment on line 1.",
-		"2. Create `tasks/NN-<slug>.md` for every card using the card template. Every card MUST declare `Depends on:` (use `—` when none), `Kind: write|recon`, and a `## State: todo` line.",
+		"1. Complete `plan.md`: north star, why, locked decisions, the phases/cards table, and done-when. Keep the front matter at the top (program defaults: mode, parallelism, review profile, max cycles).",
+		"2. Create `tasks/NN-<slug>.md` for every card using the card template. Every card MUST have front matter with `dependsOn` (use `[]` when none), `kind: write|recon`, `review: light|enhanced`, and `maxCycles` set from difficulty (trivial: light/1-2, standard: light/3, tricky: enhanced/3-5, critical: enhanced/5), plus a `## State: todo` line. Do NOT set card models (workerModel/reviewerModel/thinking) unless the operator explicitly asked — leave them unset to inherit the program/global defaults.",
 		"3. Call `work_program({ action: \"finalize_plan\" })` to validate. Finalize only stages the program — it never starts execution.",
 		"4. STOP after finalize. Present the plan and cards to the operator for review and wait for an explicit start. Never call `resume`, `start`, or `dispatch` on your own.",
 		"5. Only after the operator explicitly says to start, call `work_program({ action: \"resume\" })`.",

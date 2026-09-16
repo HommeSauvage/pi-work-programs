@@ -153,12 +153,19 @@ describe("operator todos", () => {
 			].join("\n"),
 			"utf8",
 		);
+		// The markdown inbox is imported on sync: the live card's item blocks it.
+		const synced = await controller.syncFromDisk();
+		expect(synced.ok).toBe(true);
+		const ledger = controller.getActive()!.ledger;
+		expect(ledger.cards["01"]?.phase).toBe("blocked");
+		expect(ledger.cards["01"]?.waitingOn).toEqual(["op-01"]);
 		const text = await controller.statusText();
-		expect(text).toContain("Operator todos (test-program): 1 open");
+		expect(text).toContain("Operator todos (test-program): 1 open, 1 blocking");
 		expect(text).toContain("Rotate the prod key");
+		expect(text).toContain("op-01 BLOCKS card 01");
 		expect(text).not.toContain("Not ours");
 		const doctor = await controller.doctor();
-		expect(doctor).toContain("operator todos (test-program): 1 open");
+		expect(doctor).toContain("operator todos (test-program): 1 open, 1 blocking");
 	});
 });
 
@@ -262,7 +269,8 @@ describe("runtime config", () => {
 		expect(ledger.maxCycles).toBe(1);
 		const { readFile } = await import("node:fs/promises");
 		const plan = await readFile(join(cwd, ".agents", "work-programs", "test-program", "plan.md"), "utf8");
-		expect(plan).toContain('"maxCycles":1');
+		expect(plan).toContain("maxCycles: 1");
+		expect(plan.startsWith("---")).toBe(true);
 		const progress = await readFile(join(cwd, ".agents", "work-programs", "test-program", "progress.md"), "utf8");
 		expect(progress).toContain("config updated — maxCycles 3→1");
 	});
@@ -318,6 +326,54 @@ describe("runtime config", () => {
 		const applied = await controller.setConfig({ maxParallel: 1 });
 		expect(applied.ok).toBe(true);
 		expect(controller.getActive()!.ledger.maxParallel).toBe(1);
+	});
+});
+
+describe("card-scoped config", () => {
+	test("sets a card's maxCycles and review profile into ledger + front matter", async () => {
+		const { controller, cwd } = await setupProgram();
+		const result = await controller.setConfig({ card: "01", maxCycles: 5, reviewProfile: "enhanced" });
+		expect(result.ok).toBe(true);
+		expect(result.text).toContain("card 01 maxCycles");
+		const ledger = controller.getActive()!.ledger;
+		expect(ledger.cards["01"]?.maxCycles).toBe(5);
+		expect(ledger.cards["01"]?.reviewProfile).toBe("enhanced");
+		// Program defaults are untouched.
+		expect(ledger.maxCycles).toBe(3);
+		const { readFile } = await import("node:fs/promises");
+		const cardText = await readFile(join(cwd, ".agents", "work-programs", "test-program", "tasks", "01-card.md"), "utf8");
+		expect(cardText.startsWith("---")).toBe(true);
+		expect(cardText).toContain("maxCycles: 5");
+		expect(cardText).toContain("review: enhanced");
+		expect(cardText).toContain("## State: todo");
+	});
+
+	test("the card change survives a sync from disk", async () => {
+		const { controller } = await setupProgram();
+		await controller.setConfig({ card: "01", maxCycles: 1 });
+		const synced = await controller.syncFromDisk();
+		expect(synced.ok).toBe(true);
+		expect(controller.getActive()!.ledger.cards["01"]?.maxCycles).toBe(1);
+	});
+
+	test("an empty-string model clears the card override", async () => {
+		const { controller, cwd } = await setupProgram();
+		await controller.setConfig({ card: "01", workerModel: "custom/model" });
+		expect(controller.getActive()!.ledger.cards["01"]?.workerModel).toBe("custom/model");
+		const cleared = await controller.setConfig({ card: "01", workerModel: "" });
+		expect(cleared.ok).toBe(true);
+		expect(controller.getActive()!.ledger.cards["01"]?.workerModel).toBeUndefined();
+		const { readFile } = await import("node:fs/promises");
+		const cardText = await readFile(join(cwd, ".agents", "work-programs", "test-program", "tasks", "01-card.md"), "utf8");
+		expect(cardText).not.toContain("workerModel");
+	});
+
+	test("program-only knobs are refused with card set, unknown cards fail", async () => {
+		const { controller } = await setupProgram();
+		expect((await controller.setConfig({ card: "01", mode: "captain" as never })).ok).toBe(false);
+		expect((await controller.setConfig({ card: "99", maxCycles: 2 })).ok).toBe(false);
+		expect((await controller.setConfig({ card: "01", reviewProfile: "deep" as never })).ok).toBe(false);
+		expect((await controller.setConfig({ card: "01" })).ok).toBe(false);
 	});
 });
 
@@ -499,5 +555,88 @@ describe("status clarity", () => {
 		expect(text).toContain("blocked cards: 1");
 		expect(text).toContain("agent not found");
 		expect(text).toContain("merge queue: 01");
+	});
+});
+
+describe("operator todos", () => {
+	test("todoAdd parks a live card and persists the store", async () => {
+		const { controller, cwd } = await setupProgram();
+		const result = await controller.todoAdd({
+			title: "Fetch the prod secret",
+			body: "The agent has no vault access.",
+			steps: [{ text: "Run the rotation", command: "vault rotate prod" }],
+			card: "01",
+			blocking: true,
+		});
+		expect(result.ok).toBe(true);
+		expect(result.text).toContain("op-01");
+		const ledger = controller.getActive()!.ledger;
+		expect(ledger.cards["01"]?.phase).toBe("blocked");
+		expect(ledger.cards["01"]?.waitingOn).toEqual(["op-01"]);
+		const { readFile } = await import("node:fs/promises");
+		const store = JSON.parse(
+			await readFile(join(cwd, ".operator", "todos.json"), "utf8"),
+		) as { items: Array<{ id: string; title: string; blocking: boolean; announced: boolean }> };
+		expect(store.items).toHaveLength(1);
+		expect(store.items[0]).toMatchObject({ id: "op-01", title: "Fetch the prod secret", blocking: true, announced: true });
+		const text = await controller.statusText();
+		expect(text).toContain("op-01 BLOCKS card 01");
+	});
+
+	test("todoAdd defaults to advisory without a card and validates", async () => {
+		const { controller } = await setupProgram();
+		const advisory = await controller.todoAdd({ title: "Nice polish" });
+		expect(advisory.ok).toBe(true);
+		expect(controller.getActive()!.ledger.cards["01"]?.phase).toBe("pending");
+		expect((await controller.todoAdd({ title: "  " })).ok).toBe(false);
+		expect((await controller.todoAdd({ title: "x", card: "99" })).ok).toBe(false);
+		expect((await controller.todoAdd({ title: "x", blocking: true })).ok).toBe(false);
+		expect((await controller.todoAdd({ title: "x", steps: "nope" as never })).ok).toBe(false);
+	});
+
+	test("todoUpdate rewrites a confusing todo and todoDone resumes the card", async () => {
+		const { controller } = await setupProgram();
+		await controller.todoAdd({ title: "Confusing blob", card: "01", blocking: true });
+		const updated = await controller.todoUpdate({
+			id: "op-01",
+			title: "Fetch the prod secret",
+			body: "Simple reason.",
+			steps: [
+				{ text: "Do step one", command: "vault read prod" },
+				{ text: "Do step two" },
+			],
+		});
+		expect(updated.ok).toBe(true);
+		expect(updated.text).toContain("title");
+		expect(updated.text).toContain("steps (2)");
+		const listed = await controller.todoList();
+		expect(listed.text).toContain("Fetch the prod secret");
+		expect(listed.text).toContain("vault read prod");
+		const done = await controller.todoDone({ id: "op-01", note: "in 1Password" });
+		expect(done.ok).toBe(true);
+		const card = controller.getActive()!.ledger.cards["01"]!;
+		expect(card.phase).toBe("pending");
+		expect(card.waitingOn).toBeUndefined();
+		expect((await controller.todoDone({ id: "op-01" })).text).toContain("already done");
+		expect((await controller.todoUpdate({ id: "op-99", title: "x" })).ok).toBe(false);
+	});
+
+	test("todoDrop releases the card without doing the work", async () => {
+		const { controller } = await setupProgram();
+		await controller.todoAdd({ title: "Blocked thing", card: "01", blocking: true });
+		expect(controller.getActive()!.ledger.cards["01"]?.phase).toBe("blocked");
+		const dropped = await controller.todoDrop({ id: "op-01", reason: "no longer needed" });
+		expect(dropped.ok).toBe(true);
+		expect(controller.getActive()!.ledger.cards["01"]?.phase).toBe("pending");
+	});
+
+	test("switching blocking off resumes; switching on parks", async () => {
+		const { controller } = await setupProgram();
+		await controller.todoAdd({ title: "Thing", card: "01", blocking: true });
+		expect(controller.getActive()!.ledger.cards["01"]?.phase).toBe("blocked");
+		await controller.todoUpdate({ id: "op-01", blocking: false });
+		expect(controller.getActive()!.ledger.cards["01"]?.phase).toBe("pending");
+		await controller.todoUpdate({ id: "op-01", blocking: true });
+		expect(controller.getActive()!.ledger.cards["01"]?.phase).toBe("blocked");
 	});
 });

@@ -1486,6 +1486,33 @@ describe("lost run recovery", () => {
 		await drive(t.host);
 		expect(card.phase).toBe("implementing");
 	});
+
+	test("a lost worker run salvages when the lane carries the finished work (pause + /tmp cleanup)", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await drive(t.host);
+		const card = t.ledger.cards["01"]!;
+		const runId = t.fake.dispatched[0]!.runId;
+		// Simulate: worker finished and committed in its lane while the program
+		// was paused; its async record in /tmp was cleaned before resume.
+		t.fake.statuses.delete(runId); // status() now reports not_found
+		t.git.changedFilesResult = ["src/feature.ts"];
+		t.fake.files.set(programCardPath("01"), makeCardText({ id: "01", evidence: "$ bun test\n3 pass", state: "review" }));
+		await drive(t.host);
+		expect(card.phase).toBe("reviewing");
+		expect(t.fake.progress.some((line) => line.includes("run record lost"))).toBe(true);
+		expect(t.fake.dispatched.some((entry) => entry.request.kind === "reviewer")).toBe(true);
+	});
+
+	test("a lost worker run with no lane commits blocks as before", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await drive(t.host);
+		const card = t.ledger.cards["01"]!;
+		const runId = t.fake.dispatched[0]!.runId;
+		t.fake.statuses.delete(runId);
+		await drive(t.host);
+		expect(card.phase).toBe("blocked");
+		expect(card.lastError).toContain("not_found");
+	});
 });
 
 describe("unblock semantics", () => {

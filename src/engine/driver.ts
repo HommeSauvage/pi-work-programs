@@ -802,12 +802,16 @@ async function handleRunFailure(
 	const error = status.error ?? "";
 	const quota = classifyQuota(error);
 	if (quota && (await holdForQuota(host, card, quota))) return "handled";
-	if (label === "worker" && NO_EDIT_GUARD.test(error) && (await laneHasCommits(host, card))) {
-		// pi-subagents hard-fails an implementation worker that made no edits. When
-		// the lane already carries commits, the implementation landed in an earlier
-		// run: treat the run as validation-complete so the card can reach review
-		// instead of looping through fresh workers that must not edit anything.
-		await progress(host, `${card.id} worker no edits, lane has commits — salvage → review`);
+	// Two "the run is gone but the work landed" cases salvage into review:
+	// pi-subagents' no-edit guard on an already-implemented lane, and a run whose
+	// async record vanished (e.g. the program sat paused while /tmp was cleaned)
+	// while the lane carries the committed implementation. Evidence is still
+	// required by the caller, so a mid-work death without commits still blocks.
+	if (label === "worker" && (NO_EDIT_GUARD.test(error) || status.state === "not_found") && (await laneHasCommits(host, card))) {
+		await progress(
+			host,
+			`${card.id} worker ${status.state === "not_found" ? "run record lost" : "no edits"}, lane has commits — salvage → review`,
+		);
 		await host.save();
 		return "salvaged";
 	}

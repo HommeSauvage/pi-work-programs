@@ -416,7 +416,7 @@ describe("dispatch resilience", () => {
 		expect(attempts).toBe(2);
 		expect(card.phase).toBe("fixing");
 		expect(card.activeRun?.kind).toBe("fix");
-		expect(t.fake.progress.some((line) => line.includes("dispatch retry succeeded"))).toBe(true);
+		expect(t.fake.progress.some((line) => line.includes("fix dispatched"))).toBe(true);
 	});
 
 	test("a repeated infra failure blocks with both attempts named", async () => {
@@ -616,7 +616,7 @@ describe("program completion", () => {
 		await driveCardToDone(t);
 		await drive(t.host);
 		expect(t.ledger.status).toBe("complete");
-		expect(t.fake.progress.some((line) => line.includes("complete (no program gate configured)"))).toBe(true);
+		expect(t.fake.progress.some((line) => line.includes("complete (no gate)"))).toBe(true);
 		expect(t.git.commits.some((message) => message.includes("program complete"))).toBe(true);
 		const packet = t.fake.asked.find((message) => message.includes("WORK PROGRAM COMPLETE"));
 		expect(packet).toBeDefined();
@@ -806,7 +806,7 @@ describe("stale blocked decisions", () => {
 		staleBlock(t);
 		await drive(t.host);
 		expect(t.ledger.decisions.find((d) => d.kind === "blocked")?.status).toBe("resolved");
-		expect(t.fake.progress.some((line) => line.includes("stale blocked"))).toBe(true);
+		expect(t.ledger.cards["01"]?.lastError).toBeUndefined();
 	});
 
 	test("program completion ignores stale blocked records", async () => {
@@ -853,7 +853,7 @@ describe("fix runner-flake retries", () => {
 		expect(card.phase).toBe("fixing");
 		expect(card.activeRun?.kind).toBe("fix");
 		expect(card.infraRetries).toBe(1);
-		expect(t.fake.progress.some((line) => line.includes("auto-retry 1/2"))).toBe(true);
+		expect(t.fake.progress.some((line) => line.includes("retry 1/2"))).toBe(true);
 	});
 
 	test("repeated flakes block loudly after the cap", async () => {
@@ -907,7 +907,7 @@ describe("gitignored program records", () => {
 		expect(text).toContain("State: done");
 		expect(text).toContain("Harness evidence");
 		expect(t.fake.notifications.some((note) => note.includes("program records not committed"))).toBe(true);
-		expect(t.fake.progress.some((line) => line.includes("record commit skipped"))).toBe(true);
+		expect(t.fake.progress.some((line) => line.includes("records not committed"))).toBe(true);
 		// No crash loop: a second tick is a clean no-op.
 		await drive(t.host);
 		expect(card.phase).toBe("done");
@@ -1053,10 +1053,11 @@ describe("quota holds", () => {
 		expect(t.ledger.decisions.filter((entry) => entry.kind === "blocked")).toHaveLength(0);
 		expect(t.fake.asked.some((message) => message.includes("unblock"))).toBe(false);
 		// The hold line names the delay it parsed and where it came from.
-		const line = t.fake.progress.find((entry) => entry.includes("provider quota"));
+		const line = t.fake.progress.find((entry) => entry.includes("quota held"));
 		expect(line).toContain("held until");
 		expect(line).toContain("1hr 27min");
-		expect(line).toContain("GoUsageLimitError");
+		// The raw provider error is never quoted into the log — the parsed delay is the signal.
+		expect(line).not.toContain("GoUsageLimitError");
 	});
 
 	test("a held card is not dispatched, and becomes dispatchable when the hold expires", async () => {
@@ -1087,7 +1088,7 @@ describe("quota holds", () => {
 		expect(card.holdCount).toBe(2);
 		expect(card.phase).toBe("pending");
 		expect(t.ledger.decisions.filter((entry) => entry.kind === "blocked")).toHaveLength(0);
-		expect(t.fake.progress.some((line) => line.includes("still exhausted, extended"))).toBe(true);
+		expect(t.fake.progress.some((line) => line.includes("quota extended"))).toBe(true);
 	});
 
 	test("past the hold cap the card blocks with the reset time named", async () => {
@@ -1256,7 +1257,7 @@ describe("review-run failures and already-committed lanes", () => {
 		expect(card.phase).toBe("reviewing");
 		expect(t.fake.dispatched.some((entry) => entry.request.kind === "worker")).toBe(false);
 		expect(t.fake.dispatched.some((entry) => entry.request.kind === "reviewer")).toBe(true);
-		expect(t.fake.progress.some((line) => line.includes("skipping the worker"))).toBe(true);
+		expect(t.fake.progress.some((line) => line.includes("skip worker"))).toBe(true);
 	});
 
 	test("a no-edit guard failure on a committed lane is salvaged into review", async () => {
@@ -1271,7 +1272,7 @@ describe("review-run failures and already-committed lanes", () => {
 		const card = t.ledger.cards["01"]!;
 		expect(card.phase).toBe("reviewing");
 		expect(card.lastError ?? "").toBe("");
-		expect(t.fake.progress.some((line) => line.includes("treating the implementation as complete"))).toBe(true);
+		expect(t.fake.progress.some((line) => line.includes("salvage"))).toBe(true);
 	});
 
 	test("the guard still blocks when the lane has no commits", async () => {
@@ -1302,7 +1303,7 @@ describe("provider blips on any run kind", () => {
 		expect(card.phase).toBe("reviewing");
 		expect(card.activeRun?.kind).toBe("reviewer");
 		expect(t.fake.dispatched.at(-1)?.request.kind).toBe("reviewer");
-		expect(t.fake.progress.some((line) => line.includes("provider/runner blip"))).toBe(true);
+		expect(t.fake.progress.some((line) => line.includes("blip"))).toBe(true);
 	});
 
 	test("a persistent outage still blocks after the retry cap", async () => {

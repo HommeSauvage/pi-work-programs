@@ -55,9 +55,13 @@ Rule of thumb: one session and one concern is an ordinary task; several dependen
 
 ```
 pending → ready → implementing → review_pending → reviewing → triaging
-        → fixing → review_pending (next cycle) → done
+        → fixing → review_pending (next cycle)
+        → approved → verifying → queued → merging → done
+                                    (conflict → reconciling)
         → blocked (escalated)
 ```
+
+After triage approval the harness verifies the card's gates, then the lane queues for its serialized merge-back (a conflict routes through a reconciler before the card is done).
 
 | Role | Does |
 |------|------|
@@ -112,7 +116,7 @@ After `finalize_plan`, Pi stops and shows you the plan. That pause is load-beari
 ```
 .agents/work-programs/<slug>/
   plan.md          the north star: context, decisions, phases, card index, rules
-  progress.md      dated lab log — one line per event, bounded (~500 lines)
+  progress.md      dated signal log — one terse line per event, capped (~500 lines; git history is the archive)
   tasks/*.md       card files: the unit of work AND the unit of record
   .runtime/        machine state (gitignored): ledger, review texts
 ```
@@ -163,12 +167,13 @@ Two tools, `suggest_work_program` (propose + scaffold) and `work_program` (drive
 | `status`, `list`, `protocol`, `doctor` | Inspect: board + counts, known programs, full protocol text, dependency diagnosis |
 | `create`, `start`, `finalize_plan` | Shape: scaffold from title+brief, attach to a slug, validate plan + cards |
 | `pause`, `resume`, `mode`, `sync` | Control: hold/resume the loop, switch mode, re-read disk edits |
+| `config` | Retune a running program or one card (cycles, profile, parallelism, models) — applies live, persists into front matter |
 | `todos`, `todo_add`, `todo_update`, `todo_done`, `todo_drop` | Operator todos: list, create (blocking parks the card), rewrite, resolve (card resumes on its own) |
 | `dispatch`, `triage`, `unblock` | Drive cards: start a role run, verdict every finding, resolve a block |
 | `cycle_decision`, `program_gate` | Decide: exhausted review loop, program-level gate failure |
 | `merge_resolved`, `close` | Finish: accept a reconciled merge, close (optionally delete) the program |
 
-One command mirrors the common half: `/work-program status | list | new <title> | start <slug> | pause | resume | mode <session|managed|captain> | sync | doctor | close [--remove]`.
+One command mirrors the common half: `/work-program status | list | new <title> | start <slug> | pause [--hard] | resume | mode <session|managed|captain> | sync | todos | doctor | close [--remove]`.
 
 ## Configuration
 
@@ -186,6 +191,7 @@ Defaults live in settings under `workPrograms` (user or project `settings.json`)
 | `worker.agent` / `review.agent` | `worker` / `reviewer` | Which subagents to spawn (plus optional `model`/`thinking`) |
 | `gates.card` / `gates.program` | `[]` | Shell commands run per card / at program end; failures block |
 | `laneBranchPattern` | `{branch}-card-{id}` | Lane branch naming |
+| `worktreeDir` | `~/.pi/agent/work-programs/worktrees/<repo>` | Base directory for lane worktrees |
 
 ## If something feels off
 
@@ -205,7 +211,7 @@ bun test
 bun run check   # both
 ```
 
-Layout: `src/` (engine, platform, program, protocol), `resources/` (plan/card templates, protocol, review profiles), `agents/` (`work-program-captain`, `work-program-reconciler`), `test/`.
+Layout: `src/` (engine, platform, program, protocol, shared), `resources/` (plan/card templates, protocol, review profiles), `agents/` (`work-program-captain`, `work-program-reconciler`), `test/`.
 
 ## License
 

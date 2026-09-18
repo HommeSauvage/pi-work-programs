@@ -198,7 +198,7 @@ describe("per-card dispatch", () => {
 		await drive(t.host);
 		const review = t.fake.dispatched.find((entry) => entry.request.kind === "reviewer");
 		expect(review?.request.model).toBe("custom/reviewer");
-		expect(t.fake.progress.some((line) => line.includes("review 1 dispatched (enhanced)"))).toBe(true);
+		expect(t.fake.progress.some((line) => line.includes("review 1 dispatched"))).toBe(true);
 	});
 
 	test("triage honors the card's maxCycles cap", async () => {

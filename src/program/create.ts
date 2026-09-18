@@ -74,11 +74,12 @@ export function renderProgressScaffold(input: {
 	return [
 		`# progress — ${input.slug}`,
 		"",
-		"Lab log: card outcomes, review verdicts, merge events, structural edits,",
-		"decisions. One line per event; detail lives in the card Evidence section.",
+		"Harness log. One terse line per event — facts only (card, event, sha).",
+		"No prose; detail lives in the card Evidence sections. Bounded: the",
+		"oldest lines roll off, git history keeps everything.",
 		"",
 		`## ${input.date}`,
-		`- Program created (mode: ${input.mode}, maxParallel: ${input.maxParallel}, ${input.parallelExecution}).`,
+		`- program created (${input.mode}, parallel ${input.maxParallel}, ${input.parallelExecution})`,
 		"",
 	].join("\n");
 }
@@ -126,14 +127,93 @@ export async function scaffoldProgram(input: {
 	};
 }
 
-export async function appendProgress(absDir: string, line: string): Promise<void> {
-	const path = join(absDir, PROGRESS_FILE);
-	const existing = (await pathExists(path)) ? await readText(path) : `# progress\n\n`;
-	if (!existing.endsWith("\n")) {
-		await writeTextAtomic(path, `${existing}\n- ${line}\n`);
-		return;
+/** Rolling cap on recorded events; the oldest lines roll off. */
+export const PROGRESS_MAX_LINES = 500;
+/** Hard per-line cap: progress is a signal log, never a wall of text. */
+export const PROGRESS_MAX_LINE_CHARS = 200;
+const TRIMMED_MARKER = /^- … \d+ earlier events trimmed/;
+
+/**
+ * Enforce the documented bound (~500 events): keep the newest event lines,
+ * fold the dropped count into a single cumulative marker, and drop sections
+ * left empty. progress.md is committed at every card completion, so git
+ * history is the archive; the live file stays a scannable signal log.
+ */
+export function boundProgress(text: string): string {
+	const lines = text.split("\n");
+	let firstSection = lines.findIndex((line) => line.startsWith("## "));
+	if (firstSection === -1) firstSection = lines.length;
+	const header = lines.slice(0, firstSection);
+	while (header.length > 0 && (header[header.length - 1] ?? "").trim().length === 0) header.pop();
+	type Section = { date: string; events: string[]; extra: string[] };
+	const sections: Section[] = [];
+	let current: Section | undefined;
+	for (const line of lines.slice(firstSection)) {
+		if (line.startsWith("## ")) {
+			current = { date: line, events: [], extra: [] };
+			sections.push(current);
+			continue;
+		}
+		if (!current) continue;
+		if (line.startsWith("- ")) current.events.push(line);
+		else if (line.trim().length > 0) current.extra.push(line);
 	}
-	await writeTextAtomic(path, `${existing}- ${line}\n`);
+	const live = sections.flatMap((section) => section.events).filter((line) => !TRIMMED_MARKER.test(line));
+	const excess = live.length - PROGRESS_MAX_LINES;
+	if (excess > 0) {
+		let toDrop = excess;
+		// Markers from earlier trims (dropped or surviving) fold into the new one,
+		// so the count stays cumulative across successive trims.
+		let carried = 0;
+		for (const section of sections) {
+			if (toDrop <= 0) break;
+			while (toDrop > 0 && section.events.length > 0) {
+				const line = section.events.shift();
+				if (line === undefined) break;
+				const match = /^- … (\d+) earlier events trimmed/.exec(line);
+				if (match) {
+					carried += Number(match[1] ?? 0);
+					continue;
+				}
+				toDrop -= 1;
+			}
+		}
+		for (const section of sections) {
+			for (const line of section.events) {
+				const match = /^- … (\d+) earlier events trimmed/.exec(line);
+				if (match) carried += Number(match[1] ?? 0);
+			}
+			section.events = section.events.filter((line) => !TRIMMED_MARKER.test(line));
+		}
+		const marker = `- … ${excess + carried} earlier events trimmed (git history)`;
+		const first = sections.find((section) => section.events.length > 0);
+		if (first) first.events.unshift(marker);
+	}
+	const out = [...header];
+	for (const section of sections) {
+		if (section.events.length === 0 && section.extra.length === 0) continue;
+		out.push("", section.date, ...section.events, ...section.extra);
+	}
+	return `${out.join("\n").trimEnd()}\n`;
+}
+
+/**
+ * The single writer of progress.md. One event = one terse line: whitespace
+ * collapsed, hard-capped, filed under today's UTC date, bounded to the newest
+ * PROGRESS_MAX_LINES events. Empty lines are dropped, never recorded.
+ */
+export async function appendProgress(absDir: string, line: string): Promise<void> {
+	const clean = line.replace(/\s+/g, " ").trim();
+	if (clean.length === 0) return;
+	const clipped = clean.length > PROGRESS_MAX_LINE_CHARS ? `${clean.slice(0, PROGRESS_MAX_LINE_CHARS - 1)}…` : clean;
+	const path = join(absDir, PROGRESS_FILE);
+	const existing = (await pathExists(path)) ? await readText(path) : "";
+	let text = existing.trimEnd();
+	if (text.length === 0) text = "# progress";
+	const today = new Date().toISOString().slice(0, 10);
+	const sections = text.split("\n").filter((entry) => entry.startsWith("## "));
+	if (sections[sections.length - 1] !== `## ${today}`) text += `\n\n## ${today}`;
+	await writeTextAtomic(path, boundProgress(`${text}\n- ${clipped}`));
 }
 
 /** Merge on-disk card records into the ledger without clobbering runtime state. */

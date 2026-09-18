@@ -200,7 +200,7 @@ describe("soft and hard pause", () => {
 		const { readFile } = await import("node:fs/promises");
 		const progress = await readFile(join(cwd, ".agents", "work-programs", "test-program", "progress.md"), "utf8");
 		expect(progress).toContain("paused (hard)");
-		expect(progress).toContain("stopped 1 run(s) (01 worker)");
+		expect(progress).toContain("stopped: 01 worker");
 		expect(progress).toContain("01 implementing→pending");
 	});
 
@@ -221,7 +221,7 @@ describe("soft and hard pause", () => {
 		expect(card.phase).toBe("fixing");
 		const { readFile } = await import("node:fs/promises");
 		const progress = await readFile(join(cwd, ".agents", "work-programs", "test-program", "progress.md"), "utf8");
-		expect(progress).toContain("could not stop");
+		expect(progress).toContain("unstopped");
 	});
 
 	test("resume rearms stranded cards and logs it", async () => {
@@ -233,7 +233,7 @@ describe("soft and hard pause", () => {
 		expect(controller.getActive()!.ledger.status).toBe("active");
 		const { readFile } = await import("node:fs/promises");
 		const progress = await readFile(join(cwd, ".agents", "work-programs", "test-program", "progress.md"), "utf8");
-		expect(progress).toContain("resumed by operator");
+		expect(progress).toContain("resumed");
 		expect(progress).toContain("01 reviewing→review_pending");
 	});
 });
@@ -272,7 +272,7 @@ describe("runtime config", () => {
 		expect(plan).toContain("maxCycles: 1");
 		expect(plan.startsWith("---")).toBe(true);
 		const progress = await readFile(join(cwd, ".agents", "work-programs", "test-program", "progress.md"), "utf8");
-		expect(progress).toContain("config updated — maxCycles 3→1");
+		expect(progress).toContain("config: maxCycles 3→1");
 	});
 
 	test("the change survives a sync from disk", async () => {
@@ -429,7 +429,7 @@ describe("cycle cap without one_more", () => {
 		expect(cardText).toContain("reversible address hash");
 		expect(cardText).not.toContain("nits");
 		const progress = await readFile(join(cwd, ".agents", "work-programs", "test-program", "progress.md"), "utf8");
-		expect(progress).toContain("cycle decision: accept — 1 approved finding(s) carried unfixed");
+		expect(progress).toContain("cycle accept — 1 finding(s) carried");
 	});
 
 	test("block still parks the card", async () => {

@@ -10,7 +10,7 @@ lanes. The program folder holds the records; the extension holds the process.
 ```
 <program-dir>/<slug>/
   plan.md          the north star: context, decisions, phases, card index, rules
-  progress.md      dated lab log — one line per event, bounded
+  progress.md      dated signal log — one terse line per event, hard-bounded
   tasks/*.md       card files: the unit of work AND the unit of record
   .runtime/        machine state (gitignored): ledger, review texts
 ```
@@ -165,7 +165,7 @@ plan and card files stay the source of truth; `sync` reconciles.
   the decision.
 - The change applies to the live ledger, is written back into `plan.md`'s
   front matter (so `sync` and session reload keep it), and lands in
-  `progress.md` as `config updated — maxCycles 3→2`. Card-scoped changes
+  `progress.md` as `config: maxCycles 3→2`. Card-scoped changes
   persist into that card file's front matter the same way.
 - `mode` is still refused while runs are in flight (pause first); every other
   knob applies immediately.
@@ -220,11 +220,10 @@ plan and card files stay the source of truth; `sync` reconciles.
 
 - A run that dies on a provider quota/rate-limit error is **held**, not
   escalated: the card is rearmed and parked until the reset time reported in
-  the error (plus a minute of slack), with a `progress.md` line naming the
-  parsed delay and the error it came from (e.g. `held until 13:42 UTC · quota
-  exhausted — parsed "1hr 27min" from: GoUsageLimitError: 5-hour usage limit
-  reached. Resets in 1hr 27min`). No decision packet, no re-dispatch: one
-  exhausted window no longer asks the supervisor seven times.
+  the error (plus a minute of slack), with a terse `progress.md` line naming
+  the parsed delay (e.g. `01 quota held until 13:42 UTC (1hr 27min)`). The raw
+  provider error is never quoted into the log. No decision packet, no
+  re-dispatch: one exhausted window no longer asks the supervisor seven times.
 - Held cards show in `status` as `held until HH:MM UTC (…)`. When the hold
   expires the drive dispatches them again on its own.
 - A repeat quota failure extends the hold (`still exhausted, extended (hold
@@ -268,10 +267,26 @@ unless the operator explicitly asked for card-specific models.
 
 ## Log hygiene
 
-`progress.md` records only: card outcomes, review verdicts, merge events,
-structural plan edits, escalations, and decisions that outlive the session.
-One line per event, no check-run detail (that lives in the card's Evidence),
-bounded to roughly 500 lines.
+`progress.md` is a signal log, not a diary. Every event is exactly one terse
+line — telegraphic facts only: card, event, commit SHA. No prose, no
+sentences, no quoting of raw model/provider error text; a line says *what
+happened*, and the detail lives where it belongs (the card's Evidence section,
+the review file, the decision packet).
+
+The extension enforces the bound mechanically, so verbosity cannot return:
+
+- One event = one line, whitespace-collapsed, hard-capped at 200 characters.
+- Events are filed under a `## <date>` UTC header; a new day starts a new
+  section, so the log scans chronologically.
+- The file keeps only the newest ~500 events. Older lines roll off into a
+  single `- … N earlier events trimmed` marker; the count stays cumulative.
+  `progress.md` is committed at every card completion, so **git history is
+  the archive** — the live file stays a scannable log.
+- Empty lines are dropped, never recorded. Pure-noise events (retry
+  bookkeeping, no-op config changes) are not logged at all.
+
+Recorded signal: card outcomes, review verdicts, merges, blocks, quota holds,
+structural plan edits, operator actions. Everything else is noise.
 
 ## Human gates
 

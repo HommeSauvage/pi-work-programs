@@ -336,7 +336,7 @@ export class WorkProgramController {
 		await this.save();
 		this.pi.appendEntry(SESSION_ENTRY_TYPE, { slug: ref.slug, dir: ref.relDir });
 		this.pi.setSessionName(`wp: ${ledger.slug}`);
-		await appendProgress(ref.absDir, `session attached (${ledger.mode}, ${ledger.order.length} cards)`);
+		await appendProgress(ref.absDir, `session attached (${ledger.order.length} cards)`);
 		this.startTick();
 		this.refreshUi();
 		if (ledger.status === "active") this.scheduleDrive();
@@ -682,7 +682,7 @@ export class WorkProgramController {
 		ledger.status = "paused";
 		this.active = { ...active, ledger };
 		await this.save();
-		await appendProgress(active.absDir, `plan finalized — ${validation.cards.length} cards (mode: ${ledger.mode}, maxParallel: ${ledger.maxParallel}) — staged, awaiting explicit start`);
+		await appendProgress(active.absDir, `plan finalized — ${validation.cards.length} cards (${ledger.mode}, parallel ${ledger.maxParallel}) — staged`);
 		await this.commitRecords(`wp(${ledger.slug}): plan — ${validation.cards.length} cards`);
 		this.refreshUi();
 		const warnings = validation.warnings.length > 0 ? `\n${formatProblems([], validation.warnings)}` : "";
@@ -757,7 +757,7 @@ export class WorkProgramController {
 			await this.save();
 			await appendProgress(
 				this.active.absDir,
-				`paused (soft) by operator — ${flying.length} run(s) continue in flight${flying.length > 0 ? ` (${flying.map((card) => `${card.id} ${card.activeRun?.kind}`).join(", ")})` : ""}`,
+				`paused (soft)${flying.length > 0 ? ` — in flight: ${flying.map((card) => `${card.id} ${card.activeRun?.kind}`).join(", ")}` : ""}`,
 			);
 			this.refreshUi();
 			return {
@@ -785,7 +785,7 @@ export class WorkProgramController {
 		await this.save();
 		await appendProgress(
 			this.active.absDir,
-				`paused (hard) by operator — stopped ${stopped.length} run(s)${stopped.length > 0 ? ` (${stopped.join(", ")})` : ""}; rearmed: ${rearmed.join(", ") || "none"}${unstopped.length > 0 ? `; could not stop (left running): ${unstopped.join(", ")}` : ""}`,
+				`paused (hard)${stopped.length > 0 ? ` — stopped: ${stopped.join(", ")}` : ""}${rearmed.length > 0 ? `; rearmed: ${rearmed.join(", ")}` : ""}${unstopped.length > 0 ? `; unstopped: ${unstopped.join(", ")}` : ""}`,
 			);
 		this.refreshUi();
 		this.sessionCtx?.ui.notify(`Work program: hard-paused ${ledger.slug} — stopped ${stopped.length} run(s)`, "warning");
@@ -804,7 +804,7 @@ export class WorkProgramController {
 		await this.syncFromDisk();
 		await appendProgress(
 			this.active.absDir,
-			`resumed by operator${rearmed.length > 0 ? ` — rearmed: ${rearmed.join(", ")}` : ""}`,
+			`resumed${rearmed.length > 0 ? ` — rearmed: ${rearmed.join(", ")}` : ""}`,
 		);
 		await this.save();
 		this.scheduleDrive();
@@ -818,7 +818,7 @@ export class WorkProgramController {
 		if (busy) return { ok: false, text: "Cannot change mode while runs are in flight; pause first." };
 		this.active.ledger.mode = mode;
 		await this.save();
-		await appendProgress(this.active.absDir, `mode changed to ${mode}`);
+		await appendProgress(this.active.absDir, `mode → ${mode}`);
 		this.refreshUi();
 		return { ok: true, text: `Mode set to ${mode}.` };
 	}
@@ -948,10 +948,12 @@ export class WorkProgramController {
 		}
 
 		await this.save();
-		await appendProgress(
-			this.active.absDir,
-			`config updated — ${changes.length > 0 ? changes.join(", ") : "(no effective change)"}${accepted > 0 ? `; ${accepted} open cycle decision(s) accepted` : ""}`,
-		);
+		if (changes.length > 0 || accepted > 0) {
+			await appendProgress(
+				this.active.absDir,
+				`config: ${changes.join(", ")}${accepted > 0 ? `${changes.length > 0 ? "; " : ""}${accepted} cycle decision(s) accepted` : ""}`,
+			);
+		}
 		this.refreshUi();
 		this.scheduleDrive();
 		return {
@@ -1032,7 +1034,7 @@ export class WorkProgramController {
 			return { ok: false, text: `Card ${cardId} ledger updated but the card file could not be written: ${oneLine(String(error), 140)}` };
 		}
 		await this.save();
-		await appendProgress(this.active.absDir, `[card ${cardId}] config updated — ${changes.join(", ") || "(no effective change)"}`);
+		if (changes.length > 0) await appendProgress(this.active.absDir, `${cardId} config: ${changes.join(", ")}`);
 		this.refreshUi();
 		this.scheduleDrive();
 		return { ok: true, text: `Card ${cardId} updated: ${changes.join(", ") || "(no effective change)"}.` };
@@ -1108,7 +1110,9 @@ export class WorkProgramController {
 		await this.save();
 		await appendProgress(
 			this.active.absDir,
-			card ? `[card ${card.id}] todo ${item.id} added (blocking): ${oneLine(title, 100)}` : `[program] todo ${item.id} added: ${oneLine(title, 100)}`,
+			card
+				? `${card.id} todo ${item.id} added (blocking): ${oneLine(title, 60)}`
+				: `todo ${item.id} added: ${oneLine(title, 60)}`,
 		);
 		this.refreshUi();
 		this.scheduleDrive();
@@ -1191,7 +1195,7 @@ export class WorkProgramController {
 		// card after a move, or this card after blocking was switched off).
 		await resumeWaitingCards(this, gate);
 		await this.save();
-		await appendProgress(this.active.absDir, `[card ${targetCard ?? "—"}] todo ${item.id} updated — ${changes.join(", ")}`);
+		await appendProgress(this.active.absDir, `${targetCard ?? "—"} todo ${item.id} updated (${changes.join(", ")})`);
 		this.refreshUi();
 		this.scheduleDrive();
 		return { ok: true, text: `Todo ${item.id} updated: ${changes.join(", ")}.` };
@@ -1212,7 +1216,7 @@ export class WorkProgramController {
 		await this.save();
 		await appendProgress(
 			this.active.absDir,
-			`[card ${item.card ?? "—"}] todo ${id} ${verb}${note?.trim() ? ` — ${oneLine(note.trim(), 120)}` : ""}`,
+			`${item.card ?? "—"} todo ${id} ${verb}${note?.trim() ? `: ${oneLine(note.trim(), 60)}` : ""}`,
 		);
 		this.refreshUi();
 		this.scheduleDrive();
@@ -1381,7 +1385,7 @@ export class WorkProgramController {
 		const result = applyTriage(this, cardId, verdicts);
 		if (!result.ok) return { ok: false, text: result.error ?? "triage failed" };
 		const approved = verdicts.filter((verdict) => verdict.verdict === "approve").length;
-		await appendProgress(this.active.absDir, `[card ${cardId}] triage: ${approved} approved / ${verdicts.length - approved} rejected-or-deferred`);
+		await appendProgress(this.active.absDir, `${cardId} triage: ${approved} fix / ${verdicts.length - approved} skip`);
 		await this.save();
 		this.scheduleDrive();
 		return { ok: true, text: `Recorded ${verdicts.length} verdict(s) for card ${cardId}.` };
@@ -1391,7 +1395,7 @@ export class WorkProgramController {
 		if (!this.active) return { ok: false, text: "No active work program." };
 		const result = await applyUnblock(this, cardId, resolution);
 		if (!result.ok) return { ok: false, text: result.error ?? "unblock failed" };
-		await appendProgress(this.active.absDir, `[card ${cardId}] unblocked: ${resolution}`);
+		await appendProgress(this.active.absDir, `${cardId} unblocked: ${resolution}`);
 		await this.save();
 		if (resolution === "redispatch") this.scheduleDrive();
 		return { ok: true, text: `Card ${cardId}: ${resolution}.` };
@@ -1410,10 +1414,10 @@ export class WorkProgramController {
 			}
 			await appendProgress(
 				this.active.absDir,
-				`[card ${cardId}] cycle decision: accept — ${card.acceptedFindings.length} approved finding(s) carried unfixed`,
+				`${cardId} cycle accept — ${card.acceptedFindings.length} finding(s) carried`,
 			);
 		} else {
-			await appendProgress(this.active.absDir, `[card ${cardId}] cycle decision: ${choice}`);
+			await appendProgress(this.active.absDir, `${cardId} cycle ${choice}`);
 		}
 		await this.save();
 		this.scheduleDrive();
@@ -1424,7 +1428,7 @@ export class WorkProgramController {
 		if (!this.active) return { ok: false, text: "No active work program." };
 		const result = applyProgramGateDecision(this, choice);
 		if (!result.ok) return { ok: false, text: result.error ?? "program gate decision failed" };
-		await appendProgress(this.active.absDir, `[program] gate decision: ${choice}`);
+		await appendProgress(this.active.absDir, `program gate: ${choice}`);
 		await this.save();
 		this.scheduleDrive();
 		return { ok: true, text: `Program gate: ${choice}.` };

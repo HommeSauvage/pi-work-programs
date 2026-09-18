@@ -249,9 +249,21 @@ plan and card files stay the source of truth; `sync` reconciles.
 ## Evidence
 
 - Evidence is measured, never assumed. Paste exact command output; name the
-  commit it was measured at.
+  commit it was measured at. During implementation, agents run only fast
+  scoped checks (the touched test file, the affected package); full quality
+  gates run ONCE at the end of the card's work.
 - When gates are configured, the harness runs them and its result is
-  authoritative; worker-pasted evidence is supplementary.
+  authoritative; worker-pasted evidence is supplementary. Reviewers see the
+  harness gate results and re-run the gates themselves at the END of their
+  review pass (the shipped `work-program-reviewer` agent has bash; the builtin
+  pi-subagents `reviewer` does not and cannot run gates).
+- Gates are set per program (`gates.card`) and may be overridden per card in
+  its front matter (`gates: [...]`, or `gates: []` for gate-free cards).
+- Every run has a wall-clock budget (`runTimeoutMs`, default 4h): pi-subagents
+  kills single async runs at 30 minutes otherwise. Resumed runs (fixes,
+  re-reviews, atlas refreshes) keep the runner's own timeout — the RPC accepts
+  no override — so a very long follow-up can still die at 30m; the failure
+  path then re-dispatches fresh with the full budget.
 - A card is done only when its gate is green (or no gate applies) and its
   review has been triaged.
 

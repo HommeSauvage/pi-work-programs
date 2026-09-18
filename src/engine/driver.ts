@@ -1,5 +1,5 @@
 import { loadResources } from "../protocol/resources.ts";
-import { PACKET_WAKE_FORCE_AGE_MS, PACKET_WAKE_MIN_AGE_MS } from "../constants.ts";
+import { PACKET_WAKE_FORCE_AGE_MS, PACKET_WAKE_MIN_AGE_MS, SCOUT_TIMEOUT_MS } from "../constants.ts";
 import {
 	captainBrief,
 	fixBrief,
@@ -14,12 +14,14 @@ import {
 import { appendHarnessEvidence, gateEvidenceLines, setCardState } from "../program/card-edit.ts";
 import {
 	atlasPath,
+	effectiveCardGates,
 	effectiveMaxCycles,
 	effectiveReviewerAgent,
 	effectiveReviewerModel,
 	effectiveReviewerResume,
 	effectiveReviewerThinking,
 	effectiveReviewProfile,
+	effectiveRunTimeoutMs,
 	effectiveWorkerAgent,
 	effectiveWorkerModel,
 	effectiveWorkerThinking,
@@ -194,7 +196,7 @@ async function progressProgram(host: DriverHost, line: string): Promise<void> {
 }
 
 async function runCardGates(host: DriverHost, card: CardLedger, cwd: string): Promise<{ ok: boolean; gates: GateResult[] }> {
-	const commands = host.ledger.gates.card;
+	const commands = effectiveCardGates(host.ledger, card);
 	const gates: GateResult[] = [];
 	if (commands.length === 0) {
 		card.gates = [];
@@ -1079,6 +1081,9 @@ async function dispatchRun(
 		task: request.task,
 		cwd: request.cwd,
 		label: request.label,
+		// Every card run carries an explicit wall-clock budget: pi-subagents kills
+		// single async runs at 30m otherwise, and a killed worker re-explores.
+		timeoutMs: effectiveRunTimeoutMs(host.ledger),
 		...(request.model ? { model: request.model } : {}),
 		...(request.thinking ? { thinking: request.thinking } : {}),
 		...(request.outputSchema ? { outputSchema: request.outputSchema } : {}),
@@ -1140,6 +1145,8 @@ async function dispatchScout(host: DriverHost, task: string, state: "building" |
 			agent: atlas.agent ?? "scout",
 			task,
 			cwd: host.cwd,
+			// Exploration, not implementation: a shorter leash than card runs.
+			timeoutMs: SCOUT_TIMEOUT_MS,
 			...(atlas.model ? { model: atlas.model } : {}),
 			...(atlas.thinking ? { thinking: atlas.thinking } : {}),
 			label: `wp ${host.ledger.slug} atlas scout`,
@@ -1349,7 +1356,7 @@ export async function startWorkerFor(host: DriverHost, card: CardLedger): Promis
 			cardPath: cardPath(host, card),
 			planPath: planPath(host),
 			cwd: host.ports.runCwd(ledger, card),
-			gates: ledger.gates.card,
+			gates: effectiveCardGates(ledger, card),
 			reviewProfile,
 			reviewPath: path,
 			repoRoot: host.cwd,
@@ -1375,7 +1382,7 @@ export async function startWorkerFor(host: DriverHost, card: CardLedger): Promis
 		cardPath: cardPath(host, card),
 		planPath: planPath(host),
 		cwd: host.ports.runCwd(ledger, card),
-		gates: ledger.gates.card,
+		gates: effectiveCardGates(ledger, card),
 		repoRoot: host.cwd,
 		atlasPath: atlasNotePath(host),
 	});
@@ -1568,7 +1575,7 @@ async function dispatchFixes(host: DriverHost, gate: TodoGate): Promise<void> {
 			card,
 			reviewPath: decision?.reviewPath ?? "",
 			verdicts,
-			gates: ledger.gates.card,
+			gates: effectiveCardGates(ledger, card),
 			repoRoot: host.cwd,
 		});
 		const cwd = host.ports.runCwd(ledger, card);
@@ -1907,7 +1914,7 @@ async function beginReconcile(
 		mergeOutput: merge.output,
 		incomingIntent: `Card ${card.id} scope: ${card.title}`,
 		existingIntent,
-		gateCommands: ledger.gates.card,
+		gateCommands: effectiveCardGates(ledger, card),
 		atlasPath: atlasNotePath(host),
 	});
 	const dispatched = await dispatchWithInfraRetry(host, card, {

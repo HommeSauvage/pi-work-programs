@@ -5,6 +5,7 @@ import type {
 	ReviewProfile,
 	WorkProgramSettings,
 } from "./shared/types.ts";
+import { DEFAULT_RUN_TIMEOUT_MS } from "./constants.ts";
 import { projectSettingsPath, userSettingsPath } from "./shared/paths.ts";
 import { readJson } from "./shared/fsx.ts";
 import { asNumber, asString, isRecord, parseStringArray } from "./shared/text.ts";
@@ -16,10 +17,11 @@ export const DEFAULT_SETTINGS: WorkProgramSettings = {
 	mode: "managed",
 	maxParallel: 2,
 	parallelExecution: "worktrees",
-	review: { agent: "reviewer", profile: "light", maxCycles: 3, onExhausted: "ask", resumeReviewer: true },
+	review: { agent: "work-program-reviewer", profile: "light", maxCycles: 3, onExhausted: "ask", resumeReviewer: true },
 	worker: { agent: "worker" },
 	reviewer: {},
 	atlas: { enabled: true, agent: "scout" },
+	runTimeoutMs: DEFAULT_RUN_TIMEOUT_MS,
 	gates: { card: [], program: [] },
 	laneBranchPattern: "{branch}-card-{id}",
 };
@@ -123,6 +125,9 @@ export function normalizeSettings(raw: unknown, base: WorkProgramSettings = DEFA
 		if (thinking) settings.atlas!.thinking = thinking;
 	}
 
+	const runTimeoutMs = asNumber(raw.runTimeoutMs);
+	if (runTimeoutMs !== undefined && runTimeoutMs >= 60_000) settings.runTimeoutMs = Math.floor(runTimeoutMs);
+
 	return settings;
 }
 
@@ -214,6 +219,7 @@ export function applyOverrides(
 			card: overrides.gates?.card ?? settings.gates.card,
 			program: overrides.gates?.program ?? settings.gates.program,
 		},
+		runTimeoutMs: overrides.runTimeoutMs ?? settings.runTimeoutMs,
 		atlas: {
 			enabled: overrides.atlasEnabled ?? settings.atlas?.enabled ?? true,
 			agent: overrides.atlasAgent ?? settings.atlas?.agent ?? "scout",
@@ -258,6 +264,7 @@ export function overridesToPlanFrontmatter(overrides: ProgramConfigOverrides): R
 	if (overrides.mode) data.mode = overrides.mode;
 	if (overrides.maxParallel !== undefined) data.maxParallel = overrides.maxParallel;
 	if (overrides.parallelExecution) data.parallelExecution = overrides.parallelExecution;
+	if (overrides.runTimeoutMs !== undefined) data.runTimeoutMs = overrides.runTimeoutMs;
 	if (overrides.laneBranchPattern) data.laneBranchPattern = overrides.laneBranchPattern;
 	const review: Record<string, unknown> = {};
 	if (overrides.reviewProfile) review.profile = overrides.reviewProfile;
@@ -298,6 +305,7 @@ export function mergePlanConfig(planText: string, patch: ProgramConfigOverrides)
 	const current: ProgramConfigOverrides = {};
 	if (isMode(existing.mode)) current.mode = existing.mode;
 	if (typeof existing.maxParallel === "number") current.maxParallel = existing.maxParallel;
+	if (typeof existing.runTimeoutMs === "number") current.runTimeoutMs = existing.runTimeoutMs;
 	if (isParallelExecution(existing.parallelExecution)) current.parallelExecution = existing.parallelExecution;
 	if (typeof existing.laneBranchPattern === "string") current.laneBranchPattern = existing.laneBranchPattern;
 	const review = isPlainRecord(existing.review) ? existing.review : undefined;

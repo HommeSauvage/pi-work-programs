@@ -26,6 +26,16 @@ export const RPC_TIMEOUT_MS = 8_000;
 export const STATUS_TIMEOUT_MS = 30_000;
 export const GATE_TIMEOUT_MS = 30 * 60_000;
 
+/**
+ * Wall-clock timeout passed to every card-run dispatch. pi-subagents otherwise
+ * kills single async runs at 30 minutes — shorter than honest cards. 4h bounds
+ * true runaways without biting long implementations.
+ */
+export const DEFAULT_RUN_TIMEOUT_MS = 4 * 60 * 60_000;
+
+/** Scout runs are exploration, not implementation: one hour is generous. */
+export const SCOUT_TIMEOUT_MS = 60 * 60_000;
+
 export const MAX_REVIEW_CHARS = 60_000;
 export const MAX_DIGEST_CHARS = 1_400;
 export const MAX_OUTPUT_TAIL_CHARS = 8_000;

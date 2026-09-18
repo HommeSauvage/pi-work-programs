@@ -163,8 +163,11 @@ export function makeCardText(input: {
 	state?: string;
 	evidence?: string;
 	review?: "light" | "enhanced";
+	/** Front-matter per-card gate commands (overrides program gates). */
+	gates?: string[];
 }): string {
 	const depends = input.depends && input.depends.length > 0 ? input.depends.join(", ") : "—";
+	const frontmatter = input.gates !== undefined ? `---\ngates: [${input.gates.join(", ")}]\n---\n\n` : "";
 	const lines = [
 		`# Card ${input.id} — ${input.title ?? `card ${input.id}`}`,
 		"",
@@ -189,7 +192,7 @@ export function makeCardText(input: {
 		`## State: ${input.state ?? "todo"}`,
 		"",
 	];
-	return lines.join("\n");
+	return frontmatter + lines.join("\n");
 }
 
 export function createTestHost(input: {
@@ -199,6 +202,7 @@ export function createTestHost(input: {
 		kind?: "write" | "recon";
 		state?: string;
 		evidence?: string;
+		gates?: string[];
 	}>;
 	overrides?: ProgramConfigOverrides;
 	gates?: { card?: string[]; program?: string[] };
@@ -237,6 +241,7 @@ export function createTestHost(input: {
 			...(card.kind ? { kind: card.kind } : {}),
 			...(card.state ? { state: card.state } : {}),
 			...(card.evidence ? { evidence: card.evidence } : {}),
+			...(card.gates ? { gates: card.gates } : {}),
 		});
 		return parseCard(path, card.id, text);
 	});

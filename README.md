@@ -147,6 +147,8 @@ Measured on real programs, fresh workers spend ~20-25% of their input budget re-
 - **Program atlas** (`atlas.md`): one scout explores the repo with the plan and every card in hand, then writes a capped orientation document — architecture, module map, conventions, integration points, negative knowledge, and 3-8 per-card file pointers. The first build gates worker dispatch; after each merge the scout is *resumed* to update the atlas from the diff. The file is the source of truth (a replacement scout re-reads it instead of starting over); the session is only a warm cache. Briefs tell agents the atlas is orientation, not a boundary — verify before relying, explore beyond freely. An `atlas.md` you write yourself in the program dir is adopted as-is.
 - **Reviewer resume**: cycle 2+ of a card's review resumes the same reviewer session with just the fix delta (`lastReviewedSha..HEAD`) and the approved-findings list. Disable with `config reviewerResume: false` (or `review.resumeReviewer: false` in settings) to get fresh reviewers every cycle.
 - **Run telemetry**: every run's usage (total tokens, peak context window, turns, tool calls, cost — read from pi-subagents' `status.json`) is aggregated onto its card and the atlas. `status` shows program totals, each done card's harness evidence carries a `usage:` line, and the completion summary totals the program.
+- **Gate discipline**: workers run fast scoped checks during implementation and the full quality gates **once, at the end** of the card — never in a mid-card loop (measured: 110+ bash calls per worker session before this). Reviewers work methodically — card first, diff second, **gates last** — running the gates themselves before writing findings (the shipped `work-program-reviewer` agent carries bash; the builtin pi-subagents `reviewer` does not, and old ledgers migrate to the new default). The harness also runs gates authoritatively at every transition. Per-card `gates:` front matter overrides the program gates; `gates: []` exempts a card.
+- **Run timeouts**: every dispatch carries an explicit wall-clock budget (`runTimeoutMs`, default **4h**). pi-subagents kills single async runs at 30 minutes otherwise — and a killed worker re-dispatches fresh and re-explores, so the 30m wall was a token bug, not just a liveness bug. Scout runs get 1h (exploration, not implementation).
 
 Two review profiles, per program with per-card override (card front matter `review: enhanced`, or `work_program({ action: "config", card, reviewProfile })`):
 
@@ -202,6 +204,7 @@ Defaults live in settings under `workPrograms` (user or project `settings.json`)
 | `review.resumeReviewer` | `true` | Resume the same reviewer across a card's cycles; `false` = fresh reviewer every cycle |
 | `atlas.enabled` / `atlas.agent` | `true` / `scout` | Build `atlas.md` via a scout and inject it into briefs (plus optional `model`/`thinking`) |
 | `gates.card` / `gates.program` | `[]` | Shell commands run per card / at program end; failures block |
+| `runTimeoutMs` | `14400000` | Wall-clock budget per run (default 4h; pi-subagents kills runs at 30m when unset) |
 | `laneBranchPattern` | `{branch}-card-{id}` | Lane branch naming |
 | `worktreeDir` | `~/.pi/agent/work-programs/worktrees/<repo>` | Base directory for lane worktrees |
 

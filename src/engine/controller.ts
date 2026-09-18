@@ -134,6 +134,7 @@ export interface ProgramConfigPatch {
 	reviewerModel?: string;
 	reviewerThinking?: string;
 	reviewerResume?: boolean;
+	runTimeoutMs?: number;
 	atlasEnabled?: boolean;
 	atlasAgent?: string;
 	atlasModel?: string;
@@ -769,6 +770,7 @@ export class WorkProgramController {
 		active.ledger.reviewerModel = settings.reviewer.model;
 		active.ledger.reviewerThinking = settings.reviewer.thinking;
 		active.ledger.reviewerResume = settings.review.resumeReviewer !== false;
+		active.ledger.runTimeoutMs = settings.runTimeoutMs;
 		// Atlas config keys follow plan front matter; runtime state (state, runId,
 		// pendingMerges, refreshes, usage) is never touched by a sync.
 		if (active.ledger.atlas) {
@@ -994,6 +996,14 @@ export class WorkProgramController {
 			}
 			overrides.reviewerResume = patch.reviewerResume;
 		}
+		if (patch.runTimeoutMs !== undefined) {
+			const timeout = Math.floor(patch.runTimeoutMs);
+			if (!Number.isFinite(timeout) || timeout < 60_000) {
+				return { ok: false, text: "runTimeoutMs must be at least 60000 (1 minute)" };
+			}
+			if (timeout !== ledger.runTimeoutMs) changes.push(`runTimeoutMs ${ledger.runTimeoutMs ?? "(default)"}→${timeout}`);
+			overrides.runTimeoutMs = timeout;
+		}
 		if (patch.atlasEnabled !== undefined) {
 			if (typeof patch.atlasEnabled !== "boolean") return { ok: false, text: "atlasEnabled must be a boolean" };
 			if (patch.atlasEnabled !== (ledger.atlas?.enabled ?? true)) {
@@ -1014,7 +1024,7 @@ export class WorkProgramController {
 			overrides.atlasThinking = patch.atlasThinking;
 		}
 		if (Object.keys(overrides).length === 0 && patch.onExhausted === undefined) {
-			return { ok: false, text: "Nothing to change; pass at least one of maxCycles, onExhausted, reviewProfile, maxParallel, parallelExecution, mode, workerAgent, workerModel, workerThinking, reviewerAgent, reviewerModel, reviewerThinking, reviewerResume, atlasEnabled, atlasAgent, atlasModel, atlasThinking." };
+			return { ok: false, text: "Nothing to change; pass at least one of maxCycles, onExhausted, reviewProfile, maxParallel, parallelExecution, mode, workerAgent, workerModel, workerThinking, reviewerAgent, reviewerModel, reviewerThinking, reviewerResume, runTimeoutMs, atlasEnabled, atlasAgent, atlasModel, atlasThinking." };
 		}
 
 		// Apply to the live ledger via the same normalization the plan path uses.
@@ -1032,6 +1042,7 @@ export class WorkProgramController {
 		if (patch.reviewerModel !== undefined) ledger.reviewerModel = patch.reviewerModel === "" ? undefined : patch.reviewerModel;
 		if (patch.reviewerThinking !== undefined) ledger.reviewerThinking = patch.reviewerThinking === "" ? undefined : patch.reviewerThinking;
 		if (patch.reviewerResume !== undefined) ledger.reviewerResume = patch.reviewerResume;
+		if (patch.runTimeoutMs !== undefined) ledger.runTimeoutMs = patch.runTimeoutMs;
 		if (
 			patch.atlasEnabled !== undefined ||
 			patch.atlasAgent !== undefined ||
@@ -1101,7 +1112,7 @@ export class WorkProgramController {
 		if (!this.active) return { ok: false, text: "No active work program." };
 		const card = this.active.ledger.cards[cardId];
 		if (!card) return { ok: false, text: `Unknown card ${cardId}.` };
-		for (const key of ["mode", "maxParallel", "parallelExecution", "onExhausted", "reviewerResume", "atlasEnabled", "atlasAgent", "atlasModel", "atlasThinking"] as const) {
+		for (const key of ["mode", "maxParallel", "parallelExecution", "onExhausted", "reviewerResume", "runTimeoutMs", "atlasEnabled", "atlasAgent", "atlasModel", "atlasThinking"] as const) {
 			if (patch[key] !== undefined) {
 				return { ok: false, text: `${key} is program-level; omit card to set it (work_program({ action: "config", ${key}: ... }))` };
 			}

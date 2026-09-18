@@ -151,6 +151,8 @@ export interface CardLedger {
 	usage?: RunUsage;
 	/** Per-run usage records (bounded), newest last. */
 	usageRuns?: CardRunUsage[];
+	/** Per-card gate commands (front matter `gates`); overrides the program's gates.card when set. */
+	gateCommands?: string[];
 	/** Findings approved at the review-cycle cap and carried into the merge unfixed. */
 	acceptedFindings?: string[];
 	updatedAt: number;
@@ -201,6 +203,8 @@ export interface ProgramLedger {
 	reviewerAgent: string;
 	/** Resume the same reviewer session across review cycles of a card (default true). */
 	reviewerResume?: boolean;
+	/** Per-run wall-clock timeout passed to every dispatch (default 4h; pi-subagents otherwise kills single async runs at 30m). */
+	runTimeoutMs?: number;
 	workerModel?: string;
 	workerThinking?: string;
 	reviewerModel?: string;
@@ -235,6 +239,8 @@ export interface ParsedCard {
 	reviewerAgent?: string;
 	reviewerModel?: string;
 	reviewerThinking?: string;
+	/** Front-matter `gates`: per-card gate commands overriding the program's gates.card. */
+	gates?: string[];
 	state: string;
 	evidence: string;
 }
@@ -270,6 +276,7 @@ export interface ProgramConfigOverrides {
 	reviewerModel?: string;
 	reviewerThinking?: string;
 	reviewerResume?: boolean;
+	runTimeoutMs?: number;
 	atlasEnabled?: boolean;
 	atlasAgent?: string;
 	atlasModel?: string;
@@ -295,6 +302,8 @@ export interface WorkProgramSettings {
 	reviewer: { model?: string; thinking?: string };
 	/** Program atlas: scout-built orientation document injected into worker/reviewer briefs. */
 	atlas?: { enabled: boolean; agent: string; model?: string; thinking?: string };
+	/** Per-run wall-clock timeout for dispatches (default 4h). */
+	runTimeoutMs?: number;
 	gates: { card: string[]; program: string[] };
 	worktreeDir?: string;
 	laneBranchPattern: string;

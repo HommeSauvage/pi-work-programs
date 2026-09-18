@@ -1,5 +1,5 @@
 import { join, resolve } from "node:path";
-import { ATLAS_FILE, LEDGER_FILE, PROGRESS_FILE, REVIEWS_DIR, RUNTIME_DIR } from "../constants.ts";
+import { ATLAS_FILE, DEFAULT_RUN_TIMEOUT_MS, LEDGER_FILE, PROGRESS_FILE, REVIEWS_DIR, RUNTIME_DIR } from "../constants.ts";
 import { readJson, writeJsonAtomic } from "../shared/fsx.ts";
 import type {
 	CardLedger,
@@ -80,6 +80,7 @@ export function cardFromParsed(parsed: ParsedCard, planText: string): CardLedger
 	if (parsed.reviewerAgent) card.reviewerAgent = parsed.reviewerAgent;
 	if (parsed.reviewerModel) card.reviewerModel = parsed.reviewerModel;
 	if (parsed.reviewerThinking) card.reviewerThinking = parsed.reviewerThinking;
+	if (parsed.gates) card.gateCommands = parsed.gates;
 	if (mapped === "adopted-unknown") {
 		card.lastError = `adopted in state "${parsed.state || "unknown"}"; needs a decision (redispatch, mark done, or abandon)`;
 	}
@@ -126,6 +127,7 @@ export function buildLedger(input: {
 		workerAgent: settings.worker.agent,
 		reviewerAgent: settings.review.agent,
 		reviewerResume: settings.review.resumeReviewer !== false,
+		runTimeoutMs: settings.runTimeoutMs ?? DEFAULT_RUN_TIMEOUT_MS,
 		workerModel: settings.worker.model,
 		workerThinking: settings.worker.thinking,
 		reviewerModel: settings.reviewer.model,
@@ -182,6 +184,7 @@ export function configOverridesFromPlan(planText: string): ProgramConfigOverride
 		if (typeof reviewer.model === "string") overrides.reviewerModel = reviewer.model;
 		if (typeof reviewer.thinking === "string") overrides.reviewerThinking = reviewer.thinking;
 	}
+	if (typeof raw.runTimeoutMs === "number") overrides.runTimeoutMs = raw.runTimeoutMs;
 	const gates = isPlainRecord(raw.gates) ? raw.gates : undefined;
 	if (gates) {
 		const card = Array.isArray(gates.card) ? gates.card.filter((v): v is string => typeof v === "string") : undefined;
@@ -242,6 +245,16 @@ export function effectiveReviewerResume(ledger: ProgramLedger): boolean {
 	return ledger.reviewerResume !== false;
 }
 
+/** Gate commands for a card: its front-matter `gates` win over the program default. */
+export function effectiveCardGates(ledger: ProgramLedger, card: CardLedger): string[] {
+	return card.gateCommands ?? ledger.gates.card;
+}
+
+/** Wall-clock timeout for card-run dispatches (ledger value, else the 4h default). */
+export function effectiveRunTimeoutMs(ledger: ProgramLedger): number {
+	return ledger.runTimeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
+}
+
 /**
  * Fill ledger fields introduced after the ledger was first written (called when
  * a program is activated or started). Returns true when anything changed.
@@ -250,6 +263,17 @@ export function migrateLedger(ledger: ProgramLedger, settings: WorkProgramSettin
 	let changed = false;
 	if (ledger.reviewerResume === undefined) {
 		ledger.reviewerResume = settings.review.resumeReviewer !== false;
+		changed = true;
+	}
+	if (ledger.runTimeoutMs === undefined) {
+		ledger.runTimeoutMs = settings.runTimeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
+		changed = true;
+	}
+	// The builtin pi-subagents "reviewer" has no bash and cannot run gates;
+	// the shipped work-program-reviewer replaced it as the default. An explicit
+	// settings choice of the builtin agent (settings.review.agent) is respected.
+	if (ledger.reviewerAgent === "reviewer" && settings.review.agent !== "reviewer") {
+		ledger.reviewerAgent = "work-program-reviewer";
 		changed = true;
 	}
 	if (!ledger.atlas) {

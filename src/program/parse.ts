@@ -1,5 +1,5 @@
 import type { CardConfigPatch, CardKind, ParsedCard, ParsedPlan, ReviewProfile } from "../shared/types.ts";
-import { asNumber, asString, isRecord } from "../shared/text.ts";
+import { asNumber, asString, isRecord, parseStringArray } from "../shared/text.ts";
 import { parseFrontmatter } from "../shared/frontmatter.ts";
 
 const CARD_PATH_RE = /`?(tasks\/[A-Za-z0-9._/-]+\.md)`?/g;
@@ -125,8 +125,8 @@ function asDependsList(value: unknown): string[] | undefined {
 }
 
 /** Per-card knobs from front matter. Body lines stay as fallback for older cards. */
-export function parseCardFrontmatter(data: Record<string, unknown>): CardConfigPatch & { dependsOn?: string[]; kind?: CardKind } {
-	const out: CardConfigPatch & { dependsOn?: string[]; kind?: CardKind } = {};
+export function parseCardFrontmatter(data: Record<string, unknown>): CardConfigPatch & { dependsOn?: string[]; kind?: CardKind; gates?: string[] } {
+	const out: CardConfigPatch & { dependsOn?: string[]; kind?: CardKind; gates?: string[] } = {};
 	const reviewNested = isRecord(data.review) ? (data.review as Record<string, unknown>) : undefined;
 	const workerNested = isRecord(data.worker) ? (data.worker as Record<string, unknown>) : undefined;
 	const reviewerNested = isRecord(data.reviewer) ? (data.reviewer as Record<string, unknown>) : undefined;
@@ -141,6 +141,8 @@ export function parseCardFrontmatter(data: Record<string, unknown>): CardConfigP
 	if (maxCycles !== undefined) out.maxCycles = Math.max(0, Math.min(32, Math.floor(maxCycles)));
 	const depends = asDependsList(data.dependsOn ?? data.depends_on ?? data.depends);
 	if (depends !== undefined) out.dependsOn = depends;
+	const gates = parseStringArray(data.gates);
+	if (gates !== undefined) out.gates = gates;
 	const kindRaw = asString(data.kind)?.toLowerCase();
 	if (kindRaw === "recon" || kindRaw === "read-only" || kindRaw === "readonly" || kindRaw === "read_only") {
 		out.kind = "recon";
@@ -197,6 +199,7 @@ export function parseCard(path: string, id: string, text: string): ParsedCard {
 		...(fm.reviewerAgent ? { reviewerAgent: fm.reviewerAgent } : {}),
 		...(fm.reviewerModel ? { reviewerModel: fm.reviewerModel } : {}),
 		...(fm.reviewerThinking ? { reviewerThinking: fm.reviewerThinking } : {}),
+		...(fm.gates ? { gates: fm.gates } : {}),
 		state: parseState(source),
 		evidence: parseEvidence(source),
 	};

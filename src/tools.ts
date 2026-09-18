@@ -34,6 +34,7 @@ interface WorkProgramParams {
 	reviewerModel?: string;
 	reviewerThinking?: string;
 	reviewerResume?: boolean;
+	runTimeoutMs?: number;
 	atlasEnabled?: boolean;
 	atlasAgent?: string;
 	atlasModel?: string;
@@ -166,6 +167,9 @@ export function registerTools(pi: ExtensionAPI, controller: WorkProgramControlle
 			reviewerResume: Type.Optional(
 				Type.Boolean({ description: "config: resume the same reviewer across a card's review cycles (default true); false = fresh reviewer every cycle" }),
 			),
+			runTimeoutMs: Type.Optional(
+				Type.Number({ description: "config: wall-clock timeout per run in ms (default 4h; pi-subagents kills runs at 30m otherwise)" }),
+			),
 			atlasEnabled: Type.Optional(
 				Type.Boolean({ description: "config: build/maintain the program atlas (scout exploration) and inject it into worker/reviewer briefs" }),
 			),
@@ -286,6 +290,7 @@ export function registerTools(pi: ExtensionAPI, controller: WorkProgramControlle
 					if (params.reviewerModel !== undefined) patch.reviewerModel = params.reviewerModel;
 					if (params.reviewerThinking !== undefined) patch.reviewerThinking = params.reviewerThinking;
 					if (params.reviewerResume !== undefined) patch.reviewerResume = params.reviewerResume;
+					if (params.runTimeoutMs !== undefined) patch.runTimeoutMs = params.runTimeoutMs;
 					if (params.atlasEnabled !== undefined) patch.atlasEnabled = params.atlasEnabled;
 					if (params.atlasAgent !== undefined) patch.atlasAgent = params.atlasAgent;
 					if (params.atlasModel !== undefined) patch.atlasModel = params.atlasModel;

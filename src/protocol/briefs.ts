@@ -38,6 +38,10 @@ export function workerBrief(input: {
 			? input.gates.map((gate) => `   - \`${gate}\``).join("\n")
 			: "   - (no gates configured; run whatever the card's `Done when` requires)";
 	const atlas = atlasNote(input.atlasPath);
+	const gateRule =
+		input.gates.length > 0
+			? `3. Quality gates run ONCE, at the end of your work for this card — never mid-card. During implementation use fast scoped checks only (the touched test file, the affected package). When the card is complete, run the card gate commands from the working directory exactly once:\n${gateLines}\n   The harness re-runs these gates authoritatively after handoff; cite your scoped checks in Evidence, the harness's gate lines are the record.`
+			: "3. No gates configured — run whatever the card's `Done when` requires, once, at the end of your work.";
 	return [
 		`You are implementing one card of the work program "${ledger.title}" (${ledger.slug}).`,
 		"",
@@ -54,7 +58,7 @@ export function workerBrief(input: {
 		"Hard rules:",
 		"1. Implement exactly the card's scope. No unrelated changes, no drive-by refactors.",
 		"2. Complete, production-quality work: no demos, no half-done paths, tests where the repository tests.",
-		`3. Run the card gate commands from the working directory:\n${gateLines}`,
+		gateRule,
 		"4. Append a `## Evidence` section to the card with the EXACT command output and the commit SHA(s) you produced. Never claim a result without output.",
 		"5. Set the card's `State: review`. Never write `State: done`; review is a separate pass.",
 		`6. Commit only your own files with message: \`wp(${ledger.slug}): ${card.id} ${oneLine(card.title, 60)}\`.`,
@@ -112,6 +116,9 @@ export function reviewTask(input: {
 		"",
 		"Harness gate results:",
 		gates,
+		...(input.gates.length > 0
+			? ["(the harness ran these gates authoritatively — do NOT re-run test suites or typechecks; review the code)"]
+			: []),
 		"",
 		"Worker summary:",
 		truncateTail(input.workerSummary.trim(), 6_000) || "(no summary returned)",
@@ -196,7 +203,7 @@ export function captainBrief(input: {
 		"",
 		"Authorized loop:",
 		"1. Dispatch a fresh worker (subagent tool, agent \"worker\", context fresh) with the exact card scope; it must produce a commit and Evidence.",
-		"2. Dispatch a fresh, read-only reviewer (agent \"reviewer\", context fresh) over the lane diff; write its findings to the review output path.",
+		"2. Dispatch a fresh, read-only reviewer (agent \"work-program-reviewer\", context fresh) over the lane diff; write its findings to the review output path.",
 		"3. Triage each finding: approve, reject, or defer it. Approved findings go back to the SAME worker (resume it when possible).",
 		"4. On later review cycles, RESUME the same reviewer with just the fix delta (commits since its last review + the approved-findings list); fall back to a fresh reviewer only if resume is unavailable.",
 		"5. Repeat at most " + (input.maxCycles ?? input.ledger.maxCycles) + " review cycles, then stop and report a blocker.",
@@ -206,6 +213,7 @@ export function captainBrief(input: {
 		"- You own this card only. Never edit plan.md or progress.md.",
 		"- Review is mandatory and must be a separate, read-only reviewer pass (never your own implementation eyes). One reviewer session per card, resumed across its cycles.",
 		"- The card's `State` must be `review` while work is pending; the harness sets `done` after accepting the card.",
+		"- Workers under you run fast scoped checks during work; the full card gates run once at handoff, never mid-card.",
 		"- If a product or plan decision is needed, use contact_supervisor and wait.",
 		`Operator todos: ${operatorTodoRule(input.repoRoot, ledger.slug, card.id)}`,
 		"",
@@ -315,7 +323,7 @@ export function scoutBrief(input: {
 		"Required sections:",
 		"## Architecture — how the repo fits together: apps/packages, entry points, data flow. 10-20 lines.",
 		"## Module map — for each area the cards touch: path → what it owns, its contract, key symbols (names, not snippets).",
-		"## Conventions — how this repo does things: error handling, testing pattern, naming, build/gate commands.",
+		"## Conventions — how this repo does things: error handling, testing pattern, naming, build/gate commands. Name the FAST scoped check (single-file or single-package test, incremental typecheck) separately from the FULL gate commands — workers need both.",
 		"## Integration points — where each card's work plugs in; cross-card dependencies (which card's output another card consumes).",
 		"## Negative knowledge — dead ends, files that LOOK relevant but aren't, traps (generated files, required codegen, flaky commands).",
 		"## Per-card pointers — for every card: the 3-8 files it will touch or must read first, one line each on why.",
@@ -406,15 +414,19 @@ export function reReviewBrief(input: {
 		"",
 		"Harness gate results:",
 		gates,
+		...(input.gates.length > 0
+			? ["(the harness ran these gates authoritatively — do NOT re-run test suites or typechecks; review the code)"]
+			: []),
 		"",
 		...(atlasNote(input.atlasPath) ? [atlasNote(input.atlasPath), ""] : []),
 		"Re-review scope:",
 		"1. Verify each approved finding is correctly addressed — say so explicitly, per finding.",
 		"2. Review the fix commits themselves for new issues, with the same standards as your first pass.",
 		"3. Regression-scan the areas your earlier findings touched. Do NOT re-audit the whole card surface.",
+		"4. Run the card gates yourself, now, at the end (commands above) — the harness results above are informational and may be stale.",
 		"",
 		`Write your findings to this exact path as well as your final reply: ${input.reviewPath}`,
 		"",
-		"Return findings as markdown. This is a read-only review: do not modify repository files. Keep your final reply under 60 lines; the complete findings live in the review file.",
+		"Return findings as markdown. This is a read-only review: do not modify repository files (gate/test caches are fine). Keep your final reply under 60 lines; the complete findings live in the review file.",
 	].join("\n");
 }

@@ -33,6 +33,11 @@ interface WorkProgramParams {
 	reviewerAgent?: string;
 	reviewerModel?: string;
 	reviewerThinking?: string;
+	reviewerResume?: boolean;
+	atlasEnabled?: boolean;
+	atlasAgent?: string;
+	atlasModel?: string;
+	atlasThinking?: string;
 	id?: string;
 	body?: string;
 	steps?: Array<{ text: string; command?: string; dangerous?: boolean }>;
@@ -122,7 +127,7 @@ export function registerTools(pi: ExtensionAPI, controller: WorkProgramControlle
 			"finalize_plan only validates and stages a program — it never starts execution. After writing a plan, STOP and wait for the operator to review; only call resume/start/dispatch after the operator explicitly says to start.",
 			"When a work program completes, you receive a summary packet: reply with a completion summary, then ask whether to close the program. Only call close with remove:true after the operator explicitly confirms — never delete program records unprompted.",
 			"Pause is soft by default (in-flight runs finish, resume reconciles); pass hard:true to stop runs immediately and rearm their cards. Resume restarts the drive.",
-			"The program is retunable while it runs: work_program({ action: \"config\", maxCycles, onExhausted, reviewProfile, maxParallel, parallelExecution, workerAgent, workerModel, workerThinking, reviewerAgent, reviewerModel, reviewerThinking }) updates the live ledger and persists into plan.md front matter, so it survives sync and reload. Use it instead of answering cycle decisions one by one (onExhausted: \"accept\" also resolves the open ones), and instead of editing plan.md by hand.",
+			"The program is retunable while it runs: work_program({ action: \"config\", maxCycles, onExhausted, reviewProfile, maxParallel, parallelExecution, workerAgent, workerModel, workerThinking, reviewerAgent, reviewerModel, reviewerThinking, reviewerResume, atlasEnabled, atlasAgent, atlasModel, atlasThinking }) updates the live ledger and persists into plan.md front matter, so it survives sync and reload. Use it instead of answering cycle decisions one by one (onExhausted: \"accept\" also resolves the open ones), and instead of editing plan.md by hand.",
 			"Retune one card the same way with card set: work_program({ action: \"config\", card: \"05\", maxCycles: 5, reviewProfile: \"enhanced\" }) updates the live ledger row and persists into that card file's front matter. Card models work the same way (workerModel, reviewerModel, thinking); pass an empty string to clear a card override so it inherits the program default. Never hand-edit card front matter — always use config with card.",
 			"When a work-program decision packet arrives, answer with the exact work_program call it names (for review triage use action 'triage' with one verdict per finding).",
 			"Operator todos are chat-driven: list with todos, create with todo_add (blocking parks the card until resolved), rewrite with todo_update (title, body, steps), resolve with todo_done (the card resumes on its own) or todo_drop. Present open todos conversationally (title, why, exact steps/commands) instead of quoting storage. Never write or edit .operator/todos.json or .operator/todo.md directly — always use the todo actions.",
@@ -158,6 +163,15 @@ export function registerTools(pi: ExtensionAPI, controller: WorkProgramControlle
 			reviewerAgent: Type.Optional(Type.String({ description: "config: reviewer subagent (program-level, or per-card with card set)" })),
 			reviewerModel: Type.Optional(Type.String({ description: "config: model for reviewer runs (empty string clears a card override)" })),
 			reviewerThinking: Type.Optional(Type.String({ description: "config: thinking level for reviewer runs (empty string clears a card override)" })),
+			reviewerResume: Type.Optional(
+				Type.Boolean({ description: "config: resume the same reviewer across a card's review cycles (default true); false = fresh reviewer every cycle" }),
+			),
+			atlasEnabled: Type.Optional(
+				Type.Boolean({ description: "config: build/maintain the program atlas (scout exploration) and inject it into worker/reviewer briefs" }),
+			),
+			atlasAgent: Type.Optional(Type.String({ description: "config: scout subagent for atlas builds/refreshes (default \"scout\")" })),
+			atlasModel: Type.Optional(Type.String({ description: "config: model for atlas scout runs (empty string clears)" })),
+			atlasThinking: Type.Optional(Type.String({ description: "config: thinking level for atlas scout runs (empty string clears)" })),
 			id: Type.Optional(Type.String({ description: "todo id (op-NN) for todo_update/todo_done/todo_drop" })),
 			body: Type.Optional(Type.String({ description: "todo_add/todo_update: why, context, details" })),
 			steps: Type.Optional(
@@ -271,6 +285,11 @@ export function registerTools(pi: ExtensionAPI, controller: WorkProgramControlle
 					if (params.reviewerAgent !== undefined) patch.reviewerAgent = params.reviewerAgent;
 					if (params.reviewerModel !== undefined) patch.reviewerModel = params.reviewerModel;
 					if (params.reviewerThinking !== undefined) patch.reviewerThinking = params.reviewerThinking;
+					if (params.reviewerResume !== undefined) patch.reviewerResume = params.reviewerResume;
+					if (params.atlasEnabled !== undefined) patch.atlasEnabled = params.atlasEnabled;
+					if (params.atlasAgent !== undefined) patch.atlasAgent = params.atlasAgent;
+					if (params.atlasModel !== undefined) patch.atlasModel = params.atlasModel;
+					if (params.atlasThinking !== undefined) patch.atlasThinking = params.atlasThinking;
 					const result = await controller.setConfig(patch as Parameters<typeof controller.setConfig>[0]);
 					if (!result.ok) fail(result.text);
 					return textResult(result.text, { ok: true });

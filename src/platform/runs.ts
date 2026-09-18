@@ -3,7 +3,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { RPC_TIMEOUT_MS, SUBAGENT_RPC_READY_EVENT, SUBAGENT_RPC_REPLY_EVENT_PREFIX, SUBAGENT_RPC_REQUEST_EVENT, SUBAGENT_RPC_VERSION, STATUS_TIMEOUT_MS } from "../constants.ts";
-import type { DispatchRequest, DispatchResult, RunHeartbeat, RunOps, RunStatus } from "../shared/types.ts";
+import type { DispatchRequest, DispatchResult, RunHeartbeat, RunOps, RunStatus, RunUsage } from "../shared/types.ts";
 
 interface RpcEnvelope {
 	version: number;
@@ -234,7 +234,13 @@ export class SubagentsRpc implements RunOps {
 		const output = extractOutput(result) ?? extractStatusOutput(status);
 		const structured = asRecord(result?.structuredOutput) ?? extractStepsStructured(result);
 		const error = typeof status.error === "string" ? status.error : typeof result?.error === "string" ? result.error : undefined;
-		const mapped: RunStatus = { state, ...(output !== undefined ? { output } : {}), ...(structured !== undefined ? { structured } : {}) };
+		const usage = usageFromStatus(status);
+		const mapped: RunStatus = {
+			state,
+			...(output !== undefined ? { output } : {}),
+			...(structured !== undefined ? { structured } : {}),
+			...(usage !== undefined ? { usage } : {}),
+		};
 		if (error) mapped.error = error;
 		return mapped;
 	}
@@ -254,6 +260,28 @@ export class SubagentsRpc implements RunOps {
 		}
 		return undefined;
 	}
+}
+
+/**
+ * Token/cost usage from a run's status.json (`totalTokens`/`totalCost`/
+ * `turnCount`/`toolCount` as written by pi-subagents). Returns undefined when
+ * the run recorded nothing usable, so callers can skip empty records.
+ */
+export function usageFromStatus(status: Record<string, unknown>): RunUsage | undefined {
+	const tokens = asRecord(status.totalTokens);
+	const cost = asRecord(status.totalCost);
+	const input = typeof tokens?.input === "number" ? tokens.input : typeof cost?.inputTokens === "number" ? cost.inputTokens : 0;
+	const output =
+		typeof tokens?.output === "number" ? tokens.output : typeof cost?.outputTokens === "number" ? cost.outputTokens : 0;
+	const total = typeof tokens?.total === "number" ? tokens.total : input + output;
+	if (total <= 0 && input <= 0 && output <= 0) return undefined;
+	const usage: RunUsage = { input, output, total };
+	if (typeof tokens?.windowPeak === "number") usage.windowPeak = tokens.windowPeak;
+	else if (typeof tokens?.window === "number") usage.windowPeak = tokens.window;
+	if (typeof cost?.costUsd === "number") usage.costUsd = cost.costUsd;
+	if (typeof status.turnCount === "number") usage.turns = status.turnCount;
+	if (typeof status.toolCount === "number") usage.tools = status.toolCount;
+	return usage;
 }
 
 function snapshotFromStatus(runId: string, status: Record<string, unknown>): RunHeartbeat {

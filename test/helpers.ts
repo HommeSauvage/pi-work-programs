@@ -17,6 +17,7 @@ import type {
 	RunHeartbeat,
 	RunOps,
 	RunStatus,
+	RunUsage,
 	WorkProgramSettings,
 } from "../src/shared/types.ts";
 
@@ -111,6 +112,9 @@ export class FakeGit implements GitOps {
 export interface FakeState {
 	files: Map<string, string>;
 	dispatched: Array<{ runId: string; request: DispatchRequest }>;
+	/** Scout dispatches are tracked separately: the fake auto-completes them and
+	 *  writes atlas.md, so card dispatch assertions stay on `dispatched`. */
+	scoutRuns: Array<{ runId: string; request: DispatchRequest }>;
 	resumed: Array<{ target: string; runId: string; message: string }>;
 	stopped: string[];
 	statuses: Map<string, RunStatus>;
@@ -118,6 +122,13 @@ export interface FakeState {
 	asked: string[];
 	gateResults: Map<string, GateResult[]>;
 	notifications: string[];
+	/** Scout behavior for auto-dispatched atlas runs: complete (default) writes
+	 *  atlas.md and lands terminal; hang stays running (gates workers); fail lands failed. */
+	scoutMode: "complete" | "hang" | "fail";
+	/** When true, runs.resume throws (exercises fresh-dispatch fallbacks). */
+	throwOnResume: boolean;
+	/** When true, runs.dispatch throws (exercises dispatch-failure fallbacks). */
+	throwOnDispatch: boolean;
 	/** Drives DriverPorts.sessionIdle in tests. */
 	sessionIdle: boolean;
 }
@@ -128,7 +139,7 @@ export interface TestHost {
 	git: FakeGit;
 	ledger: ProgramLedger;
 	/** Complete a run with an output payload. */
-	completeRun(runId: string, payload?: { output?: string; structured?: unknown }): void;
+	completeRun(runId: string, payload?: { output?: string; structured?: unknown; usage?: RunUsage }): void;
 	failRun(runId: string, error?: string): void;
 	lastRunId(): string;
 }
@@ -194,10 +205,18 @@ export function createTestHost(input: {
 	mode?: "session" | "managed" | "captain";
 	maxParallel?: number;
 	parallelExecution?: "worktrees" | "direct";
+	/** Set false to disable the program atlas (default: on, matching production).
+	 *  The fake auto-completes scout runs instantly, so one drive() still lands
+	 *  worker dispatches; scout runs are recorded separately in fake.scoutRuns. */
+	atlas?: boolean;
+	/** Set false to force fresh reviewers per cycle (default: resume, matching production). */
+	reviewerResume?: boolean;
 }): TestHost {
 	const settings: WorkProgramSettings = applyOverrides(
 		{
 			...DEFAULT_SETTINGS,
+			review: { ...DEFAULT_SETTINGS.review, resumeReviewer: input.reviewerResume ?? DEFAULT_SETTINGS.review.resumeReviewer ?? true },
+			atlas: { enabled: input.atlas ?? DEFAULT_SETTINGS.atlas?.enabled ?? true, agent: "scout" },
 			gates: {
 				card: input.gates?.card ?? DEFAULT_SETTINGS.gates.card,
 				program: input.gates?.program ?? DEFAULT_SETTINGS.gates.program,
@@ -249,6 +268,7 @@ export function createTestHost(input: {
 	const fake: FakeState = {
 		files,
 		dispatched: [],
+		scoutRuns: [],
 		resumed: [],
 		stopped: [],
 		statuses: new Map(),
@@ -256,6 +276,9 @@ export function createTestHost(input: {
 		asked: [],
 		gateResults: new Map(),
 		notifications: [],
+		scoutMode: "complete",
+		throwOnResume: false,
+		throwOnDispatch: false,
 		sessionIdle: true,
 	};
 	const git = new FakeGit();
@@ -282,16 +305,49 @@ export function createTestHost(input: {
 	const runs: RunOps = {
 		available: () => true,
 		dispatch: async (request: DispatchRequest): Promise<DispatchResult> => {
+			if (fake.throwOnDispatch) throw new Error("dispatch unavailable");
 			runCounter += 1;
 			const runId = `run-${runCounter}`;
+			// Scout runs auto-complete: write atlas.md and land terminal in the same
+			// instant, so the drive's drain loop reaches card dispatches in one call.
+			if (request.kind === "scout") {
+				fake.scoutRuns.push({ runId, request });
+				if (fake.scoutMode === "hang") {
+					fake.statuses.set(runId, { state: "running" });
+				} else if (fake.scoutMode === "fail") {
+					fake.statuses.set(runId, { state: "failed", error: "scout exploded" });
+				} else {
+					const atlasFile = join(programDir, "atlas.md");
+					if (!(fake.files.get(atlasFile) ?? "").trim()) {
+						fake.files.set(atlasFile, "# Atlas\n\n## Architecture\n\ntest atlas\n");
+					}
+					fake.statuses.set(runId, {
+						state: "complete",
+						output: "atlas ready",
+						usage: { input: 2_000, output: 500, total: 12_000, windowPeak: 30_000, turns: 8, tools: 12, costUsd: 0.01 },
+					});
+				}
+				return { runId };
+			}
 			fake.dispatched.push({ runId, request });
 			fake.statuses.set(runId, { state: "running" });
 			return { runId };
 		},
 		resume: async (target: string, message: string): Promise<DispatchResult> => {
+			if (fake.throwOnResume) throw new Error("resume unavailable");
 			runCounter += 1;
 			const runId = `run-${runCounter}`;
 			fake.resumed.push({ target, runId, message });
+			// Resuming a scout (atlas refresh) auto-completes like a fresh scout run.
+			if (fake.scoutRuns.some((run) => run.runId === target)) {
+				fake.scoutRuns.push({ runId, request: { kind: "scout", agent: "scout", task: message, cwd: "/repo", label: "resume" } });
+				fake.statuses.set(runId, {
+					state: "complete",
+					output: "atlas refreshed",
+					usage: { input: 800, output: 200, total: 4_000, turns: 3, tools: 4, costUsd: 0.004 },
+				});
+				return { runId };
+			}
 			fake.statuses.set(runId, { state: "running" });
 			fake.dispatched.push({ runId, request: { kind: "fix", agent: "worker", task: message, cwd: "/repo", label: "resume" } });
 			return { runId };
@@ -361,6 +417,7 @@ export function createTestHost(input: {
 				state: "complete",
 				...(payload?.output !== undefined ? { output: payload.output } : {}),
 				...(payload?.structured !== undefined ? { structured: payload.structured } : {}),
+				...(payload?.usage !== undefined ? { usage: payload.usage } : {}),
 			});
 		},
 		failRun: (runId, error) => {

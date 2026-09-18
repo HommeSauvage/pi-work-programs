@@ -8,6 +8,19 @@ function cardLabel(ledger: ProgramLedger, card: CardLedger): string {
 	return `Card ${card.id} — ${card.title} (${ledger.slug})`;
 }
 
+/**
+ * Standard atlas pointer injected into worker/reviewer/captain/reconciler briefs.
+ * Orientation, not a boundary: agents verify before relying on it and may
+ * explore freely beyond it (prevents both re-exploration and tunnel vision).
+ */
+export function atlasNote(atlasPath: string | undefined): string {
+	if (!atlasPath) return "";
+	return [
+		`Program atlas: ${atlasPath} — read it FIRST for orientation: architecture, module map, and a per-card section naming the files this card touches.`,
+		"It is orientation, not a boundary: verify paths before relying on them, explore beyond it whenever the task requires, and where it disagrees with the code, trust the code. If the file is missing, ignore this and explore as usual.",
+	].join("\n");
+}
+
 export function workerBrief(input: {
 	ledger: ProgramLedger;
 	card: CardLedger;
@@ -17,12 +30,14 @@ export function workerBrief(input: {
 	gates: string[];
 	reviewCwdNote?: string;
 	repoRoot: string;
+	atlasPath?: string;
 }): string {
 	const { ledger, card } = input;
 	const gateLines =
 		input.gates.length > 0
 			? input.gates.map((gate) => `   - \`${gate}\``).join("\n")
 			: "   - (no gates configured; run whatever the card's `Done when` requires)";
+	const atlas = atlasNote(input.atlasPath);
 	return [
 		`You are implementing one card of the work program "${ledger.title}" (${ledger.slug}).`,
 		"",
@@ -34,6 +49,7 @@ export function workerBrief(input: {
 		"Commit only code changes in your working directory; never commit the program records from a lane.",
 		"",
 		"Read the card fully first, then the plan sections that concern it.",
+		...(atlas ? [atlas] : []),
 		"",
 		"Hard rules:",
 		"1. Implement exactly the card's scope. No unrelated changes, no drive-by refactors.",
@@ -46,7 +62,7 @@ export function workerBrief(input: {
 		"8. If blocked, or if a plan decision is wrong, stop and ask via contact_supervisor instead of guessing.",
 		`Operator todos: ${operatorTodoRule(input.repoRoot, ledger.slug, card.id)}`,
 		"",
-		"When finished, reply with a short summary: what changed, files touched, gate results, commit SHA, and anything the reviewer should look at.",
+		"When finished, reply with a summary of AT MOST 40 lines: what changed, files touched, gate results, commit SHA, and anything the reviewer should look at. The full detail belongs in the card's Evidence section, not in your reply.",
 	].join("\n");
 }
 
@@ -65,6 +81,7 @@ export function reviewTask(input: {
 	changedFiles: string[];
 	workerSummary: string;
 	gates: GateResult[];
+	atlasPath?: string;
 }): string {
 	const { ledger, card, profile } = input;
 	const template = input.resources.reviews[profile] ?? input.resources.reviews.light ?? "";
@@ -99,9 +116,10 @@ export function reviewTask(input: {
 		"Worker summary:",
 		truncateTail(input.workerSummary.trim(), 6_000) || "(no summary returned)",
 		"",
+		...(atlasNote(input.atlasPath) ? [atlasNote(input.atlasPath), ""] : []),
 		`Write your findings to this exact path as well as your final reply: ${input.reviewPath}`,
 		"",
-		"Return findings as markdown. This is a read-only review: do not modify repository files.",
+		"Return findings as markdown. This is a read-only review: do not modify repository files. Keep your final reply under 60 lines; the complete findings live in the review file.",
 	].join("\n");
 	const prompt = template
 		.replace("[card name/path]", cardLabel(ledger, card))
@@ -147,7 +165,7 @@ export function fixBrief(input: {
 		"- If an approved finding is wrong or conflicts with the plan, stop and ask via contact_supervisor instead of inventing scope.",
 		`Operator todos: ${operatorTodoRule(input.repoRoot, input.ledger.slug, input.card.id)}`,
 		"",
-		"Reply with what you changed per finding and the new commit SHA(s).",
+		"Reply with what you changed per finding and the new commit SHA(s) — at most 40 lines.",
 	].join("\n");
 }
 
@@ -162,6 +180,7 @@ export function captainBrief(input: {
 	reviewPath: string;
 	repoRoot: string;
 	maxCycles?: number;
+	atlasPath?: string;
 }): string {
 	const { ledger, card } = input;
 	const gates = input.gates.length > 0 ? input.gates.map((gate) => `\`${gate}\``).join(", ") : "(none configured)";
@@ -173,17 +192,19 @@ export function captainBrief(input: {
 		`Working directory (lane): ${input.cwd}`,
 		`Review profile: ${input.reviewProfile}`,
 		`Review output path: ${input.reviewPath}`,
+		...(atlasNote(input.atlasPath) ? ["", atlasNote(input.atlasPath)] : []),
 		"",
 		"Authorized loop:",
 		"1. Dispatch a fresh worker (subagent tool, agent \"worker\", context fresh) with the exact card scope; it must produce a commit and Evidence.",
 		"2. Dispatch a fresh, read-only reviewer (agent \"reviewer\", context fresh) over the lane diff; write its findings to the review output path.",
 		"3. Triage each finding: approve, reject, or defer it. Approved findings go back to the SAME worker (resume it when possible).",
-		"4. Repeat at most " + (input.maxCycles ?? input.ledger.maxCycles) + " review cycles, then stop and report a blocker.",
-		`5. Run the card gates (${gates}); the gate result is authoritative.`,
+		"4. On later review cycles, RESUME the same reviewer with just the fix delta (commits since its last review + the approved-findings list); fall back to a fresh reviewer only if resume is unavailable.",
+		"5. Repeat at most " + (input.maxCycles ?? input.ledger.maxCycles) + " review cycles, then stop and report a blocker.",
+		`6. Run the card gates (${gates}); the gate result is authoritative.`,
 		"",
 		"Hard rules:",
 		"- You own this card only. Never edit plan.md or progress.md.",
-		"- Review is mandatory and must be a separate fresh read-only pass. Never approve your own implementation work.",
+		"- Review is mandatory and must be a separate, read-only reviewer pass (never your own implementation eyes). One reviewer session per card, resumed across its cycles.",
 		"- The card's `State` must be `review` while work is pending; the harness sets `done` after accepting the card.",
 		"- If a product or plan decision is needed, use contact_supervisor and wait.",
 		`Operator todos: ${operatorTodoRule(input.repoRoot, ledger.slug, card.id)}`,
@@ -241,6 +262,7 @@ export function reconcilerBrief(input: {
 	incomingIntent: string;
 	existingIntent: string;
 	gateCommands: string[];
+	atlasPath?: string;
 }): string {
 	const gates = input.gateCommands.length > 0 ? input.gateCommands.map((gate) => `\`${gate}\``).join(", ") : "(none)";
 	return [
@@ -249,6 +271,7 @@ export function reconcilerBrief(input: {
 		`Repository: ${input.cwd}`,
 		`Merging lane branch \`${input.branch}\` into the program branch.`,
 		`Conflicted paths: ${input.conflicted.join(", ") || "(unknown)"}`,
+		...(atlasNote(input.atlasPath) ? ["", atlasNote(input.atlasPath)] : []),
 		"",
 		"Merge state (conflict markers are in the working tree):",
 		"```",
@@ -266,5 +289,132 @@ export function reconcilerBrief(input: {
 		`- Resolve the conflicts, run the card gates (${gates}), and complete the merge commit.`,
 		"- If a resolution would change a card's contract or drop required behavior, stop and explain instead of guessing.",
 		"- Do not touch other cards' files.",
+	].join("\n");
+}
+
+export function scoutBrief(input: {
+	ledger: ProgramLedger;
+	planPath: string;
+	tasksDir: string;
+	atlasPath: string;
+	cwd: string;
+	cardCount: number;
+}): string {
+	const { ledger } = input;
+	return [
+		`You are the context scout for the work program "${ledger.title}" (${ledger.slug}). Produce the program atlas: a durable orientation document that lets fresh worker and reviewer agents execute each card WITHOUT re-exploring the codebase from scratch.`,
+		"",
+		"Read first:",
+		`- Program plan: ${input.planPath}`,
+		`- Every card file in ${input.tasksDir}/ (${input.cardCount} cards)`,
+		"",
+		`Then explore the repository at ${input.cwd} as deeply as the cards require.`,
+		"",
+		`Write exactly one file: ${input.atlasPath}`,
+		"",
+		"Required sections:",
+		"## Architecture — how the repo fits together: apps/packages, entry points, data flow. 10-20 lines.",
+		"## Module map — for each area the cards touch: path → what it owns, its contract, key symbols (names, not snippets).",
+		"## Conventions — how this repo does things: error handling, testing pattern, naming, build/gate commands.",
+		"## Integration points — where each card's work plugs in; cross-card dependencies (which card's output another card consumes).",
+		"## Negative knowledge — dead ends, files that LOOK relevant but aren't, traps (generated files, required codegen, flaky commands).",
+		"## Per-card pointers — for every card: the 3-8 files it will touch or must read first, one line each on why.",
+		"",
+		"Rules:",
+		"- Write for an agent that has never seen this repo. Dense prose with path:symbol references; no code dumps.",
+		"- Hard cap 12,000 characters. Density beats completeness — omit anything no card needs.",
+		"- Verify every path and symbol you list actually exists (a wrong pointer is worse than none).",
+			`- Read-only otherwise: do not create or modify any file except ${input.atlasPath}.`,
+		"",
+		"Reply with at most 10 lines: what you covered, what you deliberately omitted.",
+	].join("\n");
+}
+
+export function scoutRefreshBrief(input: {
+	ledger: ProgramLedger;
+	atlasPath: string;
+	cwd: string;
+	merged: Array<{ id: string; title: string; commit?: string }>;
+	fresh: boolean;
+}): string {
+	const { ledger } = input;
+	const lines = input.merged.map(
+		(card) => `- Card ${card.id} — ${card.title}${card.commit ? ` (merge/record commit ${card.commit.slice(0, 12)})` : ""}`,
+	);
+	return [
+		...(input.fresh
+			? [
+					`You are the context scout for the work program "${ledger.title}" (${ledger.slug}). An atlas already exists at ${input.atlasPath} from a previous scout — read it first; it is your starting point, not something to rebuild.`,
+					"",
+				]
+			: []),
+		`Since the atlas was last updated, these cards of "${ledger.title}" (${ledger.slug}) landed in the program branch at ${input.cwd}:`,
+		"",
+		...lines,
+		"",
+		`Each card file lives under ${ledger.dir}/${ledger.slug}/tasks/ and its ## Evidence section names its commits; you can also find them with \`git log --grep="wp(${ledger.slug}) <id>"\`. Inspect the merged changes as needed.`,
+		"",
+		`Update ${input.atlasPath} where these changes outdated it: module map entries, integration points, conventions, negative knowledge, and the per-card pointers of UPCOMING cards (a card that just landed needs no pointer; cards building on it do).`,
+		"",
+		"Rules:",
+		"- Keep the 12,000-character cap and the section structure. Update in place; do not rewrite wholesale.",
+		"- Verify before writing: if a merge renamed/moved something the atlas references, fix the reference.",
+		`- Read-only otherwise: do not create or modify any file except ${input.atlasPath}.`,
+		"",
+		"Reply with at most 5 lines: sections updated, or \"no change\".",
+	].join("\n");
+}
+
+export function reReviewBrief(input: {
+	ledger: ProgramLedger;
+	card: CardLedger;
+	cycle: number;
+	previousReviewPath: string;
+	reviewPath: string;
+	sinceSha: string;
+	fixLog: string;
+	fixStat: string;
+	approved: FindingVerdict[];
+	gates: GateResult[];
+	atlasPath?: string;
+}): string {
+	const { ledger, card } = input;
+	const approved =
+		input.approved.length === 0
+			? "- (none recorded — evaluate the fix commits on their own merits)"
+			: input.approved.map((item, index) => `${index + 1}. ${item.finding}${item.note ? `\n   → ${item.note}` : ""}`).join("\n");
+	const gates = input.gates.length
+		? input.gates.map((gate) => `- ${gate.command} → exit ${gate.code}`).join("\n")
+		: "- (none configured)";
+	return [
+		`You are re-reviewing ${cardLabel(ledger, card)} — review cycle ${input.cycle}. You reviewed this card before; your cycle-${input.cycle - 1} findings are at ${input.previousReviewPath}.`,
+		"",
+		`The operator triaged that review and the worker applied fix commits. Everything since your last review (${input.sinceSha.slice(0, 12)}..HEAD):`,
+		"",
+		"Fix commits:",
+		"```",
+		truncateTail(input.fixLog.trim(), 2_000) || "(none)",
+		"```",
+		"",
+		"Diffstat of the fix range:",
+		"```",
+		truncateTail(input.fixStat.trim(), 4_000) || "(none)",
+		"```",
+		"",
+		"Approved findings the fixes must address:",
+		approved,
+		"",
+		"Harness gate results:",
+		gates,
+		"",
+		...(atlasNote(input.atlasPath) ? [atlasNote(input.atlasPath), ""] : []),
+		"Re-review scope:",
+		"1. Verify each approved finding is correctly addressed — say so explicitly, per finding.",
+		"2. Review the fix commits themselves for new issues, with the same standards as your first pass.",
+		"3. Regression-scan the areas your earlier findings touched. Do NOT re-audit the whole card surface.",
+		"",
+		`Write your findings to this exact path as well as your final reply: ${input.reviewPath}`,
+		"",
+		"Return findings as markdown. This is a read-only review: do not modify repository files. Keep your final reply under 60 lines; the complete findings live in the review file.",
 	].join("\n");
 }

@@ -16,9 +16,10 @@ export const DEFAULT_SETTINGS: WorkProgramSettings = {
 	mode: "managed",
 	maxParallel: 2,
 	parallelExecution: "worktrees",
-	review: { agent: "reviewer", profile: "light", maxCycles: 3, onExhausted: "ask" },
+	review: { agent: "reviewer", profile: "light", maxCycles: 3, onExhausted: "ask", resumeReviewer: true },
 	worker: { agent: "worker" },
 	reviewer: {},
+	atlas: { enabled: true, agent: "scout" },
 	gates: { card: [], program: [] },
 	laneBranchPattern: "{branch}-card-{id}",
 };
@@ -54,6 +55,12 @@ export function normalizeSettings(raw: unknown, base: WorkProgramSettings = DEFA
 		review: { ...base.review },
 		worker: { ...base.worker },
 		reviewer: { ...base.reviewer },
+		atlas: {
+			enabled: base.atlas?.enabled ?? true,
+			agent: base.atlas?.agent ?? "scout",
+			...(base.atlas?.model ? { model: base.atlas.model } : {}),
+			...(base.atlas?.thinking ? { thinking: base.atlas.thinking } : {}),
+		},
 		gates: { card: [...base.gates.card], program: [...base.gates.program] },
 	};
 	const dir = asString(raw.dir);
@@ -76,6 +83,7 @@ export function normalizeSettings(raw: unknown, base: WorkProgramSettings = DEFA
 		if (onExhausted === "ask" || onExhausted === "accept" || onExhausted === "block") {
 			settings.review.onExhausted = onExhausted;
 		}
+		if (typeof review.resumeReviewer === "boolean") settings.review.resumeReviewer = review.resumeReviewer;
 	}
 
 	const worker = isRecord(raw.worker) ? raw.worker : undefined;
@@ -102,6 +110,17 @@ export function normalizeSettings(raw: unknown, base: WorkProgramSettings = DEFA
 		if (card) settings.gates.card = card;
 		const program = parseStringArray(gates.program);
 		if (program) settings.gates.program = program;
+	}
+
+	const atlas = isRecord(raw.atlas) ? raw.atlas : undefined;
+	if (atlas) {
+		if (typeof atlas.enabled === "boolean") settings.atlas!.enabled = atlas.enabled;
+		const agent = asString(atlas.agent);
+		if (agent) settings.atlas!.agent = agent;
+		const model = asString(atlas.model);
+		if (model) settings.atlas!.model = model;
+		const thinking = asString(atlas.thinking);
+		if (thinking) settings.atlas!.thinking = thinking;
 	}
 
 	return settings;
@@ -180,6 +199,7 @@ export function applyOverrides(
 			profile: overrides.reviewProfile ?? settings.review.profile,
 			maxCycles: overrides.maxCycles ?? settings.review.maxCycles,
 			onExhausted: settings.review.onExhausted,
+			resumeReviewer: overrides.reviewerResume ?? settings.review.resumeReviewer,
 		},
 		worker: {
 			agent: overrides.workerAgent ?? settings.worker.agent,
@@ -193,6 +213,12 @@ export function applyOverrides(
 		gates: {
 			card: overrides.gates?.card ?? settings.gates.card,
 			program: overrides.gates?.program ?? settings.gates.program,
+		},
+		atlas: {
+			enabled: overrides.atlasEnabled ?? settings.atlas?.enabled ?? true,
+			agent: overrides.atlasAgent ?? settings.atlas?.agent ?? "scout",
+			model: overrides.atlasModel ?? settings.atlas?.model,
+			thinking: overrides.atlasThinking ?? settings.atlas?.thinking,
 		},
 	}, settings);
 	return normalized;
@@ -236,6 +262,7 @@ export function overridesToPlanFrontmatter(overrides: ProgramConfigOverrides): R
 	const review: Record<string, unknown> = {};
 	if (overrides.reviewProfile) review.profile = overrides.reviewProfile;
 	if (overrides.maxCycles !== undefined) review.maxCycles = overrides.maxCycles;
+	if (overrides.reviewerResume !== undefined) review.resumeReviewer = overrides.reviewerResume;
 	if (Object.keys(review).length > 0) data.review = review;
 	const gates: Record<string, unknown> = {};
 	if (overrides.gates?.card) gates.card = overrides.gates.card;
@@ -251,6 +278,12 @@ export function overridesToPlanFrontmatter(overrides: ProgramConfigOverrides): R
 	if (overrides.reviewerModel) reviewer.model = overrides.reviewerModel;
 	if (overrides.reviewerThinking) reviewer.thinking = overrides.reviewerThinking;
 	if (Object.keys(reviewer).length > 0) data.reviewer = reviewer;
+	const atlas: Record<string, unknown> = {};
+	if (overrides.atlasEnabled !== undefined) atlas.enabled = overrides.atlasEnabled;
+	if (overrides.atlasAgent) atlas.agent = overrides.atlasAgent;
+	if (overrides.atlasModel) atlas.model = overrides.atlasModel;
+	if (overrides.atlasThinking) atlas.thinking = overrides.atlasThinking;
+	if (Object.keys(atlas).length > 0) data.atlas = atlas;
 	return data;
 }
 
@@ -288,6 +321,17 @@ export function mergePlanConfig(planText: string, patch: ProgramConfigOverrides)
 		const thinking = asString(reviewer.thinking);
 		if (thinking) current.reviewerThinking = thinking;
 	}
+	if (typeof review?.resumeReviewer === "boolean") current.reviewerResume = review.resumeReviewer;
+	const atlas = isPlainRecord(existing.atlas) ? existing.atlas : undefined;
+	if (atlas) {
+		if (typeof atlas.enabled === "boolean") current.atlasEnabled = atlas.enabled;
+		const agent = asString(atlas.agent);
+		if (agent) current.atlasAgent = agent;
+		const model = asString(atlas.model);
+		if (model) current.atlasModel = model;
+		const thinking = asString(atlas.thinking);
+		if (thinking) current.atlasThinking = thinking;
+	}
 	const merged: ProgramConfigOverrides = { ...current, ...patch };
 	const { data: existingFront } = parseFrontmatter(planText);
 	const patchFront = overridesToPlanFrontmatter(patch);
@@ -304,6 +348,9 @@ export function mergePlanConfig(planText: string, patch: ProgramConfigOverrides)
 		["reviewerAgent", "reviewer", "agent"],
 		["reviewerModel", "reviewer", "model"],
 		["reviewerThinking", "reviewer", "thinking"],
+		["atlasAgent", "atlas", "agent"],
+		["atlasModel", "atlas", "model"],
+		["atlasThinking", "atlas", "thinking"],
 	];
 	for (const [patchKey, mapKey, childKey] of clearNested) {
 		if ((patch as Record<string, unknown>)[patchKey] === "") {
@@ -314,7 +361,7 @@ export function mergePlanConfig(planText: string, patch: ProgramConfigOverrides)
 		}
 	}
 	// Drop empty maps the patch cleared (e.g. workerModel: "" clears the override).
-	for (const key of ["worker", "reviewer", "review", "gates"]) {
+	for (const key of ["worker", "reviewer", "review", "gates", "atlas"]) {
 		const entry = next[key];
 		if (typeof entry === "object" && entry !== null && !Array.isArray(entry) && Object.keys(entry as Record<string, unknown>).length === 0) {
 			delete next[key];

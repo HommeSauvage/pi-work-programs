@@ -11,6 +11,7 @@ lanes. The program folder holds the records; the extension holds the process.
 <program-dir>/<slug>/
   plan.md          the north star: context, decisions, phases, card index, rules
   progress.md      dated signal log — one terse line per event, hard-bounded
+  atlas.md         scout-built orientation (architecture, module map, per-card pointers)
   tasks/*.md       card files: the unit of work AND the unit of record
   .runtime/        machine state (gitignored): ledger, review texts
 ```
@@ -21,6 +22,39 @@ lanes. The program folder holds the records; the extension holds the process.
 - Every card declares its dependencies explicitly (`dependsOn` front matter).
   No card starts before its dependencies are `done`.
 - Completed programs stay in the tree until the user explicitly closes them out.
+
+## Program atlas
+
+Every program builds an **`atlas.md`**: a scout subagent explores the repo once
+(cards + plan in hand) and writes a capped orientation document — architecture,
+module map, conventions, integration points, negative knowledge, and per-card
+file pointers. Worker, reviewer, captain, and reconciler briefs point at it.
+
+- The **first build gates worker dispatch**: workers start after the scout
+  finishes, because starting with the atlas is the entire point. A failed
+  build never blocks — workers fall back to exploring, as before.
+- Managed and captain programs dispatch the scout automatically. Session-mode
+  programs adopt an `atlas.md` you write into the program dir (the session
+  drives its own runs there).
+- After each card merges, the scout is **resumed** to update the atlas from
+  the merge diff (fallback: a fresh scout re-reads the existing atlas and
+  verifies it — the file is the source of truth, the session only a cache).
+  A failed refresh keeps the existing atlas and retries, throttled.
+- The atlas is orientation, not a boundary: briefs tell agents to verify
+  before relying on it and to explore beyond it freely.
+- Configure via settings (`workPrograms.atlas: { enabled, agent, model,
+  thinking }`, default agent `scout`) or per program:
+  `work_program({ action: "config", atlasEnabled: false })`.
+- An existing `atlas.md` in the program dir is adopted as-is (no rebuild).
+
+## Run telemetry
+
+Every run's token usage (from pi-subagents' `status.json`: total, peak window,
+turns, tool calls, cost) is recorded onto its card; `status` shows program
+totals, each card's harness Evidence carries a `usage:` line, and the
+completion summary totals the program. Use it to retune: cards that dominate
+the token budget are candidates for tighter scope, more Context, or `enhanced`
+→ `light` review.
 
 ## Card lifecycle
 
@@ -35,6 +69,11 @@ pending → ready → implementing → review_pending → reviewing → triaging
   sets `State: review`, and commits.
 - The **reviewer** is a fresh, read-only second pass over the committed work.
   Review is mandatory: a card can never reach `done` without a completed review.
+  Within one card, review cycles 2+ **resume the same reviewer session** — it
+  already holds the diff understanding, so re-review covers the fix delta
+  instead of re-deriving the whole card (a fresh reviewer per cycle pays that
+  cost in full). Independence is per card: the reviewer session is never the
+  worker's. Disable with `work_program({ action: "config", reviewerResume: false })`.
 - Review findings are advisory. The orchestrator (session agent or card
   captain) approves, rejects, or defers each finding; approved findings are
   handed back to the **same worker** for a fix pass.

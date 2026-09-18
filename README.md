@@ -41,7 +41,7 @@ That is enough to start. Pi decides whether to call `suggest_work_program`, writ
 
 A **work program** is a multi-session initiative split into numbered **cards**. The extension owns the process: it scaffolds programs, drives the card pipeline, enforces review, records evidence, and merges card lanes. The program folder holds the records; the extension holds the state machine.
 
-When a program is active, every session sees a short brief (`[WORK PROGRAM] slug · mode · done/total`, board line, ready cards, open decisions). Workers implement one card at a time. A fresh reviewer checks every card before it can land. Findings come back to you as triage decisions — approve, reject, or defer — and approved findings go back to the same worker for a fix pass.
+When a program is active, every session sees a short brief (`[WORK PROGRAM] slug · mode · done/total`, board line, ready cards, open decisions). A **scout** explores the repo once and writes `atlas.md` (architecture, module map, per-card file pointers); workers start only after it lands, so no worker pays the from-scratch exploration tax again. Workers implement one card at a time. A reviewer checks every card before it can land — resumed across that card's review cycles, so cycle 2+ re-reads only the fix delta instead of the whole card. Findings come back to you as triage decisions — approve, reject, or defer — and approved findings go back to the same worker for a fix pass.
 
 Installing the extension does not start background work. It gives Pi two tools and one command. If you want large requests to become programs by default, say so in your project instructions:
 
@@ -65,8 +65,9 @@ After triage approval the harness verifies the card's gates, then the lane queue
 
 | Role | Does |
 |------|------|
+| `scout` | Explores the repo once and writes `atlas.md`; resumed after each merge to keep it current. The first build gates worker dispatch; refreshes never gate. |
 | `worker` | Implements exactly the card's scope, runs the card gates, appends `## Evidence` with exact output and commit SHAs, sets `State: review`, commits. Never writes `State: done`. |
-| `reviewer` | A fresh, read-only second pass over the committed lane diff. Mandatory — no card reaches `done` without one. |
+| `reviewer` | A read-only second pass over the committed lane diff. Mandatory — no card reaches `done` without one. Resumed across a card's cycles (fresh eyes per card, not per cycle). |
 | orchestrator (you, or a captain) | Triages every finding: `approve`, `reject`, or `defer`. Approved findings go back to the same worker. |
 | `reconciler` | Resolves a lane merge conflict preserving both intents, then completes the merge. |
 
@@ -94,7 +95,7 @@ Switch any time: `work_program({ action: "mode", mode: "captain" })` or `/work-p
 | Triage a review | Answer the decision packet with `work_program({ action: "triage", card, verdicts })` — one verdict per finding |
 | Unblock a card | `work_program({ action: "unblock", card, resolution })` — `redispatch` retries the pending fix when one exists (and re-adopts an abandoned card), `done` marks it finished, `abandon` drops its scope (branch kept, excluded from completion) |
 | Resolve an exhausted cycle | `work_program({ action: "cycle_decision", card, choice })` — `accept` (land it; unfixed findings recorded on the card) or `block`. Extra review rounds are not offered |
-| Retune a running program | `work_program({ action: "config", maxCycles, onExhausted, reviewProfile, maxParallel, workerModel, reviewerModel, … })` — applies live and persists into plan.md front matter, so it survives sync and reload |
+| Retune a running program | `work_program({ action: "config", maxCycles, onExhausted, reviewProfile, maxParallel, workerModel, reviewerModel, reviewerResume, atlasEnabled, … })` — applies live and persists into plan.md front matter, so it survives sync and reload |
 | Retune one card | `work_program({ action: "config", card: "05", maxCycles: 5, reviewProfile: "enhanced" })` — applies live and persists into that card's front matter (empty-string model clears the override) |
 | Resolve a program gate | `work_program({ action: "program_gate", choice })` — `retry` or `block` |
 | Merge a reconciled lane | `work_program({ action: "merge_resolved", card })` |
@@ -117,6 +118,7 @@ After `finalize_plan`, Pi stops and shows you the plan. That pause is load-beari
 .agents/work-programs/<slug>/
   plan.md          the north star: context, decisions, phases, card index, rules
   progress.md      dated signal log — one terse line per event, capped (~500 lines; git history is the archive)
+  atlas.md         scout-built orientation: architecture, module map, per-card pointers
   tasks/*.md       card files: the unit of work AND the unit of record
   .runtime/        machine state (gitignored): ledger, review texts
 ```
@@ -137,6 +139,14 @@ After `finalize_plan`, Pi stops and shows you the plan. That pause is load-beari
 ## Evidence and review
 
 Evidence is measured, never assumed. The worker pastes exact command output and the commit SHA it was measured at into the card's `## Evidence` section. When gates are configured, the harness runs them itself and its result is authoritative; worker-pasted evidence is supplementary. A card is done only when its gate is green (or no gate applies) and its review has been triaged.
+
+## Token economy
+
+Measured on real programs, fresh workers spend ~20-25% of their input budget re-exploring the repo before their first edit, and each fresh review cycle re-derives the same understanding. Three mechanisms attack that:
+
+- **Program atlas** (`atlas.md`): one scout explores the repo with the plan and every card in hand, then writes a capped orientation document — architecture, module map, conventions, integration points, negative knowledge, and 3-8 per-card file pointers. The first build gates worker dispatch; after each merge the scout is *resumed* to update the atlas from the diff. The file is the source of truth (a replacement scout re-reads it instead of starting over); the session is only a warm cache. Briefs tell agents the atlas is orientation, not a boundary — verify before relying, explore beyond freely. An `atlas.md` you write yourself in the program dir is adopted as-is.
+- **Reviewer resume**: cycle 2+ of a card's review resumes the same reviewer session with just the fix delta (`lastReviewedSha..HEAD`) and the approved-findings list. Disable with `config reviewerResume: false` (or `review.resumeReviewer: false` in settings) to get fresh reviewers every cycle.
+- **Run telemetry**: every run's usage (total tokens, peak context window, turns, tool calls, cost — read from pi-subagents' `status.json`) is aggregated onto its card and the atlas. `status` shows program totals, each done card's harness evidence carries a `usage:` line, and the completion summary totals the program.
 
 Two review profiles, per program with per-card override (card front matter `review: enhanced`, or `work_program({ action: "config", card, reviewProfile })`):
 
@@ -189,6 +199,8 @@ Defaults live in settings under `workPrograms` (user or project `settings.json`)
 | `review.maxCycles` | `3` | Review/fix rounds before asking |
 | `review.onExhausted` | `ask` | `ask`, `accept`, or `block` |
 | `worker.agent` / `review.agent` | `worker` / `reviewer` | Which subagents to spawn (plus optional `model`/`thinking`) |
+| `review.resumeReviewer` | `true` | Resume the same reviewer across a card's cycles; `false` = fresh reviewer every cycle |
+| `atlas.enabled` / `atlas.agent` | `true` / `scout` | Build `atlas.md` via a scout and inject it into briefs (plus optional `model`/`thinking`) |
 | `gates.card` / `gates.program` | `[]` | Shell commands run per card / at program end; failures block |
 | `laneBranchPattern` | `{branch}-card-{id}` | Lane branch naming |
 | `worktreeDir` | `~/.pi/agent/work-programs/worktrees/<repo>` | Base directory for lane worktrees |

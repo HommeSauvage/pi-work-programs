@@ -4,15 +4,20 @@ import {
 	captainBrief,
 	fixBrief,
 	gateFixBrief,
+	reReviewBrief,
 	reconcilerBrief,
 	reviewTask,
+	scoutBrief,
+	scoutRefreshBrief,
 	workerBrief,
 } from "../protocol/briefs.ts";
 import { appendHarnessEvidence, gateEvidenceLines, setCardState } from "../program/card-edit.ts";
 import {
+	atlasPath,
 	effectiveMaxCycles,
 	effectiveReviewerAgent,
 	effectiveReviewerModel,
+	effectiveReviewerResume,
 	effectiveReviewerThinking,
 	effectiveReviewProfile,
 	effectiveWorkerAgent,
@@ -35,14 +40,16 @@ import {
 	type TodoStore,
 } from "../program/operator-todos.ts";
 import { parseEvidence } from "../program/parse.ts";
-import { oneLine, truncateTail } from "../shared/text.ts";
+import { oneLine, formatTokens, truncateTail } from "../shared/text.ts";
 import type {
+	ActiveRunKind,
 	CardLedger,
 	DriverPorts,
 	FindingVerdict,
 	GateResult,
 	ProgramLedger,
 	RunStatus,
+	RunUsage,
 } from "../shared/types.ts";
 import {
 	blockedDecisionMessage,
@@ -67,6 +74,45 @@ import {
 } from "./phases.ts";
 
 const UNKNOWN_RUN_GRACE_MS = 10 * 60_000;
+
+/** Per-card cap on recorded per-run usage entries (aggregate keeps accumulating). */
+const MAX_USAGE_RUNS = 24;
+
+/** Merge one run's usage into an aggregate, keeping optional fields only when present. */
+function mergeUsage(acc: RunUsage | undefined, usage: RunUsage): RunUsage {
+	const merged: RunUsage = {
+		input: (acc?.input ?? 0) + usage.input,
+		output: (acc?.output ?? 0) + usage.output,
+		total: (acc?.total ?? 0) + usage.total,
+	};
+	const windowPeak = Math.max(acc?.windowPeak ?? 0, usage.windowPeak ?? 0);
+	if (windowPeak > 0) merged.windowPeak = windowPeak;
+	const costUsd = (acc?.costUsd ?? 0) + (usage.costUsd ?? 0);
+	if (costUsd > 0) merged.costUsd = costUsd;
+	const turns = (acc?.turns ?? 0) + (usage.turns ?? 0);
+	if (turns > 0) merged.turns = turns;
+	const tools = (acc?.tools ?? 0) + (usage.tools ?? 0);
+	if (tools > 0) merged.tools = tools;
+	return merged;
+}
+
+/** Record a terminal run's usage onto the card (aggregate + bounded per-run log). */
+function recordRunUsage(card: CardLedger, kind: ActiveRunKind, status: RunStatus): void {
+	const usage = status.usage;
+	if (!usage) return;
+	card.usage = mergeUsage(card.usage, usage);
+	const runs = card.usageRuns ?? [];
+	runs.push({ ...usage, kind, at: Date.now() });
+	card.usageRuns = runs.slice(-MAX_USAGE_RUNS);
+}
+
+/** Compact usage label for progress lines and evidence: `16.6M tok · 153 turns · $0.22`. */
+function formatUsage(usage: RunUsage): string {
+	const parts = [`${formatTokens(usage.total)} tok`];
+	if (usage.turns !== undefined) parts.push(`${usage.turns} turns`);
+	if (usage.costUsd !== undefined) parts.push(`$${usage.costUsd.toFixed(2)}`);
+	return parts.join(" · ");
+}
 
 export interface DriverHost {
 	cwd: string;
@@ -97,7 +143,7 @@ function stateSignature(host: DriverHost): string {
 			return `${id}:${card.phase}:${card.activeRun?.runId ?? "-"}:${card.abandoned === true ? "A" : "-"}`;
 		})
 		.join("|");
-	return `${cards}#${host.ledger.mergeQueue.join(",")}#${host.ledger.status}`;
+	return `${cards}#${host.ledger.mergeQueue.join(",")}#${host.ledger.status}#${host.ledger.atlas?.state ?? ""}:${host.ledger.atlas?.pendingMerges.length ?? 0}`;
 }
 const CAPTAIN_OUTPUT_SCHEMA: Record<string, unknown> = {
 	type: "object",
@@ -140,6 +186,11 @@ async function progress(host: DriverHost, line: string): Promise<void> {
 	const match = /^(\S+)\s+(.*)$/.exec(line);
 	const formatted = match ? `[card ${match[1]}] ${match[2]}` : `[program] ${line}`;
 	await host.ports.appendProgress(formatted);
+}
+
+/** Program-level (not card-scoped) events: scout builds, atlas refreshes. */
+async function progressProgram(host: DriverHost, line: string): Promise<void> {
+	await host.ports.appendProgress(`[program] ${line}`);
 }
 
 async function runCardGates(host: DriverHost, card: CardLedger, cwd: string): Promise<{ ok: boolean; gates: GateResult[] }> {
@@ -192,8 +243,10 @@ export async function drive(host: DriverHost): Promise<void> {
 		for (let pass = 0; pass < MAX_DRIVE_PASSES; pass += 1) {
 			const before = stateSignature(host);
 			await reconcileRuns(host, gate);
+			await reconcileScout(host);
 			await resolveStaleBlocks(host);
 			await resumeWaitingCards(host, gate);
+			await ensureScout(host);
 			if (ledger.mode === "managed" || ledger.mode === "captain") {
 				await dispatchReadyCards(host, gate);
 				await dispatchReviews(host, gate);
@@ -202,6 +255,7 @@ export async function drive(host: DriverHost): Promise<void> {
 			await finishApprovedCards(host, gate);
 			await ensurePackets(host);
 			await processMergeQueue(host, gate, attemptedMerges);
+			await maybeRefreshAtlas(host);
 			if (stateSignature(host) === before) break;
 		}
 		await maybeRunProgramGate(host);
@@ -808,6 +862,7 @@ async function laneAlreadyImplemented(host: DriverHost, card: CardLedger): Promi
 }
 
 async function onWorkerComplete(host: DriverHost, gate: TodoGate, card: CardLedger, status: RunStatus, runId: string): Promise<void> {
+	recordRunUsage(card, "worker", status);
 	if (status.state === "paused") {
 		await blockCard(host, card, `worker run ${runId} paused by operator — redispatch to continue from the lane state`);
 		return;
@@ -886,6 +941,7 @@ async function startGateFix(
 }
 
 async function onReviewerComplete(host: DriverHost, card: CardLedger, status: RunStatus, runId: string): Promise<void> {
+	recordRunUsage(card, "reviewer", status);
 	if (status.state === "paused") {
 		await blockCard(host, card, `reviewer run ${runId} paused by operator — redispatch to re-run the review`);
 		return;
@@ -919,6 +975,7 @@ async function onReviewerComplete(host: DriverHost, card: CardLedger, status: Ru
 }
 
 async function onFixComplete(host: DriverHost, gate: TodoGate, card: CardLedger, status: RunStatus, runId: string): Promise<void> {
+	recordRunUsage(card, "fix", status);
 	const wasMerged = card.merge?.state === "merged";
 	if (status.state === "paused") {
 		await blockCard(host, card, `fix run ${runId} paused by operator — redispatch to retry the pending fixes`);
@@ -953,6 +1010,7 @@ async function onFixComplete(host: DriverHost, gate: TodoGate, card: CardLedger,
 }
 
 async function onCaptainComplete(host: DriverHost, gate: TodoGate, card: CardLedger, status: RunStatus, runId: string): Promise<void> {
+	recordRunUsage(card, "captain", status);
 	if (status.state === "paused") {
 		await blockCard(host, card, `captain run ${runId} paused by operator — redispatch to restart the card loop`);
 		return;
@@ -1049,6 +1107,199 @@ async function dispatchRun(
 	await host.save();
 }
 
+/* ---------------------------------------------------------------------------
+ * Program atlas: scout-built orientation (atlas.md)
+ *
+ * One scout explores the repo once and writes atlas.md; workers and reviewers
+ * get its path in their briefs instead of re-deriving the codebase per run.
+ * The atlas file is the source of truth; the scout session is a warm cache —
+ * post-merge refreshes resume it when possible and fall back to a fresh scout
+ * (which re-reads the existing atlas instead of exploring from zero).
+ * The first build gates worker dispatch (the whole point is workers starting
+ * WITH the atlas); refreshes never gate.
+ * ------------------------------------------------------------------------- */
+
+/** Atlas path injected into briefs only when the file should exist and be current-ish. */
+function atlasNotePath(host: DriverHost): string | undefined {
+	const atlas = host.ledger.atlas;
+	if (!atlas?.enabled) return undefined;
+	if (atlas.state !== "ready" && atlas.state !== "refreshing") return undefined;
+	return atlasPath(host.programDir);
+}
+
+async function dispatchScout(host: DriverHost, task: string, state: "building" | "refreshing"): Promise<boolean> {
+	const atlas = host.ledger.atlas;
+	if (!atlas?.enabled) return false;
+	try {
+		const result = await host.ports.runs.dispatch({
+			kind: "scout",
+			agent: atlas.agent ?? "scout",
+			task,
+			cwd: host.cwd,
+			...(atlas.model ? { model: atlas.model } : {}),
+			...(atlas.thinking ? { thinking: atlas.thinking } : {}),
+			label: `wp ${host.ledger.slug} atlas scout`,
+		});
+		atlas.state = state;
+		atlas.runId = result.runId;
+		atlas.startedAt = Date.now();
+		atlas.nextRefreshAt = undefined;
+		if (result.asyncDir) atlas.asyncDir = result.asyncDir;
+		atlas.lastError = undefined;
+		await host.save();
+		return true;
+	} catch (error) {
+		atlas.state = "failed";
+		atlas.lastError = oneLine(String(error), 160);
+		await progressProgram(host, `atlas scout dispatch failed: ${oneLine(String(error), 120)}`);
+		await host.save();
+		return false;
+	}
+}
+
+/** Adopt an existing atlas.md in any mode; auto-dispatch the first build only
+ *  in managed/captain (session mode drives its own runs — bring your own atlas). */
+async function ensureScout(host: DriverHost): Promise<void> {
+	const atlas = host.ledger.atlas;
+	if (!atlas?.enabled || atlas.state !== undefined) return;
+	// An atlas written by the operator or left by an earlier program run is adopted as-is.
+	const existing = (await host.ports.readFile(atlasPath(host.programDir))).trim();
+	if (existing.length > 0) {
+		atlas.state = "ready";
+		atlas.builtAt = Date.now();
+		await progressProgram(host, "atlas adopted (existing file)");
+		await host.save();
+		return;
+	}
+	if (host.ledger.mode === "session") return;
+	const dispatched = await dispatchScout(
+		host,
+		scoutBrief({
+			ledger: host.ledger,
+			planPath: planPath(host),
+			tasksDir: `${host.programDir}/tasks`,
+			atlasPath: atlasPath(host.programDir),
+			cwd: host.cwd,
+			cardCount: host.ledger.order.length,
+		}),
+		"building",
+	);
+	if (dispatched) await progressProgram(host, "atlas scout dispatched (first build gates workers)");
+}
+
+/** Track the in-flight scout run: complete → ready (and gate release), failure → failed (workers proceed atlas-less). */
+async function reconcileScout(host: DriverHost): Promise<void> {
+	const atlas = host.ledger.atlas;
+	if (!atlas?.enabled) return;
+	if (atlas.state !== "building" && atlas.state !== "refreshing") return;
+	if (!atlas.runId) {
+		atlas.state = "failed";
+		atlas.lastError = "scout run id missing";
+		await host.save();
+		return;
+	}
+	const status = await host.ports.runs.status(atlas.runId, atlas.asyncDir);
+	if (status.state === "unknown") {
+		if ((atlas.startedAt ?? 0) > 0 && Date.now() - (atlas.startedAt ?? 0) > UNKNOWN_RUN_GRACE_MS) {
+			atlas.state = "failed";
+			atlas.lastError = `scout run ${atlas.runId} state could not be determined`;
+			await progressProgram(host, `atlas scout ${atlas.lastError}`);
+			await host.save();
+		}
+		return;
+	}
+	if (!isTerminal(status)) return;
+	if (status.usage) atlas.usage = mergeUsage(atlas.usage, status.usage);
+	const wasBuilding = atlas.state === "building";
+	if (status.state !== "complete") {
+		atlas.state = "failed";
+		atlas.lastError = status.error ?? `scout run ${status.state}`;
+		await progressProgram(host, `atlas scout ${wasBuilding ? "build" : "refresh"} failed: ${oneLine(atlas.lastError, 120)}`);
+		await host.save();
+		return;
+	}
+	const text = (await host.ports.readFile(atlasPath(host.programDir))).trim();
+	if (text.length === 0) {
+		atlas.state = "failed";
+		atlas.lastError = "scout completed without writing atlas.md";
+		await progressProgram(host, "atlas scout produced no atlas.md");
+		await host.save();
+		return;
+	}
+	const mergedCount = atlas.pendingMerges.length;
+	atlas.pendingMerges = [];
+	atlas.state = "ready";
+	atlas.updatedAt = Date.now();
+	if (wasBuilding) {
+		atlas.builtAt = atlas.updatedAt;
+		await progressProgram(host, `atlas built${status.usage ? ` (${formatUsage(status.usage)})` : ""} — worker dispatch unblocked`);
+	} else {
+		atlas.refreshes += 1;
+		await progressProgram(host, `atlas refreshed (${mergedCount} merge${mergedCount === 1 ? "" : "s"})`);
+	}
+	await host.save();
+}
+
+/** Record a landed card for the next atlas refresh (both merge modes call this). */
+function queueAtlasRefresh(host: DriverHost, card: CardLedger, commit: string | undefined): void {
+	const atlas = host.ledger.atlas;
+	if (!atlas?.enabled) return;
+	if (atlas.state !== "ready" && atlas.state !== "refreshing") return;
+	atlas.pendingMerges.push({ id: card.id, ...(commit ? { commit } : {}) });
+}
+
+/** Refresh the atlas after merges: resume the retained scout when possible, fresh scout otherwise.
+ *  A failed refresh dispatch stays retryable (state returns to ready, pending merges kept)
+ *  and is throttled to one attempt per 5 minutes so a dead runner cannot spam every tick. */
+async function maybeRefreshAtlas(host: DriverHost): Promise<void> {
+	const atlas = host.ledger.atlas;
+	if (!atlas?.enabled || atlas.state !== "ready" || atlas.pendingMerges.length === 0) return;
+	if ((atlas.nextRefreshAt ?? 0) > Date.now()) return;
+	const merged = atlas.pendingMerges.map((entry) => ({
+		id: entry.id,
+		title: host.ledger.cards[entry.id]?.title ?? entry.id,
+		...(entry.commit ? { commit: entry.commit } : {}),
+	}));
+	const label = merged.map((entry) => entry.id).join(",");
+	if (atlas.runId) {
+		try {
+			const result = await host.ports.runs.resume(
+				atlas.runId,
+				scoutRefreshBrief({
+					ledger: host.ledger,
+					atlasPath: atlasPath(host.programDir),
+					cwd: host.cwd,
+					merged,
+					fresh: false,
+				}),
+			);
+			atlas.state = "refreshing";
+			atlas.runId = result.runId;
+			atlas.startedAt = Date.now();
+			if (result.asyncDir) atlas.asyncDir = result.asyncDir;
+			await progressProgram(host, `atlas refresh dispatched (resume; cards ${label})`);
+			await host.save();
+			return;
+		} catch {
+			await progressProgram(host, "atlas scout resume failed → fresh refresh");
+		}
+	}
+	const dispatched = await dispatchScout(
+		host,
+		scoutRefreshBrief({ ledger: host.ledger, atlasPath: atlasPath(host.programDir), cwd: host.cwd, merged, fresh: true }),
+		"refreshing",
+	);
+	if (dispatched) {
+		await progressProgram(host, `atlas refresh dispatched (fresh; cards ${label})`);
+	} else {
+		// dispatchScout marked the atlas failed; a refresh failure must not kill the
+		// existing atlas — stay ready, keep the pending merges, retry in 5 minutes.
+		atlas.state = "ready";
+		atlas.nextRefreshAt = Date.now() + 5 * 60_000;
+		await host.save();
+	}
+}
+
 async function ensureLane(host: DriverHost, card: CardLedger): Promise<void> {
 	if (host.ledger.parallelExecution !== "worktrees") return;
 	if (card.lane) return;
@@ -1099,6 +1350,7 @@ export async function startWorkerFor(host: DriverHost, card: CardLedger): Promis
 			reviewPath: path,
 			repoRoot: host.cwd,
 			maxCycles: effectiveMaxCycles(ledger, card),
+			atlasPath: atlasNotePath(host),
 		});
 		const dispatched = await dispatchWithInfraRetry(host, card, {
 			kind: "captain",
@@ -1121,6 +1373,7 @@ export async function startWorkerFor(host: DriverHost, card: CardLedger): Promis
 		cwd: host.ports.runCwd(ledger, card),
 		gates: ledger.gates.card,
 		repoRoot: host.cwd,
+		atlasPath: atlasNotePath(host),
 	});
 	try {
 		const dispatched = await dispatchWithInfraRetry(host, card, {
@@ -1142,6 +1395,10 @@ export async function startWorkerFor(host: DriverHost, card: CardLedger): Promis
 
 async function dispatchReadyCards(host: DriverHost, gate: TodoGate): Promise<void> {
 	const ledger = host.ledger;
+	// The atlas's first build gates worker dispatch: the entire point is that
+	// workers start WITH orientation instead of paying the exploration tax.
+	// A failed/absent build never gates — workers then explore as before.
+	if (ledger.atlas?.enabled && ledger.atlas.state === "building") return;
 	const capacity = ledger.parallelExecution === "direct" ? 1 : ledger.maxParallel;
 	const ready = readyCards(ledger);
 	if (ready.length === 0) return;
@@ -1165,13 +1422,66 @@ export async function startReviewFor(host: DriverHost, card: CardLedger): Promis
 	const cwd = host.ports.runCwd(ledger, card);
 	const base = card.lane?.base ?? (await host.ports.git.head(cwd));
 	const branch = card.lane?.branch ?? (await host.ports.git.currentBranch(cwd));
-	const [commitLog, diffStat, changedFiles] = await Promise.all([
+	const [commitLog, diffStat, changedFiles, headSha] = await Promise.all([
 		host.ports.git.commitLog(cwd, `${base}..HEAD`),
 		host.ports.git.diffStat(cwd, base, "HEAD"),
 		host.ports.git.changedFiles(cwd, base, "HEAD"),
+		host.ports.git.head(cwd),
 	]);
 	const path = reviewPath(host.programDir, card.id, card.cycles + 1);
 	await host.ports.writeFile(path, "");
+
+	// Cycle 2+: resume the same reviewer session. It already holds the diff
+	// understanding from cycle 1, so re-review pays only for the fix delta
+	// instead of re-deriving the whole card. Independence is per card (reviewer
+	// ≠ worker); a fresh pair of eyes per cycle only re-reads the same files.
+	if (effectiveReviewerResume(ledger) && card.reviewRun && card.cycles > 0 && card.lastReviewedSha) {
+		const decision = [...ledger.decisions]
+			.reverse()
+			.find((entry) => entry.card === card.id && entry.kind === "review-triage" && entry.status === "resolved");
+		const approved = (decision?.verdicts ?? []).filter((verdict) => verdict.verdict === "approve");
+		const [fixLog, fixStat] = await Promise.all([
+			host.ports.git.commitLog(cwd, `${card.lastReviewedSha}..HEAD`),
+			host.ports.git.diffStat(cwd, card.lastReviewedSha, "HEAD"),
+		]);
+		const task = reReviewBrief({
+			ledger,
+			card,
+			cycle: card.cycles + 1,
+			previousReviewPath: reviewPath(host.programDir, card.id, card.cycles),
+			reviewPath: path,
+			sinceSha: card.lastReviewedSha,
+			fixLog,
+			fixStat,
+			approved,
+			gates: card.gates ?? [],
+			atlasPath: atlasNotePath(host),
+		});
+		try {
+			const result = await host.ports.runs.resume(card.reviewRun, task);
+			card.activeRun = {
+				kind: "reviewer",
+				runId: result.runId,
+				startedAt: Date.now(),
+				...(result.asyncDir ? { asyncDir: result.asyncDir } : {}),
+			};
+			card.reviewRun = result.runId;
+			card.lastReviewedSha = headSha;
+			card.phase = "reviewing";
+			card.runs += 1;
+			card.blockedFrom = undefined;
+			await progress(host, `${card.id} review ${card.cycles + 1} dispatched (resume)`);
+			await host.save();
+			return;
+		} catch (error) {
+			host.ports.notify(
+				`Work program: could not resume the retained reviewer for card ${card.id} (${oneLine(String(error), 120)}); dispatching a fresh reviewer.`,
+				"warning",
+			);
+			await progress(host, `${card.id} reviewer resume failed → fresh review`);
+		}
+	}
+
 	const task = reviewTask({
 		resources: loadResources(),
 		ledger,
@@ -1187,6 +1497,7 @@ export async function startReviewFor(host: DriverHost, card: CardLedger): Promis
 		changedFiles,
 		workerSummary: card.workerSummary ?? "",
 		gates: card.gates ?? [],
+		atlasPath: atlasNotePath(host),
 	});
 	try {
 		await dispatchRun(host, card, {
@@ -1202,6 +1513,8 @@ export async function startReviewFor(host: DriverHost, card: CardLedger): Promis
 		await blockCard(host, card, `reviewer dispatch failed: ${oneLine(String(error), 200)}`);
 		return;
 	}
+	card.lastReviewedSha = headSha;
+	await host.save();
 	await progress(host, `${card.id} review ${card.cycles + 1} dispatched`);
 }
 
@@ -1326,6 +1639,7 @@ async function completeDirectCard(host: DriverHost, card: CardLedger): Promise<v
 	updated = appendHarnessEvidence(updated, [
 		...gateEvidenceLines(card.gates ?? [], "gate"),
 		`review: ${card.cycles} cycle(s) completed`,
+		...(card.usage ? [`usage: ${formatUsage(card.usage)} (${card.usageRuns?.length ?? card.runs} runs)`] : []),
 		`completed: ${new Date().toISOString()}`,
 	]);
 	await writeCardText(host, card, updated);
@@ -1337,6 +1651,7 @@ async function completeDirectCard(host: DriverHost, card: CardLedger): Promise<v
 	card.phase = "done";
 	card.activeRun = undefined;
 	await progress(host, `${card.id} done (${commit.slice(0, 7)})`);
+	queueAtlasRefresh(host, card, commit);
 }
 
 /**
@@ -1589,6 +1904,7 @@ async function beginReconcile(
 		incomingIntent: `Card ${card.id} scope: ${card.title}`,
 		existingIntent,
 		gateCommands: ledger.gates.card,
+		atlasPath: atlasNotePath(host),
 	});
 	const dispatched = await dispatchWithInfraRetry(host, card, {
 		kind: "reconciler",
@@ -1629,6 +1945,7 @@ async function finishMergeCommit(host: DriverHost, card: CardLedger, gate: TodoG
 }
 
 async function onReconcilerComplete(host: DriverHost, gate: TodoGate, card: CardLedger, status: RunStatus, runId: string): Promise<void> {
+	recordRunUsage(card, "reconciler", status);
 	if (status.state === "paused") {
 		await blockCard(
 			host,
@@ -1677,6 +1994,7 @@ async function markDoneAndCommit(host: DriverHost, card: CardLedger, extraLines:
 	updated = appendHarnessEvidence(updated, [
 		...gateEvidenceLines(card.gates ?? [], "gate"),
 		...extraLines,
+		...(card.usage ? [`usage: ${formatUsage(card.usage)} (${card.usageRuns?.length ?? card.runs} runs)`] : []),
 		`completed: ${new Date().toISOString()}`,
 	]);
 	await host.ports.writeFile(mainCardPath, updated);
@@ -1728,6 +2046,7 @@ async function finalizeMergedCard(host: DriverHost, card: CardLedger, commit: st
 	if (index >= 0) host.ledger.mergeQueue.splice(index, 1);
 	await progress(host, `${card.id} merged (${commit.slice(0, 7)})`);
 	await host.save();
+	queueAtlasRefresh(host, card, commit);
 	if (card.lane) {
 		const lane = card.lane;
 		try {

@@ -18,6 +18,7 @@ export const LEDGER_FILE = "program.json";
 export const REVIEWS_DIR = "reviews";
 export const PLAN_FILE = "plan.md";
 export const PROGRESS_FILE = "progress.md";
+export const ATLAS_FILE = "atlas.md";
 export const TASKS_DIR = "tasks";
 export const RUNTIME_GITIGNORE = "*\n";
 

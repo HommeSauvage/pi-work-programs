@@ -1,5 +1,5 @@
 import { join, resolve } from "node:path";
-import { LEDGER_FILE, PROGRESS_FILE, REVIEWS_DIR, RUNTIME_DIR } from "../constants.ts";
+import { ATLAS_FILE, LEDGER_FILE, PROGRESS_FILE, REVIEWS_DIR, RUNTIME_DIR } from "../constants.ts";
 import { readJson, writeJsonAtomic } from "../shared/fsx.ts";
 import type {
 	CardLedger,
@@ -34,6 +34,10 @@ export function reviewPath(programDir: string, cardId: string, cycle: number): s
 
 export function progressPath(programDir: string): string {
 	return join(programDir, PROGRESS_FILE);
+}
+
+export function atlasPath(programDir: string): string {
+	return join(programDir, ATLAS_FILE);
 }
 
 export function laneBranch(pattern: string, baseBranch: string, cardId: string): string {
@@ -121,6 +125,7 @@ export function buildLedger(input: {
 		onExhausted: settings.review.onExhausted,
 		workerAgent: settings.worker.agent,
 		reviewerAgent: settings.review.agent,
+		reviewerResume: settings.review.resumeReviewer !== false,
 		workerModel: settings.worker.model,
 		workerThinking: settings.worker.thinking,
 		reviewerModel: settings.reviewer.model,
@@ -129,6 +134,14 @@ export function buildLedger(input: {
 		baseBranch: input.baseBranch,
 		baseCommit: input.baseCommit,
 		laneBranchPattern: settings.laneBranchPattern,
+		atlas: {
+			enabled: settings.atlas?.enabled ?? true,
+			agent: settings.atlas?.agent ?? "scout",
+			...(settings.atlas?.model ? { model: settings.atlas.model } : {}),
+			...(settings.atlas?.thinking ? { thinking: settings.atlas.thinking } : {}),
+			pendingMerges: [],
+			refreshes: 0,
+		},
 		cards,
 		order,
 		mergeQueue: [],
@@ -155,6 +168,7 @@ export function configOverridesFromPlan(planText: string): ProgramConfigOverride
 	if (review) {
 		if (typeof review.profile === "string") overrides.reviewProfile = review.profile as ProgramConfigOverrides["reviewProfile"];
 		if (typeof review.maxCycles === "number") overrides.maxCycles = review.maxCycles;
+		if (typeof review.resumeReviewer === "boolean") overrides.reviewerResume = review.resumeReviewer;
 	}
 	const worker = isPlainRecord(raw.worker) ? raw.worker : undefined;
 	if (worker) {
@@ -175,6 +189,13 @@ export function configOverridesFromPlan(planText: string): ProgramConfigOverride
 			? gates.program.filter((v): v is string => typeof v === "string")
 			: undefined;
 		overrides.gates = { ...(card ? { card } : {}), ...(program ? { program } : {}) };
+	}
+	const atlas = isPlainRecord(raw.atlas) ? raw.atlas : undefined;
+	if (atlas) {
+		if (typeof atlas.enabled === "boolean") overrides.atlasEnabled = atlas.enabled;
+		if (typeof atlas.agent === "string") overrides.atlasAgent = atlas.agent;
+		if (typeof atlas.model === "string") overrides.atlasModel = atlas.model;
+		if (typeof atlas.thinking === "string") overrides.atlasThinking = atlas.thinking;
 	}
 	return overrides;
 }
@@ -214,5 +235,34 @@ export function effectiveReviewerModel(ledger: ProgramLedger, card: CardLedger):
 
 export function effectiveReviewerThinking(ledger: ProgramLedger, card: CardLedger): string | undefined {
 	return card.reviewerThinking ?? ledger.reviewerThinking;
+}
+
+/** True when the card's review cycles should resume the same reviewer session. */
+export function effectiveReviewerResume(ledger: ProgramLedger): boolean {
+	return ledger.reviewerResume !== false;
+}
+
+/**
+ * Fill ledger fields introduced after the ledger was first written (called when
+ * a program is activated or started). Returns true when anything changed.
+ */
+export function migrateLedger(ledger: ProgramLedger, settings: WorkProgramSettings): boolean {
+	let changed = false;
+	if (ledger.reviewerResume === undefined) {
+		ledger.reviewerResume = settings.review.resumeReviewer !== false;
+		changed = true;
+	}
+	if (!ledger.atlas) {
+		ledger.atlas = {
+			enabled: settings.atlas?.enabled ?? true,
+			agent: settings.atlas?.agent ?? "scout",
+			...(settings.atlas?.model ? { model: settings.atlas.model } : {}),
+			...(settings.atlas?.thinking ? { thinking: settings.atlas.thinking } : {}),
+			pendingMerges: [],
+			refreshes: 0,
+		};
+		changed = true;
+	}
+	return changed;
 }
 

@@ -29,6 +29,12 @@ export function buildBrief(ledger: ProgramLedger, cwd?: string): string {
 	if (ready.length > 0) {
 		lines.push(`Ready: ${ready.map((card) => card.id).join(", ")}`);
 	}
+	const atlas = ledger.atlas;
+	if (atlas?.enabled && atlas.state === "building") {
+		lines.push("Atlas: scout is building orientation — worker dispatch held until it lands.");
+	} else if (atlas?.enabled && atlas.state === "failed") {
+		lines.push(`Atlas: scout failed (${oneLine(atlas.lastError ?? "unknown", 80)}) — cards run without it.`);
+	}
 	const decisions = openDecisions(ledger);
 	if (decisions.length > 0) {
 		lines.push("Open decisions:");

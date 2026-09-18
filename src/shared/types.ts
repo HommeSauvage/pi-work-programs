@@ -36,6 +36,53 @@ export interface Lane {
 	base: string;
 }
 
+/** Token/cost usage of one run (or an aggregate of runs), from pi-subagents status.json. */
+export interface RunUsage {
+	/** Non-cached input tokens. */
+	input: number;
+	output: number;
+	/** Cumulative tokens across the run (input + cache reads + output). */
+	total: number;
+	/** Largest context window the run reached. */
+	windowPeak?: number;
+	costUsd?: number;
+	turns?: number;
+	tools?: number;
+}
+
+/** One recorded run's usage, kept per card for per-pass breakdown. */
+export interface CardRunUsage extends RunUsage {
+	kind: ActiveRunKind;
+	at: number;
+}
+
+/**
+ * Program atlas: a scout-maintained orientation document (`atlas.md`) so workers
+ * and reviewers start from a curated map instead of re-exploring the repo.
+ * The atlas file is the source of truth; the scout session is only a warm cache
+ * over it (resume when possible, fresh scout re-reads the atlas otherwise).
+ */
+export interface AtlasLedger {
+	enabled: boolean;
+	agent?: string;
+	model?: string;
+	thinking?: string;
+	/** undefined = never built; building = first build in flight (gates worker dispatch); refreshing = post-merge update in flight. */
+	state?: "building" | "ready" | "refreshing" | "failed";
+	runId?: string;
+	asyncDir?: string;
+	startedAt?: number;
+	/** Cards merged since the atlas was last updated (drives refresh briefs). */
+	pendingMerges: Array<{ id: string; commit?: string }>;
+	refreshes: number;
+	builtAt?: number;
+	updatedAt?: number;
+	usage?: RunUsage;
+	lastError?: string;
+	/** Refresh retry throttle: no fresh refresh dispatch before this timestamp. */
+	nextRefreshAt?: number;
+}
+
 export interface CardMerge {
 	state: "queued" | "merging" | "conflict" | "merged";
 	commit?: string;
@@ -70,6 +117,8 @@ export interface CardLedger {
 	reviewerThinking?: string;
 	workerRun?: string;
 	reviewRun?: string;
+	/** Lane HEAD sha at the last review dispatch — the delta base for a resumed re-review. */
+	lastReviewedSha?: string;
 	fixRuns?: string[];
 	captainRun?: string;
 	reconcilerRun?: string;
@@ -98,6 +147,10 @@ export interface CardLedger {
 	waitingOn?: string[];
 	/** Operator-dropped scope: terminal, kept in records, excluded from completion gating. */
 	abandoned?: boolean;
+	/** Aggregated token usage across all of this card's runs. */
+	usage?: RunUsage;
+	/** Per-run usage records (bounded), newest last. */
+	usageRuns?: CardRunUsage[];
 	/** Findings approved at the review-cycle cap and carried into the merge unfixed. */
 	acceptedFindings?: string[];
 	updatedAt: number;
@@ -146,6 +199,8 @@ export interface ProgramLedger {
 	onExhausted: "ask" | "accept" | "block";
 	workerAgent: string;
 	reviewerAgent: string;
+	/** Resume the same reviewer session across review cycles of a card (default true). */
+	reviewerResume?: boolean;
 	workerModel?: string;
 	workerThinking?: string;
 	reviewerModel?: string;
@@ -160,6 +215,7 @@ export interface ProgramLedger {
 	decisions: Decision[];
 	programGate?: GateResult[];
 	mergeQueuePaused?: boolean;
+	atlas?: AtlasLedger;
 	createdAt: number;
 	updatedAt: number;
 }
@@ -213,6 +269,11 @@ export interface ProgramConfigOverrides {
 	workerThinking?: string;
 	reviewerModel?: string;
 	reviewerThinking?: string;
+	reviewerResume?: boolean;
+	atlasEnabled?: boolean;
+	atlasAgent?: string;
+	atlasModel?: string;
+	atlasThinking?: string;
 	gates?: { card?: string[]; program?: string[] };
 	laneBranchPattern?: string;
 }
@@ -227,9 +288,13 @@ export interface WorkProgramSettings {
 		profile: ReviewProfile;
 		maxCycles: number;
 		onExhausted: "ask" | "accept" | "block";
+		/** Resume the same reviewer across a card's review cycles (default true). */
+		resumeReviewer?: boolean;
 	};
 	worker: { agent: string; model?: string; thinking?: string };
 	reviewer: { model?: string; thinking?: string };
+	/** Program atlas: scout-built orientation document injected into worker/reviewer briefs. */
+	atlas?: { enabled: boolean; agent: string; model?: string; thinking?: string };
 	gates: { card: string[]; program: string[] };
 	worktreeDir?: string;
 	laneBranchPattern: string;
@@ -240,6 +305,8 @@ export interface RunStatus {
 	output?: string;
 	structured?: unknown;
 	error?: string;
+	/** Token/cost usage read from the run's status.json (terminal states). */
+	usage?: RunUsage;
 }
 
 export interface RunHeartbeat {
@@ -253,7 +320,7 @@ export interface RunHeartbeat {
 }
 
 export interface DispatchRequest {
-	kind: "worker" | "reviewer" | "fix" | "captain" | "reconciler";
+	kind: "worker" | "reviewer" | "fix" | "captain" | "reconciler" | "scout";
 	agent: string;
 	task: string;
 	cwd: string;

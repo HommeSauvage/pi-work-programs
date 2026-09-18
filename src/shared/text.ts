@@ -61,3 +61,12 @@ export function asString(value: unknown): string | undefined {
 export function asNumber(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
+
+/** Compact token count for status/progress lines: 980, 41.2k, 16.6M. */
+export function formatTokens(n: number): string {
+	if (!Number.isFinite(n) || n < 0) return "0";
+	if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+	if (n >= 10_000) return `${Math.round(n / 1_000)}k`;
+	if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+	return `${Math.round(n)}`;
+}

@@ -32,12 +32,13 @@ import {
 	buildLedger,
 	configOverridesFromPlan,
 	loadLedger,
+	migrateLedger,
 	reviewPath,
 	saveLedger,
 } from "../program/ledger.ts";
 import { formatProblems, validatePlanFiles } from "../program/validate.ts";
 import { defaultWorktreeDir } from "../shared/paths.ts";
-import { oneLine, slugify, formatAgo, formatDuration } from "../shared/text.ts";
+import { oneLine, slugify, formatAgo, formatDuration, formatTokens } from "../shared/text.ts";
 import { readTextOrUndefined, writeTextAtomic } from "../shared/fsx.ts";
 import { PLAN_FILE } from "../constants.ts";
 import {
@@ -132,6 +133,11 @@ export interface ProgramConfigPatch {
 	reviewerAgent?: string;
 	reviewerModel?: string;
 	reviewerThinking?: string;
+	reviewerResume?: boolean;
+	atlasEnabled?: boolean;
+	atlasAgent?: string;
+	atlasModel?: string;
+	atlasThinking?: string;
 }
 
 export interface ActionResult {
@@ -144,6 +150,48 @@ const MODE_LABELS: Array<{ mode: Mode; label: string }> = [
 	{ mode: "session", label: "session — this agent dispatches every step; the extension enforces and records" },
 	{ mode: "captain", label: "captain — one fresh orchestrator per card; this agent handles program gates" },
 ];
+
+/** One-line atlas state for status: build state, refreshes, scout usage. */
+function atlasStatusLine(ledger: ProgramLedger): string | undefined {
+	const atlas = ledger.atlas;
+	if (!atlas) return undefined;
+	if (!atlas.enabled) return "atlas: off";
+	const state = atlas.state ?? "not built";
+	const parts = [`atlas: ${state}`];
+	if (atlas.state === "ready" || atlas.state === "refreshing") {
+		parts.push(`${atlas.refreshes} refresh${atlas.refreshes === 1 ? "" : "es"}`);
+	}
+	if (atlas.pendingMerges.length > 0) parts.push(`${atlas.pendingMerges.length} merge(s) pending`);
+	if (atlas.usage) parts.push(`${formatTokens(atlas.usage.total)} tok`);
+	if (atlas.lastError) parts.push(oneLine(atlas.lastError, 80));
+	return parts.join(" · ");
+}
+
+/** Program token totals line: summed card usage + scout usage. */
+function tokensStatusLine(ledger: ProgramLedger): string | undefined {
+	let total = 0;
+	let out = 0;
+	let cost = 0;
+	let runs = 0;
+	let has = false;
+	for (const id of ledger.order) {
+		const card = ledger.cards[id];
+		if (!card?.usage) continue;
+		has = true;
+		total += card.usage.total;
+		out += card.usage.output;
+		cost += card.usage.costUsd ?? 0;
+		runs += card.usageRuns?.length ?? 0;
+	}
+	if (ledger.atlas?.usage) {
+		has = true;
+		total += ledger.atlas.usage.total;
+		out += ledger.atlas.usage.output;
+		cost += ledger.atlas.usage.costUsd ?? 0;
+	}
+	if (!has) return undefined;
+	return `tokens: ${formatTokens(total)} total · ${formatTokens(out)} out${cost > 0 ? ` · $${cost.toFixed(2)}` : ""} (${runs} card runs)`;
+}
 
 /** Suggested next step for a blocked card, shown in status/doctor Issues. */
 function unblockHint(card: CardLedger): string {
@@ -316,6 +364,11 @@ export class WorkProgramController {
 		let ledger = await loadLedger(ref.absDir);
 		if (!ledger) {
 			ledger = await adoptProgram({ cwd: this.cwd, settings: this.settings, ref });
+		}
+		// Backfill fields introduced after this ledger was written (atlas,
+		// reviewerResume) so resumed programs pick up current behaviour.
+		if (migrateLedger(ledger, this.settings)) {
+			await appendProgress(ref.absDir, "ledger migrated (atlas / reviewer-resume)");
 		}
 		this.active = { slug: ref.slug, absDir: ref.absDir, ledger };
 		// Pick up file-driven edits (folded/dropped cards, rewired deps) at session
@@ -715,6 +768,17 @@ export class WorkProgramController {
 		active.ledger.reviewerAgent = settings.review.agent;
 		active.ledger.reviewerModel = settings.reviewer.model;
 		active.ledger.reviewerThinking = settings.reviewer.thinking;
+		active.ledger.reviewerResume = settings.review.resumeReviewer !== false;
+		// Atlas config keys follow plan front matter; runtime state (state, runId,
+		// pendingMerges, refreshes, usage) is never touched by a sync.
+		if (active.ledger.atlas) {
+			active.ledger.atlas.enabled = settings.atlas?.enabled ?? true;
+			if (settings.atlas?.agent) active.ledger.atlas.agent = settings.atlas.agent;
+			if (settings.atlas?.model) active.ledger.atlas.model = settings.atlas.model;
+			else delete active.ledger.atlas.model;
+			if (settings.atlas?.thinking) active.ledger.atlas.thinking = settings.atlas.thinking;
+			else delete active.ledger.atlas.thinking;
+		}
 		active.ledger.gates = { card: [...settings.gates.card], program: [...settings.gates.program] };
 		// Import worker-inbox todos (blocking ones park + announce via the drive path).
 		await syncTodoStore(this);
@@ -781,6 +845,20 @@ export class WorkProgramController {
 			}
 		}
 		const rearmed = rearmPausedCards(this);
+		// A scout run is program-level, not card-level: stop and rearm it the same
+		// way (building → redispatch on resume; refreshing → stays ready, pending
+		// merges preserved and re-sent on the next drive tick).
+		const atlas = ledger.atlas;
+		if (atlas?.enabled && (atlas.state === "building" || atlas.state === "refreshing") && atlas.runId) {
+			try {
+				await this.runs.stop(atlas.runId);
+				stopped.push("atlas scout");
+				atlas.state = atlas.state === "building" ? undefined : "ready";
+				atlas.startedAt = undefined;
+			} catch (error) {
+				unstopped.push(`atlas scout (${oneLine(String(error), 100)})`);
+			}
+		}
 		ledger.status = "paused";
 		await this.save();
 		await appendProgress(
@@ -909,8 +987,34 @@ export class WorkProgramController {
 			changes.push(`reviewerThinking ${ledger.reviewerThinking ?? "(default)"}→${patch.reviewerThinking === "" ? "(default)" : patch.reviewerThinking}`);
 			overrides.reviewerThinking = patch.reviewerThinking;
 		}
+		if (patch.reviewerResume !== undefined) {
+			if (typeof patch.reviewerResume !== "boolean") return { ok: false, text: "reviewerResume must be a boolean" };
+			if (patch.reviewerResume !== ledger.reviewerResume) {
+				changes.push(`reviewerResume ${ledger.reviewerResume !== false}→${patch.reviewerResume}`);
+			}
+			overrides.reviewerResume = patch.reviewerResume;
+		}
+		if (patch.atlasEnabled !== undefined) {
+			if (typeof patch.atlasEnabled !== "boolean") return { ok: false, text: "atlasEnabled must be a boolean" };
+			if (patch.atlasEnabled !== (ledger.atlas?.enabled ?? true)) {
+				changes.push(`atlas ${ledger.atlas?.enabled !== false ? "on" : "off"}→${patch.atlasEnabled ? "on" : "off"}`);
+			}
+			overrides.atlasEnabled = patch.atlasEnabled;
+		}
+		if (patch.atlasAgent !== undefined) {
+			changes.push(`atlasAgent ${ledger.atlas?.agent ?? "scout"}→${patch.atlasAgent === "" ? "(default)" : patch.atlasAgent}`);
+			overrides.atlasAgent = patch.atlasAgent;
+		}
+		if (patch.atlasModel !== undefined) {
+			changes.push(`atlasModel ${ledger.atlas?.model ?? "(default)"}→${patch.atlasModel === "" ? "(default)" : patch.atlasModel}`);
+			overrides.atlasModel = patch.atlasModel;
+		}
+		if (patch.atlasThinking !== undefined) {
+			changes.push(`atlasThinking ${ledger.atlas?.thinking ?? "(default)"}→${patch.atlasThinking === "" ? "(default)" : patch.atlasThinking}`);
+			overrides.atlasThinking = patch.atlasThinking;
+		}
 		if (Object.keys(overrides).length === 0 && patch.onExhausted === undefined) {
-			return { ok: false, text: "Nothing to change; pass at least one of maxCycles, onExhausted, reviewProfile, maxParallel, parallelExecution, mode, workerAgent, workerModel, workerThinking, reviewerAgent, reviewerModel, reviewerThinking." };
+			return { ok: false, text: "Nothing to change; pass at least one of maxCycles, onExhausted, reviewProfile, maxParallel, parallelExecution, mode, workerAgent, workerModel, workerThinking, reviewerAgent, reviewerModel, reviewerThinking, reviewerResume, atlasEnabled, atlasAgent, atlasModel, atlasThinking." };
 		}
 
 		// Apply to the live ledger via the same normalization the plan path uses.
@@ -927,6 +1031,31 @@ export class WorkProgramController {
 		if (patch.reviewerAgent !== undefined) ledger.reviewerAgent = settings.review.agent;
 		if (patch.reviewerModel !== undefined) ledger.reviewerModel = patch.reviewerModel === "" ? undefined : patch.reviewerModel;
 		if (patch.reviewerThinking !== undefined) ledger.reviewerThinking = patch.reviewerThinking === "" ? undefined : patch.reviewerThinking;
+		if (patch.reviewerResume !== undefined) ledger.reviewerResume = patch.reviewerResume;
+		if (
+			patch.atlasEnabled !== undefined ||
+			patch.atlasAgent !== undefined ||
+			patch.atlasModel !== undefined ||
+			patch.atlasThinking !== undefined
+		) {
+			const atlas = ledger.atlas ?? { enabled: true, pendingMerges: [], refreshes: 0 };
+			if (patch.atlasEnabled !== undefined) atlas.enabled = patch.atlasEnabled;
+			if (patch.atlasAgent !== undefined && patch.atlasAgent !== "") atlas.agent = patch.atlasAgent;
+			if (patch.atlasModel !== undefined) {
+				if (patch.atlasModel === "") delete atlas.model;
+				else atlas.model = patch.atlasModel;
+			}
+			if (patch.atlasThinking !== undefined) {
+				if (patch.atlasThinking === "") delete atlas.thinking;
+				else atlas.thinking = patch.atlasThinking;
+			}
+			// A config change resurrects a failed atlas: next drive rebuilds it.
+			if (atlas.state === "failed") {
+				atlas.state = undefined;
+				atlas.lastError = undefined;
+			}
+			ledger.atlas = atlas;
+		}
 
 		// Persist into the plan so sync/reload keep the change.
 		const planText = await readPlan(this.active.absDir);
@@ -972,7 +1101,7 @@ export class WorkProgramController {
 		if (!this.active) return { ok: false, text: "No active work program." };
 		const card = this.active.ledger.cards[cardId];
 		if (!card) return { ok: false, text: `Unknown card ${cardId}.` };
-		for (const key of ["mode", "maxParallel", "parallelExecution", "onExhausted"] as const) {
+		for (const key of ["mode", "maxParallel", "parallelExecution", "onExhausted", "reviewerResume", "atlasEnabled", "atlasAgent", "atlasModel", "atlasThinking"] as const) {
 			if (patch[key] !== undefined) {
 				return { ok: false, text: `${key} is program-level; omit card to set it (work_program({ action: "config", ${key}: ... }))` };
 			}
@@ -1240,6 +1369,8 @@ export class WorkProgramController {
 			`slug: ${ledger.slug} · status: ${ledger.status} · mode: ${ledger.mode} · ${done}/${total} done${abandoned ? ` · ${abandoned} dropped` : ""}${blocked ? ` · ${blocked} blocked` : ""}`,
 			`parallel: ${ledger.parallelExecution} (max ${ledger.maxParallel}) · review: ${ledger.reviewProfile} · cycles: ${ledger.maxCycles}`,
 			`dir: ${ledger.dir}`,
+			...(atlasStatusLine(ledger) ? [atlasStatusLine(ledger)] : []),
+			...(tokensStatusLine(ledger) ? [tokensStatusLine(ledger)] : []),
 			"",
 			"Cards:",
 		];

@@ -1,5 +1,5 @@
 import type { Decision, ProgramLedger } from "../shared/types.ts";
-import { oneLine } from "../shared/text.ts";
+import { formatTokens, oneLine } from "../shared/text.ts";
 import type { OperatorTodoItem } from "../program/operator-todos.ts";
 import { counts, nextDecisionId } from "./phases.ts";
 
@@ -127,7 +127,8 @@ export function programCompleteMessage(ledger: ProgramLedger, openTodos: Operato
 			continue;
 		}
 		const landing = card.merge?.commit ? `merged ${card.merge.commit.slice(0, 7)}` : "done";
-		lines.push(`- ${card.id} ${card.title} — ${landing} (${card.cycles} review cycle(s))`);
+		const usage = card.usage ? ` · ${formatTokens(card.usage.total)} tok` : "";
+		lines.push(`- ${card.id} ${card.title} — ${landing} (${card.cycles} review cycle(s))${usage}`);
 	}
 	const triaged = ledger.decisions.filter(
 		(decision) => decision.kind === "review-triage" && decision.status === "resolved" && decision.verdicts,
@@ -152,6 +153,24 @@ export function programCompleteMessage(ledger: ProgramLedger, openTodos: Operato
 		lines.push(`Program gate: green (${ledger.programGate.map((gate) => gate.command).join(", ")}).`);
 	} else {
 		lines.push("Program gate: none configured.");
+	}
+	let tokenTotal = 0;
+	let costTotal = 0;
+	let hasUsage = false;
+	for (const id of ledger.order) {
+		const usage = ledger.cards[id]?.usage;
+		if (!usage) continue;
+		hasUsage = true;
+		tokenTotal += usage.total;
+		costTotal += usage.costUsd ?? 0;
+	}
+	if (ledger.atlas?.usage) {
+		hasUsage = true;
+		tokenTotal += ledger.atlas.usage.total;
+		costTotal += ledger.atlas.usage.costUsd ?? 0;
+	}
+	if (hasUsage) {
+		lines.push(`Tokens: ${formatTokens(tokenTotal)} total${costTotal > 0 ? ` · $${costTotal.toFixed(2)}` : ""} across all runs (cards + scout).`);
 	}
 	if (openTodos.length > 0) {
 		lines.push("", `Open operator todos (${openTodos.length}) — still needing human hands (.operator/todo.md):`);

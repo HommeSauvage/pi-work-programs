@@ -209,21 +209,29 @@ plan and card files stay the source of truth; `sync` reconciles.
 ## Retuning a running program
 
 - The orchestrator can change program behaviour mid-flight instead of working
-  around it: `work_program({ action: "config", maxCycles, onExhausted,
-  reviewProfile, maxParallel, parallelExecution, mode, workerAgent,
-  workerModel, workerThinking, reviewerAgent, reviewerModel,
-  reviewerThinking })`.
-- One card is retuned the same way with `card` set: `work_program({
-  action: "config", card: "05", maxCycles: 5, reviewProfile: "enhanced"
-  })`. Card models work the same way (`workerModel`, `reviewerModel`,
-  `thinking`); an empty string clears a card override so it inherits the
-  program default. Always use `config` with `card` — never hand-edit card
-  front matter.
-- `maxCycles` is **review cycles before the harness asks** (default 3). Setting
-  it low does not silence the question — it makes the question arrive sooner.
-  The question is binary: `accept` (land it, with the unfixed findings recorded
-  on the card) or `block` (park it). Extra review rounds are deliberately not
-  offerable.
+  around it: `work_program({ action: "config", onExhausted, reviewProfile,
+  maxParallel, parallelExecution, mode, workerAgent, workerModel,
+  workerThinking, reviewerAgent, reviewerModel, reviewerThinking,
+  reviewerResume, runTimeoutMs, resumeMaxWindowPeak, resumeMaxDepth,
+  atlasEnabled, atlasAgent, atlasModel, atlasThinking })`.
+- **`maxCycles` is not on that list: cycle budgets are operator-only.** An
+  agent never raises or lowers one — not to finish a stuck card, not to
+  unblock the drive, not to avoid a cycle decision. The call is refused unless
+  it carries `operatorApproved: true`, which is only legitimate when the
+  operator explicitly asked for that exact change in the conversation; the
+  change is then written to `progress.md` as `(operator-authorized)`. The
+  operator may also edit `plan.md` or the card's front matter by hand.
+- One card is retuned with `card` set: `work_program({ action: "config", card:
+  "05", reviewProfile: "enhanced" })`. Card models work the same way
+  (`workerModel`, `reviewerModel`, `thinking`); an empty string clears a card
+  override so it inherits the program default. Always use `config` with `card`
+  — never hand-edit card front matter (the operator's cycle-budget edits are
+  the one exception).
+- `maxCycles` is **review cycles before the harness asks** (default 3, set at
+  plan time). The question is binary: `accept` (land it, with the unfixed
+  findings recorded on the card) or `block` (park it). Extra review rounds are
+  deliberately not offerable — a stuck card is an operator decision, not an
+  agent budget bump.
 - `onExhausted` pre-answers the question: `"accept"` approves exhausted cards —
   recording their unfixed findings — and resolves any **open** cycle decisions
   in the same call; `"block"` pre-answers with a park; `"ask"` (default) raises
@@ -285,6 +293,14 @@ plan and card files stay the source of truth; `sync` reconciles.
   pi-subagents `reviewer` does not and cannot run gates).
 - Gates are set per program (`gates.card`) and may be overridden per card in
   its front matter (`gates: [...]`, or `gates: []` for gate-free cards).
+- **Gates are discovered at plan time, never invented.** Whoever writes the
+  plan reads the repository's own check commands — `package.json` scripts, CI
+  workflows, `Makefile`/`justfile`, `turbo.json`/`nx.json`/`mise.toml`,
+  `AGENTS.md`/`CONTRIBUTING.md` — and writes the canonical one into the plan
+  front matter so every card inherits it. A program that declares no gate at
+  all is staged with a warning and every card hands off with
+  `gate: no gates configured`: legal, but its "gates green" is a claim, not a
+  check. `gates: []` on a card is a deliberate exemption, not a fallback.
 - Every run has a wall-clock budget (`runTimeoutMs`, default 4h): pi-subagents
   kills single async runs at 30 minutes otherwise. Resumed runs (fixes,
   re-reviews, atlas refreshes) keep the runner's own timeout — the RPC accepts

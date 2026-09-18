@@ -1,10 +1,10 @@
 /** Minimal YAML front-matter support (zero-dep, no gray-matter).
  *
- *  We only need the subset we write ourselves: flat `key: value` pairs, one
- *  level of nesting (`review:\n  profile: enhanced`), and small arrays either
- *  inline (`[a, b]`) or as dash lists. Anything richer falls back to plain
- *  strings — the config normalizers clamp/ignore the rest, so a hand-edited
- *  file can never crash the drive.
+ *  We only need the subset we write ourselves: flat `key: value` pairs, nested
+ *  maps (`gates:\n  card:\n    - "bun run check"`), and arrays either inline
+ *  (`[a, b]`) or as dash lists at any depth. Anything richer falls back to plain
+ *  strings — the config normalizers clamp/ignore the rest, so a hand-edited file
+ *  can never crash the drive.
  */
 
 export interface FrontmatterResult {
@@ -119,13 +119,51 @@ function indentOf(line: string): number {
 	return match?.[1]?.replace(/\t/g, "  ").length ?? 0;
 }
 
-/** Tiny YAML subset: flat scalars, one-level maps, inline + dash-list arrays. */
+/** Tiny YAML subset: scalars, nested maps, inline arrays, dash lists at any depth. */
 function parseYamlSubset(raw: string): Record<string, unknown> {
+	const parsed = parseYamlBlock(raw.split("\n"));
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
+	return parsed as Record<string, unknown>;
+}
+
+/** Strip the block's own indentation so nested lines start at column 0. */
+function dedentBlock(lines: string[]): string[] {
+	const indents = lines.filter((line) => line.trim().length > 0).map(indentOf);
+	if (indents.length === 0) return lines;
+	const min = Math.min(...indents);
+	if (min === 0) return lines;
+	return lines.map((line) => {
+		let remaining = min;
+		let rest = line;
+		while (remaining > 0 && (rest.startsWith(" ") || rest.startsWith("\t"))) {
+			const char = rest[0] ?? "";
+			rest = rest.slice(1);
+			remaining -= char === "\t" ? 2 : 1;
+		}
+		return rest;
+	});
+}
+
+/** Parse an already-dedented block: either a dash list or a map. */
+function parseYamlBlock(input: string[]): unknown {
+	const first = input.find((line) => line.trim().length > 0);
+	if (first === undefined) return "";
+	if (first.trim().startsWith("- ")) {
+		const items: unknown[] = [];
+		let index = 0;
+		while (index < input.length) {
+			const line = input[index] ?? "";
+			index += 1;
+			if (line.trim().length === 0 || line.trim().startsWith("#")) continue;
+			if (!line.trim().startsWith("- ")) break;
+			items.push(parseScalar(line.trim().slice(2).trim()));
+		}
+		return items;
+	}
 	const out: Record<string, unknown> = {};
-	const lines = raw.split("\n");
 	let i = 0;
-	while (i < lines.length) {
-		const line = lines[i] ?? "";
+	while (i < input.length) {
+		const line = input[i] ?? "";
 		const trimmed = line.trim();
 		i += 1;
 		if (trimmed.length === 0 || trimmed.startsWith("#")) continue;
@@ -138,37 +176,25 @@ function parseYamlSubset(raw: string): Record<string, unknown> {
 			out[key] = parseScalar(rest);
 			continue;
 		}
-		// Nested block: collect indented children.
+		// Nested block: collect the indented children and recurse (dash list or map).
 		const children: string[] = [];
-		while (i < lines.length) {
-			const child = lines[i] ?? "";
+		while (i < input.length) {
+			const child = input[i] ?? "";
 			if (child.trim().length === 0) {
+				children.push(child);
 				i += 1;
 				continue;
 			}
 			if (indentOf(child) === 0) break;
-			children.push(child.replace(/^  /, ""));
+			children.push(child);
 			i += 1;
 		}
-		if (children.length === 0) {
+		const meaningful = children.filter((child) => child.trim().length > 0);
+		if (meaningful.length === 0) {
 			out[key] = "";
 			continue;
 		}
-		if (children.every((child) => child.trim().startsWith("- "))) {
-			out[key] = children.map((child) => parseScalar(child.trim().slice(2).trim()));
-			continue;
-		}
-		const nested: Record<string, unknown> = {};
-		for (const child of children) {
-			const childTrimmed = child.trim();
-			if (childTrimmed.length === 0 || childTrimmed.startsWith("#")) continue;
-			const childColon = childTrimmed.indexOf(":");
-			if (childColon === -1) continue;
-			const childKey = childTrimmed.slice(0, childColon).trim();
-			if (!childKey) continue;
-			nested[childKey] = parseScalar(childTrimmed.slice(childColon + 1).trim());
-		}
-		out[key] = nested;
+		out[key] = parseYamlBlock(dedentBlock(meaningful));
 	}
 	return out;
 }

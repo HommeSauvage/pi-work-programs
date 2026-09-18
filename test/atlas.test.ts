@@ -94,13 +94,39 @@ describe("program atlas", () => {
 
 		const refresh = t.fake.resumed.find((entry) => entry.target === scoutRun);
 		expect(refresh).toBeDefined();
-		expect(refresh?.message).toContain("landed in the program branch");
+		// A refresh is a delta prompt, never the build brief replayed.
+		expect(refresh?.message).not.toContain("Produce the program atlas");
+		expect(refresh?.message).toContain("just closed");
 		expect(refresh?.message).toContain("Card 01");
+		expect(refresh?.message).toContain("surgically");
 		expect(t.ledger.atlas?.pendingMerges).toHaveLength(0);
 		expect(t.ledger.atlas?.refreshes).toBe(1);
 		expect(t.ledger.atlas?.state).toBe("ready");
 		// Refresh usage accumulates onto the atlas totals.
 		expect(t.ledger.atlas?.usage?.total).toBe(16_000);
+	});
+
+	test("a scout refresh still in flight is closed out when the program completes", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await drive(t.host);
+		writeLaneEvidence(t, "01", "$ bun test\n3 pass");
+		t.completeRun(t.fake.dispatched.at(-1)!.runId, { output: "implemented" });
+		await drive(t.host);
+		const review = t.fake.dispatched.find((entry) => entry.request.kind === "reviewer")!;
+		t.completeRun(review.runId, { output: "No issues found." });
+		await drive(t.host);
+		// A refresh that never got reconciled: an in-flight scout run on the ledger.
+		t.fake.statuses.set("scout-refresh-inflight", { state: "running" });
+		t.ledger.atlas!.state = "refreshing";
+		t.ledger.atlas!.runId = "scout-refresh-inflight";
+		t.ledger.atlas!.startedAt = Date.now();
+		expect(applyTriage(t.host, "01", []).ok).toBe(true);
+		await drive(t.host);
+		expect(t.ledger.status).toBe("complete");
+		expect(t.ledger.atlas?.state as string).toBe("ready");
+		expect(t.ledger.atlas?.runId).toBeUndefined();
+		expect(t.ledger.atlas?.pendingMerges).toHaveLength(0);
+		expect(t.fake.progress.some((line) => line.includes("atlas close-out at program completion"))).toBe(true);
 	});
 
 	test("atlas disabled: no scout, no pointer", async () => {

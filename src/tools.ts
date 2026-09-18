@@ -23,6 +23,7 @@ interface WorkProgramParams {
 	remove?: boolean;
 	hard?: boolean;
 	maxCycles?: number;
+	operatorApproved?: boolean;
 	onExhausted?: string;
 	reviewProfile?: string;
 	maxParallel?: number;
@@ -95,6 +96,7 @@ export function registerTools(pi: ExtensionAPI, controller: WorkProgramControlle
 		promptGuidelines: [
 			"Use suggest_work_program when a request spans multiple sessions, has several dependent deliverables, or would outlive the current context; do not use it for ordinary single-change requests.",
 			"After suggest_work_program returns scaffold instructions, write plan.md and tasks/*.md yourself (you have the conversation context), then validate with work_program action 'finalize_plan'.",
+			"Discover gates before writing cards: read the repository's own check commands (package.json scripts, CI workflows, Makefile/justfile, turbo/nx/mise, AGENTS.md/CONTRIBUTING.md) and declare them in the plan front matter as `gates.card` (cards inherit it), with per-card `gates:` overrides where a card needs something narrower. Never invent a command; `gates: []` only when the repo truly has no runnable check, and say so in done-when. finalize_plan warns when nothing is declared.",
 			"After finalize_plan, STOP: present the plan and cards to the operator for review and wait for an explicit start. Never call resume, start, or dispatch on your own — only after the operator explicitly says to start may you call work_program with action 'resume'.",
 		],
 		parameters: Type.Object({
@@ -130,8 +132,9 @@ export function registerTools(pi: ExtensionAPI, controller: WorkProgramControlle
 			"finalize_plan only validates and stages a program — it never starts execution. After writing a plan, STOP and wait for the operator to review; only call resume/start/dispatch after the operator explicitly says to start.",
 			"When a work program completes, you receive a summary packet: reply with a completion summary, then ask whether to close the program. Only call close with remove:true after the operator explicitly confirms — never delete program records unprompted.",
 			"Pause is soft by default (in-flight runs finish, resume reconciles); pass hard:true to stop runs immediately and rearm their cards. Resume restarts the drive.",
-			"The program is retunable while it runs: work_program({ action: \"config\", maxCycles, onExhausted, reviewProfile, maxParallel, parallelExecution, workerAgent, workerModel, workerThinking, reviewerAgent, reviewerModel, reviewerThinking, reviewerResume, atlasEnabled, atlasAgent, atlasModel, atlasThinking }) updates the live ledger and persists into plan.md front matter, so it survives sync and reload. Use it instead of answering cycle decisions one by one (onExhausted: \"accept\" also resolves the open ones), and instead of editing plan.md by hand.",
-			"Retune one card the same way with card set: work_program({ action: \"config\", card: \"05\", maxCycles: 5, reviewProfile: \"enhanced\" }) updates the live ledger row and persists into that card file's front matter. Card models work the same way (workerModel, reviewerModel, thinking); pass an empty string to clear a card override so it inherits the program default. Never hand-edit card front matter — always use config with card.",
+			"The program is retunable while it runs: work_program({ action: \"config\", onExhausted, reviewProfile, maxParallel, parallelExecution, workerAgent, workerModel, workerThinking, reviewerAgent, reviewerModel, reviewerThinking, reviewerResume, atlasEnabled, atlasAgent, atlasModel, atlasThinking, runTimeoutMs, resumeMaxWindowPeak, resumeMaxDepth }) updates the live ledger and persists into plan.md front matter, so it survives sync and reload. Use it instead of answering cycle decisions one by one (onExhausted: \"accept\" also resolves the open ones), and instead of editing plan.md by hand.",
+			"maxCycles is OPERATOR-ONLY and immutable to you: never raise or lower a cycle budget on your own — not to finish a card, not to unblock the drive, not to silence a cycle decision. When the operator explicitly asks for a cycle-budget change, pass operatorApproved: true (it is written to progress.md as operator-authorized); otherwise the call is refused. The operator may also edit plan.md / card front matter by hand.",
+			"Retune one card with card set: work_program({ action: \"config\", card: \"05\", reviewProfile: \"enhanced\" }) updates the live ledger row and persists into that card file's front matter. Card models work the same way (workerModel, reviewerModel, thinking); pass an empty string to clear a card override so it inherits the program default. Never hand-edit card front matter — always use config with card.",
 			"When a work-program decision packet arrives, answer with the exact work_program call it names (for review triage use action 'triage' with one verdict per finding).",
 			"Operator todos are chat-driven: list with todos, create with todo_add (blocking parks the card until resolved), rewrite with todo_update (title, body, steps), resolve with todo_done (the card resumes on its own) or todo_drop. Present open todos conversationally (title, why, exact steps/commands) instead of quoting storage. Never write or edit .operator/todos.json or .operator/todo.md directly — always use the todo actions.",
 		],
@@ -152,7 +155,16 @@ export function registerTools(pi: ExtensionAPI, controller: WorkProgramControlle
 				Type.Boolean({ description: "pause with hard=true stops in-flight runs immediately (default soft: let them finish)" }),
 			),
 			maxCycles: Type.Optional(
-				Type.Number({ description: "config: review cycles before the harness asks (0-32); lowering it applies to the next triage" }),
+				Type.Number({
+					description:
+						"config: OPERATOR-ONLY cycle budget. Refused unless operatorApproved: true, which only the operator's explicit request may set (logged as operator-authorized). Never change it on your own initiative.",
+				}),
+			),
+			operatorApproved: Type.Optional(
+				Type.Boolean({
+					description:
+						"config: set true ONLY together with maxCycles and ONLY when the operator explicitly asked for that exact cycle-budget change in this conversation. Anything else is refused.",
+				}),
 			),
 			onExhausted: Type.Optional(
 				Type.String({ description: "config: ask | accept | block when maxCycles is reached; accept also resolves open cycle decisions" }),
@@ -286,6 +298,7 @@ export function registerTools(pi: ExtensionAPI, controller: WorkProgramControlle
 					const patch: Record<string, unknown> = {};
 					if (params.card !== undefined) patch.card = params.card;
 					if (params.maxCycles !== undefined) patch.maxCycles = params.maxCycles;
+					if (params.operatorApproved !== undefined) patch.operatorApproved = params.operatorApproved;
 					if (params.onExhausted !== undefined) patch.onExhausted = params.onExhausted;
 					if (params.reviewProfile !== undefined) patch.reviewProfile = params.reviewProfile;
 					if (params.maxParallel !== undefined) patch.maxParallel = params.maxParallel;

@@ -1414,6 +1414,25 @@ async function maybeRefreshAtlas(host: DriverHost): Promise<void> {
 		...(entry.commit ? { commit: entry.commit } : {}),
 	}));
 	const label = merged.map((entry) => entry.id).join(",");
+	// Hand the scout the merged diff instead of letting it go looking: a refresh
+	// should be a few surgical edits, not a re-exploration. Best-effort — the
+	// brief degrades to "use git log" when the diff cannot be read.
+	let diffContext: { headSha?: string; commitLog?: string; diffStat?: string; changedFiles?: string[] } = {};
+	const mergeCommits = merged.map((entry) => entry.commit).filter((sha): sha is string => Boolean(sha));
+	if (mergeCommits.length > 0) {
+		const base = `${mergeCommits[0]}~1`;
+		try {
+			const [headSha, commitLog, diffStat, changedFiles] = await Promise.all([
+				host.ports.git.head(host.cwd),
+				host.ports.git.commitLog(host.cwd, `${base}..HEAD`),
+				host.ports.git.diffStat(host.cwd, base, "HEAD"),
+				host.ports.git.changedFiles(host.cwd, base, "HEAD"),
+			]);
+			diffContext = { headSha, commitLog, diffStat, changedFiles };
+		} catch {
+			diffContext = {};
+		}
+	}
 	if (atlas.runId) {
 		try {
 			const result = await host.ports.runs.resume(
@@ -1424,6 +1443,7 @@ async function maybeRefreshAtlas(host: DriverHost): Promise<void> {
 					cwd: host.cwd,
 					merged,
 					fresh: false,
+					...diffContext,
 				}),
 			);
 			atlas.state = "refreshing";
@@ -1439,7 +1459,14 @@ async function maybeRefreshAtlas(host: DriverHost): Promise<void> {
 	}
 	const dispatched = await dispatchScout(
 		host,
-		scoutRefreshBrief({ ledger: host.ledger, atlasPath: atlasPath(host.programDir), cwd: host.cwd, merged, fresh: true }),
+		scoutRefreshBrief({
+			ledger: host.ledger,
+			atlasPath: atlasPath(host.programDir),
+			cwd: host.cwd,
+			merged,
+			fresh: true,
+			...diffContext,
+		}),
 		"refreshing",
 	);
 	if (dispatched) {
@@ -1620,6 +1647,7 @@ export async function startReviewFor(host: DriverHost, card: CardLedger): Promis
 				kind: "reviewer",
 				runId: result.runId,
 				startedAt: Date.now(),
+				resumed: true,
 				...(result.asyncDir ? { asyncDir: result.asyncDir } : {}),
 			};
 			card.reviewRun = result.runId;
@@ -2291,6 +2319,34 @@ async function maybeRunProgramGate(host: DriverHost): Promise<void> {
 async function completeProgram(host: DriverHost, how: string): Promise<void> {
 	const ledger = host.ledger;
 	ledger.status = "complete";
+	// Cards are done, so nothing consumes the atlas any more: close out a scout
+	// run left in flight instead of leaving the ledger stuck on "refreshing".
+	// The file is the source of truth — a landed atlas.md is simply "ready".
+	const atlas = ledger.atlas;
+	if (atlas?.enabled && (atlas.state === "building" || atlas.state === "refreshing")) {
+		const previous = atlas.state;
+		let atlasText = "";
+		try {
+			atlasText = (await host.ports.readFile(atlasPath(host.programDir))).trim();
+		} catch {
+			atlasText = "";
+		}
+		atlas.pendingMerges = [];
+		atlas.runId = undefined;
+		atlas.asyncDir = undefined;
+		atlas.startedAt = undefined;
+		atlas.nextRefreshAt = undefined;
+		if (atlasText.length > 0) {
+			atlas.state = "ready";
+			atlas.updatedAt = Date.now();
+			if (previous === "building") atlas.builtAt = atlas.updatedAt;
+			await progressProgram(host, `atlas close-out at program completion (${previous} → ready)`);
+		} else {
+			atlas.state = "failed";
+			atlas.lastError = `program completed before the scout produced atlas.md (was ${previous})`;
+			await progressProgram(host, `atlas close-out at program completion (${previous} → failed: no atlas.md)`);
+		}
+	}
 	await progress(host, `program complete (${how})`);
 	try {
 		await host.ports.git.commitRecords(

@@ -14,6 +14,35 @@ import { DEFAULT_SETTINGS, applyOverrides } from "../src/config.ts";
 import { buildLedger } from "../src/program/ledger.ts";
 
 describe("frontmatter parser", () => {
+	test("parses nested maps with dash lists at two levels (gates)", () => {
+		const text = [
+			"---",
+			"gates:",
+			"  card:",
+			'    - "bun run check"',
+			'    - "bun test"',
+			"  program:",
+			'    - "bun run e2e"',
+			"mode: managed",
+			"---",
+			"",
+			"# Title",
+		].join("\n");
+		const { data } = parseFrontmatter(text);
+		expect(data.gates).toEqual({ card: ["bun run check", "bun test"], program: ["bun run e2e"] });
+		expect(data.mode).toBe("managed");
+	});
+
+	test("nested maps with dash lists round-trip through the writer", () => {
+		const written = stringifyFrontmatter({
+			gates: { card: ["bun run check"], program: [] },
+			review: { profile: "light", maxCycles: 3 },
+		});
+		const { data } = parseFrontmatter(`---\n${written}\n---\n\n# Title\n`);
+		expect(data.gates).toEqual({ card: ["bun run check"], program: [] });
+		expect(data.review).toEqual({ profile: "light", maxCycles: 3 });
+	});
+
 	test("parses flat and nested keys", () => {
 		const text = ["---", "mode: managed", "maxParallel: 3", "review:", "  profile: enhanced", "  maxCycles: 5", "---", "", "# Title", ""].join("\n");
 		const { data, body } = parseFrontmatter(text);

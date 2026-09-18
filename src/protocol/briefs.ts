@@ -344,6 +344,11 @@ export function scoutRefreshBrief(input: {
 	cwd: string;
 	merged: Array<{ id: string; title: string; commit?: string }>;
 	fresh: boolean;
+	/** Program branch head after the merges, when it was readable. */
+	headSha?: string;
+	commitLog?: string;
+	diffStat?: string;
+	changedFiles?: string[];
 }): string {
 	const { ledger } = input;
 	const lines = input.merged.map(
@@ -352,24 +357,35 @@ export function scoutRefreshBrief(input: {
 	return [
 		...(input.fresh
 			? [
-					`You are the context scout for the work program "${ledger.title}" (${ledger.slug}). An atlas already exists at ${input.atlasPath} from a previous scout — read it first; it is your starting point, not something to rebuild.`,
+					`You are the context scout for the work program "${ledger.title}" (${ledger.slug}) doing a REFRESH — not a build. An atlas already exists at ${input.atlasPath}: read that one file, then update it in place. Never rebuild it and never re-explore the repository.`,
 					"",
 				]
 			: []),
-		`Since the atlas was last updated, these cards of "${ledger.title}" (${ledger.slug}) landed in the program branch at ${input.cwd}:`,
+		`Card${input.merged.length === 1 ? "" : "s"} just closed in "${ledger.title}" (${ledger.slug})${input.headSha ? `, program branch now at ${input.headSha.slice(0, 12)}` : ""}:`,
 		"",
 		...lines,
 		"",
-		`Each card file lives under ${ledger.dir}/${ledger.slug}/tasks/ and its ## Evidence section names its commits; you can also find them with \`git log --grep="wp(${ledger.slug}) <id>"\`. Inspect the merged changes as needed.`,
-		"",
-		`Update ${input.atlasPath} where these changes outdated it: module map entries, integration points, conventions, negative knowledge, and the per-card pointers of UPCOMING cards (a card that just landed needs no pointer; cards building on it do).`,
+		"What landed is this diff — it is your whole scope:",
+		"```",
+		truncateTail(input.commitLog?.trim() ?? "", 1_500) || "(commit list unavailable — `git log --oneline -20`)",
+		"```",
+		"```",
+		truncateTail(input.diffStat?.trim() ?? "", 2_500) || "(diffstat unavailable — `git diff --stat HEAD~1`)",
+		"```",
+		...(input.changedFiles && input.changedFiles.length > 0
+			? [`Changed files: ${input.changedFiles.slice(0, 60).join(", ")}`, ""]
+			: []),
+		`Update ${input.atlasPath} surgically — only where this diff made it stale: a moved or renamed module, a changed contract or convention, an integration point, negative knowledge, and the per-card pointers of the cards that have NOT run yet (a card that just landed needs no pointer; the cards building on it do).`,
 		"",
 		"Rules:",
-		"- Keep the 12,000-character cap and the section structure. Update in place; do not rewrite wholesale.",
-		"- Verify before writing: if a merge renamed/moved something the atlas references, fix the reference.",
+		"- The plan, the card files, and the current atlas are already in your context from your earlier work — do NOT re-read them and do not re-explore the repository.",
+		"- Read at most the handful of files the atlas references that this diff touched, and only where the diffstat alone cannot tell you whether a pointer is still true.",
+		"- Prefer 1-4 targeted edits over a rewrite. Keep the 12,000-character cap and the section structure.",
+		"- Verify every path and symbol you write still exists after the merge.",
+		"- If nothing in the atlas is invalidated, edit nothing and reply `no change`.",
 		`- Read-only otherwise: do not create or modify any file except ${input.atlasPath}.`,
 		"",
-		"Reply with at most 5 lines: sections updated, or \"no change\".",
+		"Reply with at most 3 lines: the sections you touched, or \"no change\".",
 	].join("\n");
 }
 

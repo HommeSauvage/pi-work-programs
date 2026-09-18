@@ -56,6 +56,35 @@ describe("reviewer resume across cycles", () => {
 		expect(t.ledger.cards["01"]?.reviewRun).toBe(resume!.runId);
 	});
 
+	test("a resumed reviewer run is recorded as resumed in the telemetry", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		const session = "/sessions/reviewer-01.jsonl";
+		const usage = { input: 1_000, output: 200, total: 5_000, windowPeak: 40_000, turns: 5, tools: 3, costUsd: 0.01 };
+		await drive(t.host);
+		writeLaneEvidence(t, "01", "$ bun test\n3 pass");
+		t.completeRun(t.fake.dispatched.find((entry) => entry.request.kind === "worker")!.runId, { output: "implemented" });
+		await drive(t.host);
+		const reviewRun = t.fake.dispatched.find((entry) => entry.request.kind === "reviewer")!.runId;
+		t.completeRun(reviewRun, { output: "## Findings\n- F1: missing null check", sessionFile: session, usage });
+		await drive(t.host);
+		expect(applyTriage(t.host, "01", [{ finding: "F1: missing null check", verdict: "approve" }]).ok).toBe(true);
+		await drive(t.host);
+		writeLaneEvidence(t, "01", "$ bun test\n5 pass (fix)");
+		t.completeRun(t.ledger.cards["01"]!.activeRun!.runId, { output: "fixed" });
+		await drive(t.host);
+		// Cycle 2 resumes the retained reviewer; the resumed run must be recorded as such.
+		const resumed = t.ledger.cards["01"]!.activeRun!;
+		expect(resumed.kind).toBe("reviewer");
+		expect(resumed.resumed).toBe(true);
+		t.completeRun(resumed.runId, { output: "## Findings\n- none", sessionFile: session, usage: { ...usage, turns: 2 } });
+		await drive(t.host);
+		const runs = t.ledger.cards["01"]?.usageRuns ?? [];
+		expect(runs.some((run) => run.kind === "reviewer" && run.resumed === true)).toBe(true);
+		expect(runs.some((run) => run.kind === "reviewer" && run.resumed !== true)).toBe(true);
+		// Resumed runs share their session: one reviewer session row, not two.
+		expect((t.ledger.cards["01"]?.usageSessions ?? []).filter((row) => row.kind === "reviewer")).toHaveLength(1);
+	});
+
 	test("reviewerResume: false keeps a fresh reviewer per cycle", async () => {
 		const t = createTestHost({ cards: [{ id: "01" }], reviewerResume: false });
 		const { reviewRun } = await driveToSecondReview(t, "01");

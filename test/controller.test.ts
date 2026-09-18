@@ -260,11 +260,24 @@ describe("session idle detection", () => {
 });
 
 describe("runtime config", () => {
-	test("lowers maxCycles, records it, and persists it into plan.md", async () => {
+	test("maxCycles is refused unless the operator's request is explicit", async () => {
+		const { controller } = await setupProgram();
+		const program = await controller.setConfig({ maxCycles: 1 });
+		expect(program.ok).toBe(false);
+		expect(program.text).toContain("operator-only");
+		const card = await controller.setConfig({ card: "01", maxCycles: 5 });
+		expect(card.ok).toBe(false);
+		expect(card.text).toContain("operator-only");
+		// Nothing changed and nothing was recorded.
+		expect(controller.getActive()!.ledger.maxCycles).toBe(3);
+		expect(controller.getActive()!.ledger.cards["01"]?.maxCycles).toBeUndefined();
+	});
+
+	test("lowers maxCycles when operator-approved, records it as authorized, persisting into plan.md", async () => {
 		const { controller, cwd } = await setupProgram();
-		const result = await controller.setConfig({ maxCycles: 1 });
+		const result = await controller.setConfig({ maxCycles: 1, operatorApproved: true });
 		expect(result.ok).toBe(true);
-		expect(result.text).toContain("maxCycles 3→1");
+		expect(result.text).toContain("maxCycles 3→1 (operator-authorized)");
 		const ledger = controller.getActive()!.ledger;
 		expect(ledger.maxCycles).toBe(1);
 		const { readFile } = await import("node:fs/promises");
@@ -272,12 +285,12 @@ describe("runtime config", () => {
 		expect(plan).toContain("maxCycles: 1");
 		expect(plan.startsWith("---")).toBe(true);
 		const progress = await readFile(join(cwd, ".agents", "work-programs", "test-program", "progress.md"), "utf8");
-		expect(progress).toContain("config: maxCycles 3→1");
+		expect(progress).toContain("config: maxCycles 3→1 (operator-authorized)");
 	});
 
 	test("the change survives a sync from disk", async () => {
 		const { controller } = await setupProgram();
-		await controller.setConfig({ maxCycles: 1, reviewProfile: "enhanced" });
+		await controller.setConfig({ maxCycles: 1, operatorApproved: true, reviewProfile: "enhanced" });
 		const synced = await controller.syncFromDisk();
 		expect(synced.ok).toBe(true);
 		const ledger = controller.getActive()!.ledger;
@@ -311,7 +324,7 @@ describe("runtime config", () => {
 
 	test("rejects nonsense and unrelated keys", async () => {
 		const { controller } = await setupProgram();
-		expect((await controller.setConfig({ maxCycles: 99 })).ok).toBe(false);
+		expect((await controller.setConfig({ maxCycles: 99, operatorApproved: true })).ok).toBe(false);
 		expect((await controller.setConfig({ reviewProfile: "deep" as never })).ok).toBe(false);
 		expect((await controller.setConfig({})).ok).toBe(false);
 	});
@@ -332,7 +345,7 @@ describe("runtime config", () => {
 describe("card-scoped config", () => {
 	test("sets a card's maxCycles and review profile into ledger + front matter", async () => {
 		const { controller, cwd } = await setupProgram();
-		const result = await controller.setConfig({ card: "01", maxCycles: 5, reviewProfile: "enhanced" });
+		const result = await controller.setConfig({ card: "01", maxCycles: 5, operatorApproved: true, reviewProfile: "enhanced" });
 		expect(result.ok).toBe(true);
 		expect(result.text).toContain("card 01 maxCycles");
 		const ledger = controller.getActive()!.ledger;
@@ -350,7 +363,7 @@ describe("card-scoped config", () => {
 
 	test("the card change survives a sync from disk", async () => {
 		const { controller } = await setupProgram();
-		await controller.setConfig({ card: "01", maxCycles: 1 });
+		await controller.setConfig({ card: "01", maxCycles: 1, operatorApproved: true });
 		const synced = await controller.syncFromDisk();
 		expect(synced.ok).toBe(true);
 		expect(controller.getActive()!.ledger.cards["01"]?.maxCycles).toBe(1);
@@ -371,9 +384,31 @@ describe("card-scoped config", () => {
 	test("program-only knobs are refused with card set, unknown cards fail", async () => {
 		const { controller } = await setupProgram();
 		expect((await controller.setConfig({ card: "01", mode: "captain" as never })).ok).toBe(false);
-		expect((await controller.setConfig({ card: "99", maxCycles: 2 })).ok).toBe(false);
+		expect((await controller.setConfig({ card: "99", maxCycles: 2, operatorApproved: true })).ok).toBe(false);
 		expect((await controller.setConfig({ card: "01", reviewProfile: "deep" as never })).ok).toBe(false);
 		expect((await controller.setConfig({ card: "01" })).ok).toBe(false);
+	});
+});
+
+describe("gates discovery", () => {
+	test("finalize warns when nothing declares a gate", async () => {
+		const { controller } = await setupProgram();
+		const result = await controller.finalizePlan();
+		expect(result.ok).toBe(true);
+		expect(result.text).toContain("NO GATES DECLARED");
+		expect(result.text).toContain("gates:");
+	});
+
+	test("a program gate declared in the plan silences the warning", async () => {
+		const { controller, cwd } = await setupProgram();
+		const { readFile, writeFile } = await import("node:fs/promises");
+		const planPath = join(cwd, ".agents", "work-programs", "test-program", "plan.md");
+		const plan = await readFile(planPath, "utf8");
+		await writeFile(planPath, `---\ngates:\n  card:\n    - "bun run check"\n---\n\n${plan}`, "utf8");
+		const result = await controller.finalizePlan();
+		expect(result.ok).toBe(true);
+		expect(result.text).not.toContain("NO GATES DECLARED");
+		expect(controller.getActive()!.ledger.gates.card).toEqual(["bun run check"]);
 	});
 });
 

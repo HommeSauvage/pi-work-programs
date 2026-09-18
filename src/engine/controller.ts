@@ -115,6 +115,12 @@ export function appendAcceptedFindings(cardText: string, findings: string[]): st
 	return `${cardText.trimEnd()}\n${block}`;
 }
 
+/** Cycle budgets are the operator's knob, never the agent's. Raising one to
+ *  finish a card defeats the point of the cap; the agent must ask instead.
+ *  `operatorApproved: true` is the explicit-request marker (see setConfig). */
+export const CYCLE_BUDGET_LOCKED =
+	"maxCycles is operator-only: cycle budgets are not an agent-retunable knob. Never raise or lower one on your own — not to finish a card, not to unblock the drive. Ask the operator and let them decide (they may edit plan.md / the card front matter, or explicitly ask you to do it: then pass operatorApproved: true, which is logged as operator-authorized).";
+
 /** Runtime knobs an orchestrator may retune while the program runs.
  *  With `card` set, the patch applies to one card's front matter instead of
  *  the program (reviewProfile, maxCycles, worker/reviewer agent+model+thinking).
@@ -124,6 +130,8 @@ export interface ProgramConfigPatch {
 	mode?: Mode;
 	reviewProfile?: ReviewProfile;
 	maxCycles?: number;
+	/** Only set alongside `maxCycles`, and only when the operator explicitly asked for that exact change. */
+	operatorApproved?: boolean;
 	onExhausted?: "ask" | "accept" | "block";
 	maxParallel?: number;
 	parallelExecution?: ParallelExecution;
@@ -737,18 +745,36 @@ export class WorkProgramController {
 		ledger.decisions = existing.decisions;
 		ledger.mergeQueue = existing.mergeQueue;
 		ledger.programGate = existing.programGate;
+		// Gates are how a card's claims become checkable. A program that declares
+		// none is legal but silent about it — say so at staging time, loudly.
+		const programGates = (ledger.gates.card?.length ?? 0) + (ledger.gates.program?.length ?? 0);
+		const cardGates = validation.cards.filter((card) => (card.gates?.length ?? 0) > 0).length;
+		const gatesWarning =
+			programGates === 0 && cardGates === 0
+				? [
+					"",
+					"NO GATES DECLARED — every card will hand off with `gate: no gates configured`, so worker/reviewer claims stay unverified.",
+					"Discover the repository's real check command (package.json scripts, CI workflows, Makefile/justfile, turbo/nx/mise, AGENTS.md, CONTRIBUTING.md) and put it in the plan's front matter:",
+					"  gates:",
+					"    card:",
+					'      - "bun run check"   # every card inherits this',
+					"Add a per-card `gates:` override only where a card needs a narrower or extra command. Never invent a command; copy the one the repository already runs.",
+					"If the repo genuinely has no runnable check, keep `gates: []` and state that in the plan's done-when. Then finalize again.",
+				].join("\n")
+				: "";
 		// Finalize validates and stages only — it never starts execution.
 		// The operator must review the plan/cards and explicitly start via resume.
 		ledger.status = "paused";
 		this.active = { ...active, ledger };
 		await this.save();
 		await appendProgress(active.absDir, `plan finalized — ${validation.cards.length} cards (${ledger.mode}, parallel ${ledger.maxParallel}) — staged`);
+		if (gatesWarning) await appendProgress(active.absDir, "plan warning: no gates declared — claims will be unverified");
 		await this.commitRecords(`wp(${ledger.slug}): plan — ${validation.cards.length} cards`);
 		this.refreshUi();
 		const warnings = validation.warnings.length > 0 ? `\n${formatProblems([], validation.warnings)}` : "";
 		return {
 			ok: true,
-			text: `Plan validated: ${validation.cards.length} cards (${ledger.mode}, maxParallel ${ledger.maxParallel}, ${ledger.parallelExecution}). Execution is NOT started. STOP here: present the plan and cards to the operator for review and wait for an explicit start. Only after the operator explicitly says to start, call work_program({ action: "resume" }).${warnings}`,
+			text: `Plan validated: ${validation.cards.length} cards (${ledger.mode}, maxParallel ${ledger.maxParallel}, ${ledger.parallelExecution}). Execution is NOT started. STOP here: present the plan and cards to the operator for review and wait for an explicit start. Only after the operator explicitly says to start, call work_program({ action: "resume" }).${gatesWarning}${warnings}`,
 		};
 	}
 
@@ -920,6 +946,9 @@ export class WorkProgramController {
 	 */
 	async setConfig(patch: ProgramConfigPatch): Promise<ActionResult> {
 		if (!this.active) return { ok: false, text: "No active work program." };
+		if (patch.maxCycles !== undefined && patch.operatorApproved !== true) {
+			return { ok: false, text: CYCLE_BUDGET_LOCKED };
+		}
 		if (patch.card !== undefined) return this.setCardConfig(patch.card, patch);
 		const ledger = this.active.ledger;
 		const overrides: ProgramConfigOverrides = {};
@@ -945,7 +974,9 @@ export class WorkProgramController {
 			if (!Number.isFinite(cycles) || cycles < 0 || cycles > 32) {
 				return { ok: false, text: "maxCycles must be a number between 0 and 32" };
 			}
-			if (cycles !== ledger.maxCycles) changes.push(`maxCycles ${ledger.maxCycles}→${cycles}`);
+			if (cycles !== ledger.maxCycles) {
+				changes.push(`maxCycles ${ledger.maxCycles}→${cycles} (operator-authorized)`);
+			}
 			overrides.maxCycles = cycles;
 		}
 		if (patch.onExhausted !== undefined) {
@@ -1154,7 +1185,7 @@ export class WorkProgramController {
 				return { ok: false, text: "maxCycles must be a number between 0 and 32" };
 			}
 			const before = card.maxCycles ?? this.active.ledger.maxCycles;
-			if (before !== cycles) changes.push(`card ${cardId} maxCycles ${before}→${cycles}`);
+			if (before !== cycles) changes.push(`card ${cardId} maxCycles ${before}→${cycles} (operator-authorized)`);
 			card.maxCycles = cycles;
 			frontPatch.maxCycles = cycles;
 		}

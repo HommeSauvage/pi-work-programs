@@ -30,8 +30,14 @@ reviewed by reviewers that resume across a card's cycles, and merged lane by
 lane with gates between. Evidence before done; one concern per card.
 
 Program defaults live in the front matter above (mode, parallelism, review
-profile, max cycles, models). Cards inherit them unless their own front
+profile, max cycles, models, gates). Cards inherit them unless their own front
 matter overrides them — see the card template.
+
+Gates are discovered from the repository, never invented: the creating agent
+reads `package.json` scripts, CI workflows, `Makefile`/`justfile`,
+`turbo.json`/`nx.json`/`mise.toml` and `AGENTS.md`/`CONTRIBUTING.md`, then
+writes the canonical check command under `gates.card` here. Declaring none
+leaves every card's claims unverified (`gate: no gates configured`).
 
 ## Done when
 

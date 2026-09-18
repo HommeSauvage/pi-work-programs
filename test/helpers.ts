@@ -139,7 +139,10 @@ export interface TestHost {
 	git: FakeGit;
 	ledger: ProgramLedger;
 	/** Complete a run with an output payload. */
-	completeRun(runId: string, payload?: { output?: string; structured?: unknown; usage?: RunUsage }): void;
+	completeRun(
+		runId: string,
+		payload?: { output?: string; structured?: unknown; usage?: RunUsage; sessionFile?: string; sessionUsage?: RunUsage },
+	): void;
 	failRun(runId: string, error?: string): void;
 	lastRunId(): string;
 }
@@ -423,6 +426,8 @@ export function createTestHost(input: {
 				...(payload?.output !== undefined ? { output: payload.output } : {}),
 				...(payload?.structured !== undefined ? { structured: payload.structured } : {}),
 				...(payload?.usage !== undefined ? { usage: payload.usage } : {}),
+				...(payload?.sessionFile !== undefined ? { sessionFile: payload.sessionFile } : {}),
+				...(payload?.sessionUsage !== undefined ? { sessionUsage: payload.sessionUsage } : {}),
 			});
 		},
 		failRun: (runId, error) => {

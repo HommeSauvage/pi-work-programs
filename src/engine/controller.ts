@@ -135,6 +135,8 @@ export interface ProgramConfigPatch {
 	reviewerThinking?: string;
 	reviewerResume?: boolean;
 	runTimeoutMs?: number;
+	resumeMaxWindowPeak?: number;
+	resumeMaxDepth?: number;
 	atlasEnabled?: boolean;
 	atlasAgent?: string;
 	atlasModel?: string;
@@ -173,6 +175,7 @@ function tokensStatusLine(ledger: ProgramLedger): string | undefined {
 	let total = 0;
 	let out = 0;
 	let cost = 0;
+	let cache = 0;
 	let runs = 0;
 	let has = false;
 	for (const id of ledger.order) {
@@ -182,6 +185,7 @@ function tokensStatusLine(ledger: ProgramLedger): string | undefined {
 		total += card.usage.total;
 		out += card.usage.output;
 		cost += card.usage.costUsd ?? 0;
+		cache += card.usage.cacheRead ?? 0;
 		runs += card.usageRuns?.length ?? 0;
 	}
 	if (ledger.atlas?.usage) {
@@ -189,9 +193,11 @@ function tokensStatusLine(ledger: ProgramLedger): string | undefined {
 		total += ledger.atlas.usage.total;
 		out += ledger.atlas.usage.output;
 		cost += ledger.atlas.usage.costUsd ?? 0;
+		cache += ledger.atlas.usage.cacheRead ?? 0;
 	}
 	if (!has) return undefined;
-	return `tokens: ${formatTokens(total)} total · ${formatTokens(out)} out${cost > 0 ? ` · $${cost.toFixed(2)}` : ""} (${runs} card runs)`;
+	const cacheSuffix = cache > 0 ? ` (cache ${formatTokens(cache)})` : "";
+	return `tokens: ${formatTokens(total)} total${cacheSuffix} · ${formatTokens(out)} out${cost > 0 ? ` · $${cost.toFixed(2)}` : ""} (${runs} card runs)`;
 }
 
 /** Suggested next step for a blocked card, shown in status/doctor Issues. */
@@ -771,6 +777,8 @@ export class WorkProgramController {
 		active.ledger.reviewerThinking = settings.reviewer.thinking;
 		active.ledger.reviewerResume = settings.review.resumeReviewer !== false;
 		active.ledger.runTimeoutMs = settings.runTimeoutMs;
+		active.ledger.resumeMaxWindowPeak = settings.resumeMaxWindowPeak;
+		active.ledger.resumeMaxDepth = settings.resumeMaxDepth;
 		// Atlas config keys follow plan front matter; runtime state (state, runId,
 		// pendingMerges, refreshes, usage) is never touched by a sync.
 		if (active.ledger.atlas) {
@@ -1004,6 +1012,18 @@ export class WorkProgramController {
 			if (timeout !== ledger.runTimeoutMs) changes.push(`runTimeoutMs ${ledger.runTimeoutMs ?? "(default)"}→${timeout}`);
 			overrides.runTimeoutMs = timeout;
 		}
+		if (patch.resumeMaxWindowPeak !== undefined) {
+			const peak = Math.floor(patch.resumeMaxWindowPeak);
+			if (!Number.isFinite(peak) || peak < 0) return { ok: false, text: "resumeMaxWindowPeak must be >= 0" };
+			if (peak !== ledger.resumeMaxWindowPeak) changes.push(`resumeMaxWindowPeak ${ledger.resumeMaxWindowPeak ?? "(default)"}→${peak}`);
+			overrides.resumeMaxWindowPeak = peak;
+		}
+		if (patch.resumeMaxDepth !== undefined) {
+			const depth = Math.floor(patch.resumeMaxDepth);
+			if (!Number.isFinite(depth) || depth < 0) return { ok: false, text: "resumeMaxDepth must be >= 0" };
+			if (depth !== ledger.resumeMaxDepth) changes.push(`resumeMaxDepth ${ledger.resumeMaxDepth ?? "(default)"}→${depth}`);
+			overrides.resumeMaxDepth = depth;
+		}
 		if (patch.atlasEnabled !== undefined) {
 			if (typeof patch.atlasEnabled !== "boolean") return { ok: false, text: "atlasEnabled must be a boolean" };
 			if (patch.atlasEnabled !== (ledger.atlas?.enabled ?? true)) {
@@ -1024,7 +1044,7 @@ export class WorkProgramController {
 			overrides.atlasThinking = patch.atlasThinking;
 		}
 		if (Object.keys(overrides).length === 0 && patch.onExhausted === undefined) {
-			return { ok: false, text: "Nothing to change; pass at least one of maxCycles, onExhausted, reviewProfile, maxParallel, parallelExecution, mode, workerAgent, workerModel, workerThinking, reviewerAgent, reviewerModel, reviewerThinking, reviewerResume, runTimeoutMs, atlasEnabled, atlasAgent, atlasModel, atlasThinking." };
+			return { ok: false, text: "Nothing to change; pass at least one of maxCycles, onExhausted, reviewProfile, maxParallel, parallelExecution, mode, workerAgent, workerModel, workerThinking, reviewerAgent, reviewerModel, reviewerThinking, reviewerResume, runTimeoutMs, resumeMaxWindowPeak, resumeMaxDepth, atlasEnabled, atlasAgent, atlasModel, atlasThinking." };
 		}
 
 		// Apply to the live ledger via the same normalization the plan path uses.
@@ -1043,6 +1063,8 @@ export class WorkProgramController {
 		if (patch.reviewerThinking !== undefined) ledger.reviewerThinking = patch.reviewerThinking === "" ? undefined : patch.reviewerThinking;
 		if (patch.reviewerResume !== undefined) ledger.reviewerResume = patch.reviewerResume;
 		if (patch.runTimeoutMs !== undefined) ledger.runTimeoutMs = patch.runTimeoutMs;
+		if (patch.resumeMaxWindowPeak !== undefined) ledger.resumeMaxWindowPeak = patch.resumeMaxWindowPeak;
+		if (patch.resumeMaxDepth !== undefined) ledger.resumeMaxDepth = patch.resumeMaxDepth;
 		if (
 			patch.atlasEnabled !== undefined ||
 			patch.atlasAgent !== undefined ||
@@ -1112,7 +1134,7 @@ export class WorkProgramController {
 		if (!this.active) return { ok: false, text: "No active work program." };
 		const card = this.active.ledger.cards[cardId];
 		if (!card) return { ok: false, text: `Unknown card ${cardId}.` };
-		for (const key of ["mode", "maxParallel", "parallelExecution", "onExhausted", "reviewerResume", "runTimeoutMs", "atlasEnabled", "atlasAgent", "atlasModel", "atlasThinking"] as const) {
+		for (const key of ["mode", "maxParallel", "parallelExecution", "onExhausted", "reviewerResume", "runTimeoutMs", "resumeMaxWindowPeak", "resumeMaxDepth", "atlasEnabled", "atlasAgent", "atlasModel", "atlasThinking"] as const) {
 			if (patch[key] !== undefined) {
 				return { ok: false, text: `${key} is program-level; omit card to set it (work_program({ action: "config", ${key}: ... }))` };
 			}

@@ -1,5 +1,5 @@
 import { join, resolve } from "node:path";
-import { ATLAS_FILE, DEFAULT_RUN_TIMEOUT_MS, LEDGER_FILE, PROGRESS_FILE, REVIEWS_DIR, RUNTIME_DIR } from "../constants.ts";
+import { ATLAS_FILE, DEFAULT_RESUME_MAX_DEPTH, DEFAULT_RESUME_MAX_WINDOW_PEAK, DEFAULT_RUN_TIMEOUT_MS, LEDGER_FILE, PROGRESS_FILE, REVIEWS_DIR, RUNTIME_DIR } from "../constants.ts";
 import { readJson, writeJsonAtomic } from "../shared/fsx.ts";
 import type {
 	CardLedger,
@@ -128,6 +128,8 @@ export function buildLedger(input: {
 		reviewerAgent: settings.review.agent,
 		reviewerResume: settings.review.resumeReviewer !== false,
 		runTimeoutMs: settings.runTimeoutMs ?? DEFAULT_RUN_TIMEOUT_MS,
+		resumeMaxWindowPeak: settings.resumeMaxWindowPeak ?? DEFAULT_RESUME_MAX_WINDOW_PEAK,
+		resumeMaxDepth: settings.resumeMaxDepth ?? DEFAULT_RESUME_MAX_DEPTH,
 		workerModel: settings.worker.model,
 		workerThinking: settings.worker.thinking,
 		reviewerModel: settings.reviewer.model,
@@ -185,6 +187,8 @@ export function configOverridesFromPlan(planText: string): ProgramConfigOverride
 		if (typeof reviewer.thinking === "string") overrides.reviewerThinking = reviewer.thinking;
 	}
 	if (typeof raw.runTimeoutMs === "number") overrides.runTimeoutMs = raw.runTimeoutMs;
+	if (typeof raw.resumeMaxWindowPeak === "number") overrides.resumeMaxWindowPeak = raw.resumeMaxWindowPeak;
+	if (typeof raw.resumeMaxDepth === "number") overrides.resumeMaxDepth = raw.resumeMaxDepth;
 	const gates = isPlainRecord(raw.gates) ? raw.gates : undefined;
 	if (gates) {
 		const card = Array.isArray(gates.card) ? gates.card.filter((v): v is string => typeof v === "string") : undefined;
@@ -255,6 +259,16 @@ export function effectiveRunTimeoutMs(ledger: ProgramLedger): number {
 	return ledger.runTimeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
 }
 
+/** Context-peak threshold above which a retained session is abandoned for a fresh dispatch. */
+export function effectiveResumeMaxWindowPeak(ledger: ProgramLedger): number {
+	return ledger.resumeMaxWindowPeak ?? DEFAULT_RESUME_MAX_WINDOW_PEAK;
+}
+
+/** Consecutive-resume cap for one session before a fresh dispatch. */
+export function effectiveResumeMaxDepth(ledger: ProgramLedger): number {
+	return ledger.resumeMaxDepth ?? DEFAULT_RESUME_MAX_DEPTH;
+}
+
 /**
  * Fill ledger fields introduced after the ledger was first written (called when
  * a program is activated or started). Returns true when anything changed.
@@ -267,6 +281,14 @@ export function migrateLedger(ledger: ProgramLedger, settings: WorkProgramSettin
 	}
 	if (ledger.runTimeoutMs === undefined) {
 		ledger.runTimeoutMs = settings.runTimeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
+		changed = true;
+	}
+	if (ledger.resumeMaxWindowPeak === undefined) {
+		ledger.resumeMaxWindowPeak = settings.resumeMaxWindowPeak ?? DEFAULT_RESUME_MAX_WINDOW_PEAK;
+		changed = true;
+	}
+	if (ledger.resumeMaxDepth === undefined) {
+		ledger.resumeMaxDepth = settings.resumeMaxDepth ?? DEFAULT_RESUME_MAX_DEPTH;
 		changed = true;
 	}
 	// The builtin pi-subagents "reviewer" has no bash and cannot run gates;

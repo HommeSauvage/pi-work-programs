@@ -49,12 +49,38 @@ file pointers. Worker, reviewer, captain, and reconciler briefs point at it.
 
 ## Run telemetry
 
-Every run's token usage (from pi-subagents' `status.json`: total, peak window,
-turns, tool calls, cost) is recorded onto its card; `status` shows program
-totals, each card's harness Evidence carries a `usage:` line, and the
-completion summary totals the program. Use it to retune: cards that dominate
-the token budget are candidates for tighter scope, more Context, or `enhanced`
-→ `light` review.
+Every run's token usage is recorded onto its card. Two layers:
+
+- **Session-accurate totals** (authoritative): the child session transcript is
+  summed at terminal status — input, cache reads, cache writes, output, cost,
+  turns. Resumed runs share one transcript, so a resume **replaces** its
+  session's row instead of adding one; card totals are the sum of sessions and
+  never double-count a resume chain. Progress lines, harness evidence
+  (`usage: 71.0M tok (cache 68.1M) · 266 turns · $1.02`), `status`, and the
+  completion summary all use these numbers.
+- **Per-run history**: each run's `status.json` numbers are kept for the
+  pass-by-pass breakdown (`usageRuns`, bounded), flagged `resumed: true` when
+  the run continued a retained session.
+
+Use it to retune: cards that dominate the token budget are candidates for
+tighter scope, more Context, or `enhanced` → `light` review.
+
+## Resume vs fresh
+
+Cycles, fixes, and re-reviews normally continue the session that already holds
+context — fix passes measure at 3–15% of a fresh worker's exploration tax. But
+continuation has a cost curve: a resumed session re-sends its whole history
+every turn, so past a point a fresh session is cheaper.
+
+- `resumeMaxWindowPeak` (default **250k tokens**): once a session's context
+  peak reaches this, the next continuation is dispatched fresh. The fresh
+  agent is told it is continuing an existing lane and must reconstruct state
+  from the card Evidence, the lane diff, and the atlas.
+- `resumeMaxDepth` (default **3**): consecutive resumes of one session before
+  a fresh dispatch; a fresh run resets the chain.
+- Both apply independently to worker fixes and reviewer cycles; a skipped
+  resume is recorded in `progress.md` with its reason
+  (`03 fix: fresh session — session peaked at 390k (limit 250k)`).
 
 ## Card lifecycle
 

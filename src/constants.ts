@@ -36,6 +36,16 @@ export const DEFAULT_RUN_TIMEOUT_MS = 4 * 60 * 60_000;
 /** Scout runs are exploration, not implementation: one hour is generous. */
 export const SCOUT_TIMEOUT_MS = 60 * 60_000;
 
+/**
+ * Resume vs fresh: a retained session whose context peak reached this many
+ * tokens costs more per remaining turn than a fresh, atlas-armed dispatch.
+ * Measured: resumed workers at 250k+ peak re-send the whole history every turn.
+ */
+export const DEFAULT_RESUME_MAX_WINDOW_PEAK = 250_000;
+
+/** Max consecutive resumes of one session before forcing a fresh dispatch. */
+export const DEFAULT_RESUME_MAX_DEPTH = 3;
+
 export const MAX_REVIEW_CHARS = 60_000;
 export const MAX_DIGEST_CHARS = 1_400;
 export const MAX_OUTPUT_TAIL_CHARS = 8_000;

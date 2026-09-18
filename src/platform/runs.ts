@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { RPC_TIMEOUT_MS, SUBAGENT_RPC_READY_EVENT, SUBAGENT_RPC_REPLY_EVENT_PREFIX, SUBAGENT_RPC_REQUEST_EVENT, SUBAGENT_RPC_VERSION, STATUS_TIMEOUT_MS } from "../constants.ts";
@@ -235,11 +235,15 @@ export class SubagentsRpc implements RunOps {
 		const structured = asRecord(result?.structuredOutput) ?? extractStepsStructured(result);
 		const error = typeof status.error === "string" ? status.error : typeof result?.error === "string" ? result.error : undefined;
 		const usage = usageFromStatus(status);
+		const sessionFile = typeof status.sessionFile === "string" && status.sessionFile.length > 0 ? status.sessionFile : undefined;
+		const sessionUsage = sessionFile ? usageFromSessionFile(sessionFile) : undefined;
 		const mapped: RunStatus = {
 			state,
 			...(output !== undefined ? { output } : {}),
 			...(structured !== undefined ? { structured } : {}),
 			...(usage !== undefined ? { usage } : {}),
+			...(sessionFile !== undefined ? { sessionFile } : {}),
+			...(sessionUsage !== undefined ? { sessionUsage } : {}),
 		};
 		if (error) mapped.error = error;
 		return mapped;
@@ -282,6 +286,58 @@ export function usageFromStatus(status: Record<string, unknown>): RunUsage | und
 	if (typeof status.turnCount === "number") usage.turns = status.turnCount;
 	if (typeof status.toolCount === "number") usage.tools = status.toolCount;
 	return usage;
+}
+
+/**
+ * Cumulative usage of a child session transcript: sums every assistant
+ * message's `usage` (input / cacheRead / cacheWrite / output / cost) and counts
+ * turns. This is the authoritative number for a resume chain — status.json's
+ * per-run totals are segment-scoped and omit cache reads entirely. Resumed runs
+ * share the original transcript, so the value grows monotonically.
+ *
+ * Reads are line-scoped with a cheap prefilter; unreadable or oversized files
+ * degrade to undefined rather than blocking a terminal status read.
+ */
+export function usageFromSessionFile(path: string, maxBytes = 256 * 1024 * 1024): RunUsage | undefined {
+	try {
+		if (!existsSync(path) || statSync(path).size > maxBytes) return undefined;
+		const text = readFileSync(path, "utf8");
+		let input = 0;
+		let output = 0;
+		let cacheRead = 0;
+		let cacheWrite = 0;
+		let costUsd = 0;
+		let turns = 0;
+		let found = false;
+		for (const line of text.split("\n")) {
+			if (line.length === 0 || !line.includes('"usage"')) continue;
+			let entry: unknown;
+			try {
+				entry = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			const message = asRecord(asRecord(entry)?.message);
+			if (!message || message.role !== "assistant") continue;
+			const usage = asRecord(message.usage);
+			if (!usage) continue;
+			found = true;
+			input += typeof usage.input === "number" ? usage.input : 0;
+			output += typeof usage.output === "number" ? usage.output : 0;
+			cacheRead += typeof usage.cacheRead === "number" ? usage.cacheRead : 0;
+			cacheWrite += typeof usage.cacheWrite === "number" ? usage.cacheWrite : 0;
+			const cost = usage.cost;
+			if (typeof cost === "number") costUsd += cost;
+			else if (asRecord(cost) && typeof asRecord(cost)?.total === "number") costUsd += asRecord(cost)!.total as number;
+			turns += 1;
+		}
+		if (!found) return undefined;
+		const result: RunUsage = { input, output, total: input + cacheRead + cacheWrite + output, cacheRead, cacheWrite, turns };
+		if (costUsd > 0) result.costUsd = costUsd;
+		return result;
+	} catch {
+		return undefined;
+	}
 }
 
 function snapshotFromStatus(runId: string, status: Record<string, unknown>): RunHeartbeat {

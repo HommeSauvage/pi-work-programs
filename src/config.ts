@@ -5,7 +5,7 @@ import type {
 	ReviewProfile,
 	WorkProgramSettings,
 } from "./shared/types.ts";
-import { DEFAULT_RUN_TIMEOUT_MS } from "./constants.ts";
+import { DEFAULT_RESUME_MAX_DEPTH, DEFAULT_RESUME_MAX_WINDOW_PEAK, DEFAULT_RUN_TIMEOUT_MS } from "./constants.ts";
 import { projectSettingsPath, userSettingsPath } from "./shared/paths.ts";
 import { readJson } from "./shared/fsx.ts";
 import { asNumber, asString, isRecord, parseStringArray } from "./shared/text.ts";
@@ -22,6 +22,8 @@ export const DEFAULT_SETTINGS: WorkProgramSettings = {
 	reviewer: {},
 	atlas: { enabled: true, agent: "scout" },
 	runTimeoutMs: DEFAULT_RUN_TIMEOUT_MS,
+	resumeMaxWindowPeak: DEFAULT_RESUME_MAX_WINDOW_PEAK,
+	resumeMaxDepth: DEFAULT_RESUME_MAX_DEPTH,
 	gates: { card: [], program: [] },
 	laneBranchPattern: "{branch}-card-{id}",
 };
@@ -127,6 +129,12 @@ export function normalizeSettings(raw: unknown, base: WorkProgramSettings = DEFA
 
 	const runTimeoutMs = asNumber(raw.runTimeoutMs);
 	if (runTimeoutMs !== undefined && runTimeoutMs >= 60_000) settings.runTimeoutMs = Math.floor(runTimeoutMs);
+	const resumeMaxWindowPeak = asNumber(raw.resumeMaxWindowPeak);
+	if (resumeMaxWindowPeak !== undefined && resumeMaxWindowPeak >= 0) {
+		settings.resumeMaxWindowPeak = Math.floor(resumeMaxWindowPeak);
+	}
+	const resumeMaxDepth = asNumber(raw.resumeMaxDepth);
+	if (resumeMaxDepth !== undefined && resumeMaxDepth >= 0) settings.resumeMaxDepth = Math.floor(resumeMaxDepth);
 
 	return settings;
 }
@@ -220,6 +228,8 @@ export function applyOverrides(
 			program: overrides.gates?.program ?? settings.gates.program,
 		},
 		runTimeoutMs: overrides.runTimeoutMs ?? settings.runTimeoutMs,
+		resumeMaxWindowPeak: overrides.resumeMaxWindowPeak ?? settings.resumeMaxWindowPeak,
+		resumeMaxDepth: overrides.resumeMaxDepth ?? settings.resumeMaxDepth,
 		atlas: {
 			enabled: overrides.atlasEnabled ?? settings.atlas?.enabled ?? true,
 			agent: overrides.atlasAgent ?? settings.atlas?.agent ?? "scout",
@@ -265,6 +275,8 @@ export function overridesToPlanFrontmatter(overrides: ProgramConfigOverrides): R
 	if (overrides.maxParallel !== undefined) data.maxParallel = overrides.maxParallel;
 	if (overrides.parallelExecution) data.parallelExecution = overrides.parallelExecution;
 	if (overrides.runTimeoutMs !== undefined) data.runTimeoutMs = overrides.runTimeoutMs;
+	if (overrides.resumeMaxWindowPeak !== undefined) data.resumeMaxWindowPeak = overrides.resumeMaxWindowPeak;
+	if (overrides.resumeMaxDepth !== undefined) data.resumeMaxDepth = overrides.resumeMaxDepth;
 	if (overrides.laneBranchPattern) data.laneBranchPattern = overrides.laneBranchPattern;
 	const review: Record<string, unknown> = {};
 	if (overrides.reviewProfile) review.profile = overrides.reviewProfile;
@@ -306,6 +318,8 @@ export function mergePlanConfig(planText: string, patch: ProgramConfigOverrides)
 	if (isMode(existing.mode)) current.mode = existing.mode;
 	if (typeof existing.maxParallel === "number") current.maxParallel = existing.maxParallel;
 	if (typeof existing.runTimeoutMs === "number") current.runTimeoutMs = existing.runTimeoutMs;
+	if (typeof existing.resumeMaxWindowPeak === "number") current.resumeMaxWindowPeak = existing.resumeMaxWindowPeak;
+	if (typeof existing.resumeMaxDepth === "number") current.resumeMaxDepth = existing.resumeMaxDepth;
 	if (isParallelExecution(existing.parallelExecution)) current.parallelExecution = existing.parallelExecution;
 	if (typeof existing.laneBranchPattern === "string") current.laneBranchPattern = existing.laneBranchPattern;
 	const review = isPlainRecord(existing.review) ? existing.review : undefined;

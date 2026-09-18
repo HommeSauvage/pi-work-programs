@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { applyTriage, drive } from "../src/engine/driver.ts";
-import { usageFromStatus } from "../src/platform/runs.ts";
+import { usageFromSessionFile, usageFromStatus } from "../src/platform/runs.ts";
 import { createTestHost, makeCardText } from "./helpers.ts";
 
 const PROGRAM_DIR = "/repo/.agents/work-programs/test-program";
@@ -13,6 +15,51 @@ function programCardPath(cardId: string): string {
 function writeLaneEvidence(host: ReturnType<typeof createTestHost>, cardId: string, evidence: string): void {
 	host.fake.files.set(programCardPath(cardId), makeCardText({ id: cardId, evidence, state: "review" }));
 }
+
+describe("usageFromSessionFile", () => {
+	function writeTranscript(lines: unknown[]): string {
+		const dir = mkdtempSync(join(tmpdir(), "wp-usage-"));
+		const file = join(dir, "session.jsonl");
+		writeFileSync(file, lines.map((line) => JSON.stringify(line)).join("\n"));
+		return file;
+	}
+
+	test("sums assistant message usage across the whole transcript", () => {
+		const file = writeTranscript([
+			{ type: "session", id: "s1" },
+			{ type: "message", message: { role: "user", content: "go" } },
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					usage: { input: 1_000, output: 100, cacheRead: 9_000, cacheWrite: 0, cost: { total: 0.01 } },
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					usage: { input: 2_000, output: 200, cacheRead: 18_000, cacheWrite: 500, cost: { total: 0.02 } },
+				},
+			},
+			{ type: "compaction", summary: "x", tokensBefore: 999 },
+		]);
+		const usage = usageFromSessionFile(file);
+		expect(usage?.input).toBe(3_000);
+		expect(usage?.output).toBe(300);
+		expect(usage?.cacheRead).toBe(27_000);
+		expect(usage?.cacheWrite).toBe(500);
+		expect(usage?.total).toBe(30_800);
+		expect(usage?.turns).toBe(2);
+		expect(usage?.costUsd).toBeCloseTo(0.03);
+	});
+
+	test("returns undefined for a missing file or a transcript without usage", () => {
+		expect(usageFromSessionFile("/nope/missing.jsonl")).toBeUndefined();
+		const file = writeTranscript([{ type: "message", message: { role: "user", content: "hi" } }]);
+		expect(usageFromSessionFile(file)).toBeUndefined();
+	});
+});
 
 describe("usageFromStatus", () => {
 	test("reads the pi-subagents status.json shape", () => {

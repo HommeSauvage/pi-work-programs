@@ -16,6 +16,8 @@ import {
 	atlasPath,
 	effectiveCardGates,
 	effectiveMaxCycles,
+	effectiveResumeMaxDepth,
+	effectiveResumeMaxWindowPeak,
 	effectiveReviewerAgent,
 	effectiveReviewerModel,
 	effectiveReviewerResume,
@@ -46,6 +48,7 @@ import { oneLine, formatTokens, truncateTail } from "../shared/text.ts";
 import type {
 	ActiveRunKind,
 	CardLedger,
+	CardSessionUsage,
 	DriverPorts,
 	FindingVerdict,
 	GateResult,
@@ -95,22 +98,147 @@ function mergeUsage(acc: RunUsage | undefined, usage: RunUsage): RunUsage {
 	if (turns > 0) merged.turns = turns;
 	const tools = (acc?.tools ?? 0) + (usage.tools ?? 0);
 	if (tools > 0) merged.tools = tools;
+	const cacheRead = (acc?.cacheRead ?? 0) + (usage.cacheRead ?? 0);
+	if (cacheRead > 0) merged.cacheRead = cacheRead;
+	const cacheWrite = (acc?.cacheWrite ?? 0) + (usage.cacheWrite ?? 0);
+	if (cacheWrite > 0) merged.cacheWrite = cacheWrite;
 	return merged;
 }
 
-/** Record a terminal run's usage onto the card (aggregate + bounded per-run log). */
-function recordRunUsage(card: CardLedger, kind: ActiveRunKind, status: RunStatus): void {
-	const usage = status.usage;
-	if (!usage) return;
-	card.usage = mergeUsage(card.usage, usage);
-	const runs = card.usageRuns ?? [];
-	runs.push({ ...usage, kind, at: Date.now() });
-	card.usageRuns = runs.slice(-MAX_USAGE_RUNS);
+/** Sum session snapshots into the card aggregate (resume-safe: one row per session). */
+function aggregateSessions(sessions: CardSessionUsage[]): RunUsage | undefined {
+	if (sessions.length === 0) return undefined;
+	let input = 0;
+	let output = 0;
+	let cacheRead = 0;
+	let cacheWrite = 0;
+	let total = 0;
+	let costUsd = 0;
+	let turns = 0;
+	let tools = 0;
+	let peak = 0;
+	for (const session of sessions) {
+		input += session.input;
+		output += session.output;
+		cacheRead += session.cacheRead;
+		cacheWrite += session.cacheWrite;
+		total += session.total;
+		costUsd += session.costUsd ?? 0;
+		turns += session.turns ?? 0;
+		tools += session.tools ?? 0;
+		peak = Math.max(peak, session.windowPeak ?? 0);
+	}
+	const aggregate: RunUsage = { input, output, total };
+	if (cacheRead > 0) aggregate.cacheRead = cacheRead;
+	if (cacheWrite > 0) aggregate.cacheWrite = cacheWrite;
+	if (turns > 0) aggregate.turns = turns;
+	if (tools > 0) aggregate.tools = tools;
+	if (costUsd > 0) aggregate.costUsd = costUsd;
+	if (peak > 0) aggregate.windowPeak = peak;
+	return aggregate;
 }
 
-/** Compact usage label for progress lines and evidence: `16.6M tok · 153 turns · $0.22`. */
+/**
+ * Record a terminal run: a per-run history entry plus the session-accurate
+ * cumulative snapshot. Resumed runs share their session key (status.json's
+ * `sessionFile`), so the snapshot is REPLACED — never summed — and the card
+ * aggregate stays truthful across resume chains. Token/cache numbers come from
+ * the session transcript when available (status.json omits cache reads).
+ */
+function recordRunUsage(
+	card: CardLedger,
+	kind: ActiveRunKind,
+	status: RunStatus,
+	opts: { resumed?: boolean; runId?: string } = {},
+): void {
+	const session = status.sessionFile ?? opts.runId;
+	const sessions = upsertSessionUsage(card.usageSessions ?? [], kind, status, opts.runId);
+	if (sessions) {
+		card.usageSessions = sessions;
+		card.usage = aggregateSessions(sessions);
+	} else if (status.usage) {
+		card.usage = mergeUsage(card.usage, status.usage);
+	}
+	const runUsage = status.usage ?? status.sessionUsage;
+	if (runUsage) {
+		const runs = card.usageRuns ?? [];
+		runs.push({
+			...runUsage,
+			kind,
+			at: Date.now(),
+			...(opts.resumed ? { resumed: true } : {}),
+			...(session ? { session } : {}),
+		});
+		card.usageRuns = runs.slice(-MAX_USAGE_RUNS);
+	}
+}
+
+/** Upsert one terminal run's session snapshot (resumed runs replace their session row). */
+function upsertSessionUsage(
+	sessions: CardSessionUsage[],
+	kind: ActiveRunKind,
+	status: RunStatus,
+	runId?: string,
+): CardSessionUsage[] | undefined {
+	const session = status.sessionFile ?? runId;
+	const sessionUsage = status.sessionUsage ?? status.usage;
+	if (!session || !sessionUsage) return undefined;
+	const windowPeak = status.usage?.windowPeak ?? status.sessionUsage?.windowPeak;
+	const snapshot: CardSessionUsage = {
+		session,
+		kind,
+		input: sessionUsage.input,
+		output: sessionUsage.output,
+		cacheRead: sessionUsage.cacheRead ?? 0,
+		cacheWrite: sessionUsage.cacheWrite ?? 0,
+		total: sessionUsage.total,
+		...(sessionUsage.costUsd !== undefined ? { costUsd: sessionUsage.costUsd } : {}),
+		...(windowPeak !== undefined ? { windowPeak } : {}),
+		...(sessionUsage.turns !== undefined ? { turns: sessionUsage.turns } : {}),
+		...(sessionUsage.tools !== undefined ? { tools: sessionUsage.tools } : {}),
+		updatedAt: Date.now(),
+	};
+	const index = sessions.findIndex((entry) => entry.session === session);
+	if (index >= 0) sessions[index] = snapshot;
+	else sessions.push(snapshot);
+	return sessions;
+}
+
+/** Latest session snapshot of a kind family (worker sessions end as worker|fix). */
+function lastSessionFor(card: CardLedger, kind: "worker" | "reviewer" | "scout"): CardSessionUsage | undefined {
+	const sessions = card.usageSessions ?? [];
+	const kinds: ActiveRunKind[] = kind === "worker" ? ["worker", "fix"] : kind === "reviewer" ? ["reviewer"] : ["scout"];
+	for (let index = sessions.length - 1; index >= 0; index -= 1) {
+		const entry = sessions[index];
+		if (entry && kinds.includes(entry.kind)) return entry;
+	}
+	return undefined;
+}
+
+/**
+ * Decide whether to continue a retained session or dispatch fresh. Continuing
+ * re-sends the whole history every turn: past the context-peak threshold or the
+ * consecutive-resume cap, a fresh dispatch (which now starts atlas-armed) is
+ * cheaper than one more round on top of a huge context.
+ */
+function resumeDecision(host: DriverHost, card: CardLedger, kind: "worker" | "reviewer"): { resume: boolean; reason?: string } {
+	const limit = effectiveResumeMaxWindowPeak(host.ledger);
+	const maxDepth = effectiveResumeMaxDepth(host.ledger);
+	const depth = (kind === "worker" ? card.workerResumeDepth : card.reviewerResumeDepth) ?? 0;
+	if (depth >= maxDepth) {
+		return { resume: false, reason: `${depth} consecutive resumes (cap ${maxDepth})` };
+	}
+	const peak = lastSessionFor(card, kind)?.windowPeak;
+	if (peak !== undefined && peak >= limit) {
+		return { resume: false, reason: `session peaked at ${formatTokens(peak)} (limit ${formatTokens(limit)})` };
+	}
+	return { resume: true };
+}
+
+/** Compact usage label for progress lines and evidence: `71.0M tok (cache 68.1M) · 266 turns · $1.02`. */
 function formatUsage(usage: RunUsage): string {
-	const parts = [`${formatTokens(usage.total)} tok`];
+	const cache = usage.cacheRead !== undefined ? ` (cache ${formatTokens(usage.cacheRead)})` : "";
+	const parts = [`${formatTokens(usage.total)} tok${cache}`];
 	if (usage.turns !== undefined) parts.push(`${usage.turns} turns`);
 	if (usage.costUsd !== undefined) parts.push(`$${usage.costUsd.toFixed(2)}`);
 	return parts.join(" · ");
@@ -220,10 +348,15 @@ function isTerminal(status: RunStatus): boolean {
 	return TERMINAL_STATES.has(status.state);
 }
 
-function activeRunOf(card: CardLedger): { kind: string; runId: string; asyncDir?: string } | undefined {
+function activeRunOf(card: CardLedger): { kind: string; runId: string; asyncDir?: string; resumed?: boolean } | undefined {
 	const active = card.activeRun;
 	if (!active) return undefined;
-	return { kind: active.kind, runId: active.runId, ...(active.asyncDir ? { asyncDir: active.asyncDir } : {}) };
+	return {
+		kind: active.kind,
+		runId: active.runId,
+		...(active.asyncDir ? { asyncDir: active.asyncDir } : {}),
+		...(active.resumed ? { resumed: active.resumed } : {}),
+	};
 }
 
 export async function drive(host: DriverHost): Promise<void> {
@@ -289,21 +422,22 @@ async function reconcileRuns(host: DriverHost, gate: TodoGate): Promise<void> {
 		}
 		if (!isTerminal(status)) continue;
 		card.activeRun = undefined;
+		const resumed = active.resumed === true;
 		switch (active.kind) {
 			case "worker":
-				await onWorkerComplete(host, gate, card, status, active.runId);
+				await onWorkerComplete(host, gate, card, status, active.runId, resumed);
 				break;
 			case "reviewer":
-				await onReviewerComplete(host, card, status, active.runId);
+				await onReviewerComplete(host, card, status, active.runId, resumed);
 				break;
 			case "fix":
-				await onFixComplete(host, gate, card, status, active.runId);
+				await onFixComplete(host, gate, card, status, active.runId, resumed);
 				break;
 			case "captain":
-				await onCaptainComplete(host, gate, card, status, active.runId);
+				await onCaptainComplete(host, gate, card, status, active.runId, resumed);
 				break;
 			case "reconciler":
-				await onReconcilerComplete(host, gate, card, status, active.runId);
+				await onReconcilerComplete(host, gate, card, status, active.runId, resumed);
 				break;
 		}
 		await host.save();
@@ -867,8 +1001,8 @@ async function laneAlreadyImplemented(host: DriverHost, card: CardLedger): Promi
 	}
 }
 
-async function onWorkerComplete(host: DriverHost, gate: TodoGate, card: CardLedger, status: RunStatus, runId: string): Promise<void> {
-	recordRunUsage(card, "worker", status);
+async function onWorkerComplete(host: DriverHost, gate: TodoGate, card: CardLedger, status: RunStatus, runId: string, resumed = false): Promise<void> {
+	recordRunUsage(card, "worker", status, { resumed, runId });
 	if (status.state === "paused") {
 		await blockCard(host, card, `worker run ${runId} paused by operator — redispatch to continue from the lane state`);
 		return;
@@ -943,11 +1077,14 @@ async function startGateFix(
 	});
 	if (!dispatched.ok) {
 		await blockCard(host, card, `gate-fix dispatch failed: ${dispatched.error}`);
+		return;
 	}
+	// A gate fix starts a fresh worker session: reset the resume chain.
+	card.workerResumeDepth = 0;
 }
 
-async function onReviewerComplete(host: DriverHost, card: CardLedger, status: RunStatus, runId: string): Promise<void> {
-	recordRunUsage(card, "reviewer", status);
+async function onReviewerComplete(host: DriverHost, card: CardLedger, status: RunStatus, runId: string, resumed = false): Promise<void> {
+	recordRunUsage(card, "reviewer", status, { resumed, runId });
 	if (status.state === "paused") {
 		await blockCard(host, card, `reviewer run ${runId} paused by operator — redispatch to re-run the review`);
 		return;
@@ -980,8 +1117,8 @@ async function onReviewerComplete(host: DriverHost, card: CardLedger, status: Ru
 	await progress(host, `${card.id} review ${cycle} → triage`);
 }
 
-async function onFixComplete(host: DriverHost, gate: TodoGate, card: CardLedger, status: RunStatus, runId: string): Promise<void> {
-	recordRunUsage(card, "fix", status);
+async function onFixComplete(host: DriverHost, gate: TodoGate, card: CardLedger, status: RunStatus, runId: string, resumed = false): Promise<void> {
+	recordRunUsage(card, "fix", status, { resumed, runId });
 	const wasMerged = card.merge?.state === "merged";
 	if (status.state === "paused") {
 		await blockCard(host, card, `fix run ${runId} paused by operator — redispatch to retry the pending fixes`);
@@ -1015,8 +1152,8 @@ async function onFixComplete(host: DriverHost, gate: TodoGate, card: CardLedger,
 	await progress(host, `${card.id} fixes applied → re-review`);
 }
 
-async function onCaptainComplete(host: DriverHost, gate: TodoGate, card: CardLedger, status: RunStatus, runId: string): Promise<void> {
-	recordRunUsage(card, "captain", status);
+async function onCaptainComplete(host: DriverHost, gate: TodoGate, card: CardLedger, status: RunStatus, runId: string, resumed = false): Promise<void> {
+	recordRunUsage(card, "captain", status, { resumed, runId });
 	if (status.state === "paused") {
 		await blockCard(host, card, `captain run ${runId} paused by operator — redispatch to restart the card loop`);
 		return;
@@ -1221,6 +1358,11 @@ async function reconcileScout(host: DriverHost): Promise<void> {
 	}
 	if (!isTerminal(status)) return;
 	if (status.usage) atlas.usage = mergeUsage(atlas.usage, status.usage);
+	const atlasSessions = upsertSessionUsage(atlas.usageSessions ?? [], "scout", status, atlas.runId);
+	if (atlasSessions) {
+		atlas.usageSessions = atlasSessions;
+		atlas.usage = aggregateSessions(atlasSessions);
+	}
 	const wasBuilding = atlas.state === "building";
 	if (status.state !== "complete") {
 		atlas.state = "failed";
@@ -1447,15 +1589,19 @@ export async function startReviewFor(host: DriverHost, card: CardLedger): Promis
 	// instead of re-deriving the whole card. Independence is per card (reviewer
 	// ≠ worker); a fresh pair of eyes per cycle only re-reads the same files.
 	if (effectiveReviewerResume(ledger) && card.reviewRun && card.cycles > 0 && card.lastReviewedSha) {
-		const decision = [...ledger.decisions]
-			.reverse()
-			.find((entry) => entry.card === card.id && entry.kind === "review-triage" && entry.status === "resolved");
-		const approved = (decision?.verdicts ?? []).filter((verdict) => verdict.verdict === "approve");
-		const [fixLog, fixStat] = await Promise.all([
-			host.ports.git.commitLog(cwd, `${card.lastReviewedSha}..HEAD`),
-			host.ports.git.diffStat(cwd, card.lastReviewedSha, "HEAD"),
-		]);
-		const task = reReviewBrief({
+		const decision = resumeDecision(host, card, "reviewer");
+		if (!decision.resume) {
+			await progress(host, `${card.id} review ${card.cycles + 1}: fresh reviewer — ${decision.reason}`);
+		} else {
+			const decisionLog = [...ledger.decisions]
+				.reverse()
+				.find((entry) => entry.card === card.id && entry.kind === "review-triage" && entry.status === "resolved");
+			const approved = (decisionLog?.verdicts ?? []).filter((verdict) => verdict.verdict === "approve");
+			const [fixLog, fixStat] = await Promise.all([
+				host.ports.git.commitLog(cwd, `${card.lastReviewedSha}..HEAD`),
+				host.ports.git.diffStat(cwd, card.lastReviewedSha, "HEAD"),
+			]);
+			const task = reReviewBrief({
 			ledger,
 			card,
 			cycle: card.cycles + 1,
@@ -1478,10 +1624,11 @@ export async function startReviewFor(host: DriverHost, card: CardLedger): Promis
 			};
 			card.reviewRun = result.runId;
 			card.lastReviewedSha = headSha;
+			card.reviewerResumeDepth = (card.reviewerResumeDepth ?? 0) + 1;
 			card.phase = "reviewing";
 			card.runs += 1;
 			card.blockedFrom = undefined;
-			await progress(host, `${card.id} review ${card.cycles + 1} dispatched (resume)`);
+			await progress(host, `${card.id} review ${card.cycles + 1} dispatched (resume ${card.reviewerResumeDepth})`);
 			await host.save();
 			return;
 		} catch (error) {
@@ -1490,6 +1637,7 @@ export async function startReviewFor(host: DriverHost, card: CardLedger): Promis
 				"warning",
 			);
 			await progress(host, `${card.id} reviewer resume failed → fresh review`);
+		}
 		}
 	}
 
@@ -1525,6 +1673,7 @@ export async function startReviewFor(host: DriverHost, card: CardLedger): Promis
 		return;
 	}
 	card.lastReviewedSha = headSha;
+	card.reviewerResumeDepth = 0;
 	await host.save();
 	await progress(host, `${card.id} review ${card.cycles + 1} dispatched`);
 }
@@ -1580,33 +1729,46 @@ async function dispatchFixes(host: DriverHost, gate: TodoGate): Promise<void> {
 		});
 		const cwd = host.ports.runCwd(ledger, card);
 		if (card.workerRun) {
-			try {
-				const result = await host.ports.runs.resume(card.workerRun, task);
-				card.activeRun = {
-					kind: "fix",
-					runId: result.runId,
-					startedAt: Date.now(),
-					...(result.asyncDir ? { asyncDir: result.asyncDir } : {}),
-				};
-				card.fixRuns = [...(card.fixRuns ?? []), result.runId];
-				card.workerRun = result.runId;
-				card.runs += 1;
-				card.blockedFrom = undefined;
-				await progress(host, `${card.id} fix dispatched (resume)`);
-				await host.save();
-				continue;
-			} catch (error) {
-				host.ports.notify(
-					`Work program: could not resume the retained worker for card ${card.id} (${oneLine(String(error), 120)}); dispatching a fresh worker.`,
-					"warning",
-				);
-				await progress(host, `${card.id} resume failed → fresh fix`);
+			const decision = resumeDecision(host, card, "worker");
+			if (!decision.resume) {
+				await progress(host, `${card.id} fix: fresh session — ${decision.reason}`);
+			} else {
+				try {
+					const result = await host.ports.runs.resume(card.workerRun, task);
+					card.activeRun = {
+						kind: "fix",
+						runId: result.runId,
+						startedAt: Date.now(),
+						resumed: true,
+						...(result.asyncDir ? { asyncDir: result.asyncDir } : {}),
+					};
+					card.fixRuns = [...(card.fixRuns ?? []), result.runId];
+					card.workerRun = result.runId;
+					card.workerResumeDepth = (card.workerResumeDepth ?? 0) + 1;
+					card.runs += 1;
+					card.blockedFrom = undefined;
+					await progress(host, `${card.id} fix dispatched (resume ${card.workerResumeDepth})`);
+					await host.save();
+					continue;
+				} catch (error) {
+					host.ports.notify(
+						`Work program: could not resume the retained worker for card ${card.id} (${oneLine(String(error), 120)}); dispatching a fresh worker.`,
+						"warning",
+					);
+					await progress(host, `${card.id} resume failed → fresh fix`);
+				}
 			}
 		}
 		const dispatched = await dispatchWithInfraRetry(host, card, {
 			kind: "fix",
 			agent: effectiveWorkerAgent(ledger, card),
-			task,
+			task:
+				task +
+				[
+					"",
+					"This is a FRESH session continuing an existing lane: the previous session's history is unavailable to you.",
+					"Reconstruct state before changing anything: the card's `## Evidence` section, the lane's commits and diff (`git log --oneline -20`, `git diff HEAD~'<n>'`), and the program atlas named above.",
+				].join("\n"),
 			cwd,
 			model: effectiveWorkerModel(ledger, card),
 			thinking: effectiveWorkerThinking(ledger, card),
@@ -1616,7 +1778,8 @@ async function dispatchFixes(host: DriverHost, gate: TodoGate): Promise<void> {
 			await blockCard(host, card, `fix dispatch failed: ${dispatched.error}`);
 			continue;
 		}
-		await progress(host, `${card.id} fix dispatched (fresh)`);
+		card.workerResumeDepth = 0;
+		await progress(host, `${card.id} fix dispatched (fresh session)`);
 	}
 }
 
@@ -1955,8 +2118,8 @@ async function finishMergeCommit(host: DriverHost, card: CardLedger, gate: TodoG
 	}
 }
 
-async function onReconcilerComplete(host: DriverHost, gate: TodoGate, card: CardLedger, status: RunStatus, runId: string): Promise<void> {
-	recordRunUsage(card, "reconciler", status);
+async function onReconcilerComplete(host: DriverHost, gate: TodoGate, card: CardLedger, status: RunStatus, runId: string, resumed = false): Promise<void> {
+	recordRunUsage(card, "reconciler", status, { resumed, runId });
 	if (status.state === "paused") {
 		await blockCard(
 			host,

@@ -48,12 +48,40 @@ export interface RunUsage {
 	costUsd?: number;
 	turns?: number;
 	tools?: number;
+	/** Cached input tokens re-read across turns (transcript-accurate when available). */
+	cacheRead?: number;
+	cacheWrite?: number;
 }
 
 /** One recorded run's usage, kept per card for per-pass breakdown. */
 export interface CardRunUsage extends RunUsage {
 	kind: ActiveRunKind;
 	at: number;
+	/** True when this run continued a retained session (resume) instead of starting fresh. */
+	resumed?: boolean;
+	/** Session transcript key; resumed runs share their session's key. */
+	session?: string;
+}
+
+/**
+ * Cumulative usage of one agent session — a worker or reviewer chain across
+ * resumes shares one session (and one transcript), so resumes UPDATE this
+ * snapshot instead of adding a row. A fresh dispatch starts a new session.
+ * Card totals are the sum of sessions: accurate across resume chains.
+ */
+export interface CardSessionUsage {
+	session: string;
+	kind: ActiveRunKind;
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	total: number;
+	costUsd?: number;
+	windowPeak?: number;
+	turns?: number;
+	tools?: number;
+	updatedAt: number;
 }
 
 /**
@@ -78,6 +106,8 @@ export interface AtlasLedger {
 	builtAt?: number;
 	updatedAt?: number;
 	usage?: RunUsage;
+	/** Per-session scout usage (refreshes replace their session row, never sum). */
+	usageSessions?: CardSessionUsage[];
 	lastError?: string;
 	/** Refresh retry throttle: no fresh refresh dispatch before this timestamp. */
 	nextRefreshAt?: number;
@@ -89,13 +119,15 @@ export interface CardMerge {
 	attempts: number;
 }
 
-export type ActiveRunKind = "worker" | "reviewer" | "fix" | "captain" | "reconciler";
+export type ActiveRunKind = "worker" | "reviewer" | "fix" | "captain" | "reconciler" | "scout";
 
 export interface ActiveRun {
 	kind: ActiveRunKind;
 	runId: string;
 	asyncDir?: string;
 	startedAt: number;
+	/** True when this run continued a retained session instead of starting fresh. */
+	resumed?: boolean;
 }
 
 export interface CardLedger {
@@ -151,6 +183,12 @@ export interface CardLedger {
 	usage?: RunUsage;
 	/** Per-run usage records (bounded), newest last. */
 	usageRuns?: CardRunUsage[];
+	/** Cumulative per-session usage (resumes update their session; fresh runs add one). */
+	usageSessions?: CardSessionUsage[];
+	/** Consecutive resumes of the worker session; a fresh worker resets it to 0. */
+	workerResumeDepth?: number;
+	/** Consecutive resumes of the reviewer session; a fresh reviewer resets it to 0. */
+	reviewerResumeDepth?: number;
 	/** Per-card gate commands (front matter `gates`); overrides the program's gates.card when set. */
 	gateCommands?: string[];
 	/** Findings approved at the review-cycle cap and carried into the merge unfixed. */
@@ -205,6 +243,10 @@ export interface ProgramLedger {
 	reviewerResume?: boolean;
 	/** Per-run wall-clock timeout passed to every dispatch (default 4h; pi-subagents otherwise kills single async runs at 30m). */
 	runTimeoutMs?: number;
+	/** Resume a retained session only while its context peak stays under this (tokens). */
+	resumeMaxWindowPeak?: number;
+	/** Max consecutive resumes of one session before a fresh dispatch. */
+	resumeMaxDepth?: number;
 	workerModel?: string;
 	workerThinking?: string;
 	reviewerModel?: string;
@@ -277,6 +319,8 @@ export interface ProgramConfigOverrides {
 	reviewerThinking?: string;
 	reviewerResume?: boolean;
 	runTimeoutMs?: number;
+	resumeMaxWindowPeak?: number;
+	resumeMaxDepth?: number;
 	atlasEnabled?: boolean;
 	atlasAgent?: string;
 	atlasModel?: string;
@@ -302,8 +346,13 @@ export interface WorkProgramSettings {
 	reviewer: { model?: string; thinking?: string };
 	/** Program atlas: scout-built orientation document injected into worker/reviewer briefs. */
 	atlas?: { enabled: boolean; agent: string; model?: string; thinking?: string };
+	iterations?: number;
 	/** Per-run wall-clock timeout for dispatches (default 4h). */
 	runTimeoutMs?: number;
+	/** Context-peak threshold for resuming a retained session (default 250k tokens). */
+	resumeMaxWindowPeak?: number;
+	/** Max consecutive resumes of one session (default 3). */
+	resumeMaxDepth?: number;
 	gates: { card: string[]; program: string[] };
 	worktreeDir?: string;
 	laneBranchPattern: string;
@@ -316,6 +365,10 @@ export interface RunStatus {
 	error?: string;
 	/** Token/cost usage read from the run's status.json (terminal states). */
 	usage?: RunUsage;
+	/** Child session transcript path (status.json `sessionFile`); resumed runs share the original. */
+	sessionFile?: string;
+	/** Cumulative usage of the whole session, summed from the transcript (authoritative, includes cache reads). */
+	sessionUsage?: RunUsage;
 }
 
 export interface RunHeartbeat {

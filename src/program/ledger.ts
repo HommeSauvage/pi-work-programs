@@ -40,6 +40,14 @@ export function atlasPath(programDir: string): string {
 	return join(programDir, ATLAS_FILE);
 }
 
+/** Lane handoff note maintained by the worker for whoever continues this lane.
+ *  Machine state, not a record: it lives in the program's `.runtime` (gitignored)
+ *  so it informs the next session without ever dirtying the repository the worker
+ *  commits to. */
+export function laneNotesPath(programDir: string, cardId: string): string {
+	return join(programDir, RUNTIME_DIR, "lanes", `${cardId}.md`);
+}
+
 export function laneBranch(pattern: string, baseBranch: string, cardId: string): string {
 	if (pattern.includes("{branch}") || pattern.includes("{id}")) {
 		return pattern.replace("{branch}", baseBranch).replace("{id}", cardId);
@@ -77,6 +85,8 @@ export function cardFromParsed(parsed: ParsedCard, planText: string): CardLedger
 	if (parsed.workerAgent) card.workerAgent = parsed.workerAgent;
 	if (parsed.workerModel) card.workerModel = parsed.workerModel;
 	if (parsed.workerThinking) card.workerThinking = parsed.workerThinking;
+	if (parsed.fixModel) card.fixModel = parsed.fixModel;
+	if (parsed.fixThinking) card.fixThinking = parsed.fixThinking;
 	if (parsed.reviewerAgent) card.reviewerAgent = parsed.reviewerAgent;
 	if (parsed.reviewerModel) card.reviewerModel = parsed.reviewerModel;
 	if (parsed.reviewerThinking) card.reviewerThinking = parsed.reviewerThinking;
@@ -132,6 +142,8 @@ export function buildLedger(input: {
 		resumeMaxDepth: settings.resumeMaxDepth ?? DEFAULT_RESUME_MAX_DEPTH,
 		workerModel: settings.worker.model,
 		workerThinking: settings.worker.thinking,
+		...(settings.worker.fixModel ? { fixModel: settings.worker.fixModel } : {}),
+		...(settings.worker.fixThinking ? { fixThinking: settings.worker.fixThinking } : {}),
 		reviewerModel: settings.reviewer.model,
 		reviewerThinking: settings.reviewer.thinking,
 		gates: { card: [...settings.gates.card], program: [...settings.gates.program] },
@@ -179,6 +191,8 @@ export function configOverridesFromPlan(planText: string): ProgramConfigOverride
 		if (typeof worker.agent === "string") overrides.workerAgent = worker.agent;
 		if (typeof worker.model === "string") overrides.workerModel = worker.model;
 		if (typeof worker.thinking === "string") overrides.workerThinking = worker.thinking;
+		if (typeof worker.fixModel === "string") overrides.fixModel = worker.fixModel;
+		if (typeof worker.fixThinking === "string") overrides.fixThinking = worker.fixThinking;
 	}
 	const reviewer = isPlainRecord(raw.reviewer) ? raw.reviewer : undefined;
 	if (reviewer) {
@@ -230,6 +244,17 @@ export function effectiveWorkerModel(ledger: ProgramLedger, card: CardLedger): s
 
 export function effectiveWorkerThinking(ledger: ProgramLedger, card: CardLedger): string | undefined {
 	return card.workerThinking ?? ledger.workerThinking;
+}
+
+/** Thinking level for FRESH fix dispatches (resumed fixes keep the retained child's own).
+ *  Falls back to the worker lane so an unset key changes nothing. */
+export function effectiveFixThinking(ledger: ProgramLedger, card: CardLedger): string | undefined {
+	return card.fixThinking ?? ledger.fixThinking ?? effectiveWorkerThinking(ledger, card);
+}
+
+/** Model for FRESH fix dispatches; see {@link effectiveFixThinking}. */
+export function effectiveFixModel(ledger: ProgramLedger, card: CardLedger): string | undefined {
+	return card.fixModel ?? ledger.fixModel ?? effectiveWorkerModel(ledger, card);
 }
 
 export function effectiveReviewerAgent(ledger: ProgramLedger, card: CardLedger): string {
@@ -296,6 +321,13 @@ export function migrateLedger(ledger: ProgramLedger, settings: WorkProgramSettin
 	// settings choice of the builtin agent (settings.review.agent) is respected.
 	if (ledger.reviewerAgent === "reviewer" && settings.review.agent !== "reviewer") {
 		ledger.reviewerAgent = "work-program-reviewer";
+		changed = true;
+	}
+	// The builtin pi-subagents "worker" prompt carries no context/read discipline;
+	// the shipped work-program-worker replaced it as the default. An explicit
+	// settings choice of the builtin agent (settings.worker.agent) is respected.
+	if (ledger.workerAgent === "worker" && settings.worker.agent !== "worker") {
+		ledger.workerAgent = "work-program-worker";
 		changed = true;
 	}
 	if (!ledger.atlas) {

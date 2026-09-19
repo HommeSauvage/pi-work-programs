@@ -52,15 +52,25 @@ file pointers. Worker, reviewer, captain, and reconciler briefs point at it.
 Every run's token usage is recorded onto its card. Two layers:
 
 - **Session-accurate totals** (authoritative): the child session transcript is
-  summed at terminal status — input, cache reads, cache writes, output, cost,
+  summed at terminal status — input, cache reads, cache writes, output,
+  reasoning, cost and its component split (`cost.input/output/cacheRead/…`),
   turns. Resumed runs share one transcript, so a resume **replaces** its
   session's row instead of adding one; card totals are the sum of sessions and
   never double-count a resume chain. Progress lines, harness evidence
-  (`usage: 71.0M tok (cache 68.1M) · 266 turns · $1.02`), `status`, and the
-  completion summary all use these numbers.
+  (`usage: 71.0M tok (cache 68.1M) · 266 turns · $1.02 (in 0.12 · out 0.20 · cache
+  0.21 · reason 82k)`), `status`, and the completion summary all use these
+  numbers. The component split appears only when the transcript recorded it —
+  status.json carries a single total — so it is never invented.
 - **Per-run history**: each run's `status.json` numbers are kept for the
   pass-by-pass breakdown (`usageRuns`, bounded), flagged `resumed: true` when
   the run continued a retained session.
+
+Read the split before retuning. Cached input is ~50x cheaper per token than
+uncached input and ~200x cheaper than output, so token counters alone mislead:
+a card whose dollars are mostly reasoning wants a lower fix-lane thinking; a card
+dominated by uncached input wants tighter reads (ranged reads, one verification
+command, citations instead of dumps); a card dominated by cached input wants a
+smaller context (fresh continuation, compaction, or more Context at plan time).
 
 Use it to retune: cards that dominate the token budget are candidates for
 tighter scope, more Context, or `enhanced` → `light` review.
@@ -75,12 +85,30 @@ every turn, so past a point a fresh session is cheaper.
 - `resumeMaxWindowPeak` (default **250k tokens**): once a session's context
   peak reaches this, the next continuation is dispatched fresh. The fresh
   agent is told it is continuing an existing lane and must reconstruct state
-  from the card Evidence, the lane diff, and the atlas.
+  from the lane notes, the card Evidence, the lane diff, and the atlas.
 - `resumeMaxDepth` (default **3**): consecutive resumes of one session before
   a fresh dispatch; a fresh run resets the chain.
 - Both apply independently to worker fixes and reviewer cycles; a skipped
   resume is recorded in `progress.md` with its reason
   (`03 fix: fresh session — session peaked at 390k (limit 250k)`).
+- **Handoff beats carrying history**: every worker maintains a ≤60-line note at
+  `<program>/.runtime/lanes/<card>.md` (decisions, invariants, dead ends, open
+  threads, the files the lane owns). Machine state — gitignored, outside the
+  lane worktree, never committed. A fresh continuation reads it FIRST; that is
+  pi's own `/handoff` pattern (extract what matters rather than replaying a
+  transcript), and it is why a fresh pass does not have to be a cold one.
+- **pi compacts by itself, just not for us**: compaction fires at
+  `contextWindow - reserveTokens` (16k reserve, ~20k kept recent). Our model
+  declares a 1M window, so nothing fires before 983k. Point the lanes at a
+  bounded model alias (`~/.pi/agent/models.json`, `contextWindow` ~180-200k for
+  workers/scouts, ~350-400k for reviewers) to get pi's native compaction
+  underneath the resume policy. It is roughly dollar-neutral — treat it as the
+  safety and coherence net, not a saving.
+- **Fix-lane model/thinking**: `worker.fixThinking` / `worker.fixModel` (plan
+  front matter under `worker:`, or per card `fixThinking:` / `fixModel:`) apply
+  to **fresh fix dispatches only** — resumed fixes keep the retained child's
+  stored agent/model/thinking, because pi-subagents revives the stored
+  contract. Unset inherits the worker lane.
 
 ## Card lifecycle
 
@@ -92,7 +120,9 @@ pending → ready → implementing → review_pending → reviewing → triaging
 
 - The **worker** implements exactly the card's scope, runs the card's gates,
   appends an `## Evidence` section with exact command output and commit SHAs,
-  sets `State: review`, and commits.
+  sets `State: review`, and commits. It also maintains the lane handoff note
+  (`<program>/.runtime/lanes/<card>.md`) and keeps its own context small:
+  ranged reads, no re-reads, one verification command, no log dumps.
 - The **reviewer** is a fresh, read-only second pass over the committed work.
   Review is mandatory: a card can never reach `done` without a completed review.
   Within one card, review cycles 2+ **resume the same reviewer session** — it

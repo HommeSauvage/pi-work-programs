@@ -93,4 +93,24 @@ describe("run timeouts", () => {
 		expect(changed).toBe(false);
 		expect(t.ledger.reviewerAgent).toBe("reviewer");
 	});
+
+	test("old ledgers migrate the builtin worker to the shipped work-program-worker", () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		expect(t.ledger.workerAgent).toBe("work-program-worker");
+		t.ledger.workerAgent = "worker";
+		const changed = migrateLedger(t.ledger, { ...DEFAULT_SETTINGS });
+		expect(changed).toBe(true);
+		expect(t.ledger.workerAgent).toBe("work-program-worker");
+	});
+
+	test("worker migration respects an explicit settings choice of the builtin worker", () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		t.ledger.workerAgent = "worker";
+		const changed = migrateLedger(t.ledger, {
+			...DEFAULT_SETTINGS,
+			worker: { ...DEFAULT_SETTINGS.worker, agent: "worker" },
+		});
+		expect(changed).toBe(false);
+		expect(t.ledger.workerAgent).toBe("worker");
+	});
 });

@@ -21,6 +21,16 @@ export function atlasNote(atlasPath: string | undefined): string {
 	].join("\n");
 }
 
+/** Handoff note rule: what a fresh continuation reads instead of doing git archaeology.
+ *  Cheap insurance for the cases a session cannot be reused (lost session, model swap,
+ *  reload) — pi's `/handoff` pattern: extract what matters, do not carry the history. */
+export function laneNotesRule(laneNotesPath: string | undefined): string[] {
+	if (!laneNotesPath) return [];
+	return [
+		`8. Maintain the lane handoff note at ${laneNotesPath} (machine state under the program's \`.runtime\`, gitignored, ≤60 lines — never commit it): decisions and why, invariants you discovered, dead ends you ruled out, open threads, and the files this lane owns. Update it before you finish, because the next session on this lane starts from it instead of from your history.`,
+	];
+}
+
 export function workerBrief(input: {
 	ledger: ProgramLedger;
 	card: CardLedger;
@@ -31,6 +41,8 @@ export function workerBrief(input: {
 	reviewCwdNote?: string;
 	repoRoot: string;
 	atlasPath?: string;
+	/** Lane handoff note this worker maintains for whoever continues the lane. */
+	laneNotesPath?: string;
 }): string {
 	const { ledger, card } = input;
 	const gateLines =
@@ -63,7 +75,8 @@ export function workerBrief(input: {
 		"5. Set the card's `State: review`. Never write `State: done`; review is a separate pass.",
 		`6. Commit only your own files with message: \`wp(${ledger.slug}): ${card.id} ${oneLine(card.title, 60)}\`.`,
 		"7. Do NOT edit plan.md or progress.md.",
-		"8. If blocked, or if a plan decision is wrong, stop and ask via contact_supervisor instead of guessing.",
+		...laneNotesRule(input.laneNotesPath),
+		"9. If blocked, or if a plan decision is wrong, stop and ask via contact_supervisor instead of guessing.",
 		`Operator todos: ${operatorTodoRule(input.repoRoot, ledger.slug, card.id)}`,
 		"",
 		"When finished, reply with a summary of AT MOST 40 lines: what changed, files touched, gate results, commit SHA, and anything the reviewer should look at. The full detail belongs in the card's Evidence section, not in your reply.",
@@ -141,6 +154,8 @@ export function fixBrief(input: {
 	verdicts: FindingVerdict[];
 	gates: string[];
 	repoRoot: string;
+	/** Lane handoff note the previous session left behind (read it first). */
+	laneNotesPath?: string;
 }): string {
 	const approved = input.verdicts.filter((verdict) => verdict.verdict === "approve");
 	const rejected = input.verdicts.filter((verdict) => verdict.verdict === "reject");
@@ -167,6 +182,9 @@ export function fixBrief(input: {
 		`Full review: ${input.reviewPath}`,
 		"",
 		"Rules:",
+		...(input.laneNotesPath
+			? [`- Read the lane handoff note at ${input.laneNotesPath} FIRST — it carries the decisions, invariants and dead ends the previous session on this lane recorded. It is not in the repository; never commit it.`]
+			: []),
 		"- Change only what the approved findings require.",
 		`- Re-run the gates (${gates}), update the card's \`## Evidence\` with the new exact output and commit SHA, keep \`State: review\`, and commit with \`wp(${input.ledger.slug}): ${input.card.id} review fixes\`.`,
 		"- If an approved finding is wrong or conflicts with the plan, stop and ask via contact_supervisor instead of inventing scope.",

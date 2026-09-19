@@ -54,6 +54,59 @@ describe("usageFromSessionFile", () => {
 		expect(usage?.costUsd).toBeCloseTo(0.03);
 	});
 
+	test("splits cost by component and counts reasoning tokens", () => {
+		const file = writeTranscript([
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					usage: {
+						input: 1_000,
+						output: 400,
+						cacheRead: 200_000,
+						cacheWrite: 0,
+						reasoning: 260,
+						cost: { input: 0.0003, output: 0.00048, cacheRead: 0.0012, cacheWrite: 0, total: 0.00198 },
+					},
+				},
+			},
+			{
+				type: "message",
+				message: {
+					role: "assistant",
+					usage: {
+						input: 500,
+						output: 200,
+						cacheRead: 100_000,
+						cacheWrite: 0,
+						reasoning: 140,
+						cost: { input: 0.00015, output: 0.00024, cacheRead: 0.0006, cacheWrite: 0, total: 0.00099 },
+					},
+				},
+			},
+		]);
+		const usage = usageFromSessionFile(file);
+		expect(usage?.reasoning).toBe(400);
+		expect(usage?.costInputUsd).toBeCloseTo(0.00045);
+		expect(usage?.costOutputUsd).toBeCloseTo(0.00072);
+		expect(usage?.costCacheReadUsd).toBeCloseTo(0.0018);
+		// A zero component stays absent rather than being invented.
+		expect(usage?.costCacheWriteUsd).toBeUndefined();
+	});
+
+	test("a legacy transcript keeps the old shape", () => {
+		const file = writeTranscript([
+			{
+				type: "message",
+				message: { role: "assistant", usage: { input: 10, output: 5, cacheRead: 100, cost: 0.5 } },
+			},
+		]);
+		const usage = usageFromSessionFile(file);
+		expect(usage?.costUsd).toBe(0.5);
+		expect(usage?.reasoning).toBeUndefined();
+		expect(usage?.costInputUsd).toBeUndefined();
+	});
+
 	test("returns undefined for a missing file or a transcript without usage", () => {
 		expect(usageFromSessionFile("/nope/missing.jsonl")).toBeUndefined();
 		const file = writeTranscript([{ type: "message", message: { role: "user", content: "hi" } }]);
@@ -128,6 +181,42 @@ describe("run usage telemetry", () => {
 
 		const text = t.fake.files.get(programCardPath("01")) ?? "";
 		expect(text).toContain("usage: 1.5M tok · 52 turns · $0.25 (2 runs)");
+	});
+
+	test("evidence shows the cost split when the transcript recorded one", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await drive(t.host);
+		const workerRun = t.fake.dispatched.find((entry) => entry.request.kind === "worker")!.runId;
+		writeLaneEvidence(t, "01", "$ bun test\n3 pass");
+		t.completeRun(workerRun, {
+			output: "implemented",
+			usage: { input: 100_000, output: 40_000, total: 8_400_000, windowPeak: 180_000, turns: 40, tools: 30, costUsd: 0.53 },
+			sessionUsage: {
+				input: 100_000,
+				output: 40_000,
+				total: 8_400_000,
+				cacheRead: 8_200_000,
+				turns: 40,
+				costUsd: 0.53,
+				reasoning: 19_000,
+				costInputUsd: 0.03,
+				costOutputUsd: 0.48,
+				costCacheReadUsd: 0.02,
+			},
+		});
+		await drive(t.host);
+		const reviewRun = t.fake.dispatched.find((entry) => entry.request.kind === "reviewer")!.runId;
+		t.completeRun(reviewRun, {
+			output: "clean",
+			usage: { input: 10_000, output: 2_000, total: 400_000, windowPeak: 90_000, turns: 8, tools: 9, costUsd: 0.05 },
+		});
+		await drive(t.host);
+		expect(applyTriage(t.host, "01", []).ok).toBe(true);
+		await drive(t.host);
+		const text = t.fake.files.get(programCardPath("01")) ?? "";
+		// Components come from the transcript-accurate worker snapshot only; the
+		// reviewer run reported a bare total, so nothing is invented for it.
+		expect(text).toContain("(in 0.03 · out 0.48 · cache 0.02 · reason 19k)");
 	});
 
 	test("runs without usage data simply record nothing", async () => {

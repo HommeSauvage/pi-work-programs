@@ -67,6 +67,29 @@ describe("applyOverrides", () => {
 	});
 });
 
+describe("fix-lane model and thinking", () => {
+	test("parses worker.fixModel and worker.fixThinking", () => {
+		const settings = normalizeSettings({
+			worker: { agent: "worker", model: "p/m", thinking: "high", fixModel: "p/cheap", fixThinking: "medium" },
+		});
+		expect(settings.worker.model).toBe("p/m");
+		expect(settings.worker.fixModel).toBe("p/cheap");
+		expect(settings.worker.fixThinking).toBe("medium");
+	});
+
+	test("leaves the fix lane unset by default so it inherits the worker lane", () => {
+		const settings = applyOverrides(DEFAULT_SETTINGS, { workerModel: "p/m" });
+		expect(settings.worker.fixModel).toBeUndefined();
+		expect(settings.worker.fixThinking).toBeUndefined();
+	});
+
+	test("program overrides replace the fix lane values", () => {
+		const base = normalizeSettings({ worker: { fixThinking: "high" } });
+		const settings = applyOverrides(base, { fixThinking: "low" });
+		expect(settings.worker.fixThinking).toBe("low");
+	});
+});
+
 import { afterEach, beforeEach } from "bun:test";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";

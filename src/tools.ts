@@ -31,6 +31,8 @@ interface WorkProgramParams {
 	workerAgent?: string;
 	workerModel?: string;
 	workerThinking?: string;
+	fixModel?: string;
+	fixThinking?: string;
 	reviewerAgent?: string;
 	reviewerModel?: string;
 	reviewerThinking?: string;
@@ -132,7 +134,8 @@ export function registerTools(pi: ExtensionAPI, controller: WorkProgramControlle
 			"finalize_plan only validates and stages a program — it never starts execution. After writing a plan, STOP and wait for the operator to review; only call resume/start/dispatch after the operator explicitly says to start.",
 			"When a work program completes, you receive a summary packet: reply with a completion summary, then ask whether to close the program. Only call close with remove:true after the operator explicitly confirms — never delete program records unprompted.",
 			"Pause is soft by default (in-flight runs finish, resume reconciles); pass hard:true to stop runs immediately and rearm their cards. Resume restarts the drive.",
-			"The program is retunable while it runs: work_program({ action: \"config\", onExhausted, reviewProfile, maxParallel, parallelExecution, workerAgent, workerModel, workerThinking, reviewerAgent, reviewerModel, reviewerThinking, reviewerResume, atlasEnabled, atlasAgent, atlasModel, atlasThinking, runTimeoutMs, resumeMaxWindowPeak, resumeMaxDepth }) updates the live ledger and persists into plan.md front matter, so it survives sync and reload. Use it instead of answering cycle decisions one by one (onExhausted: \"accept\" also resolves the open ones), and instead of editing plan.md by hand.",
+			"The program is retunable while it runs: work_program({ action: \"config\", onExhausted, reviewProfile, maxParallel, parallelExecution, workerAgent, workerModel, workerThinking, fixModel, fixThinking, reviewerAgent, reviewerModel, reviewerThinking, reviewerResume, atlasEnabled, atlasAgent, atlasModel, atlasThinking, runTimeoutMs, resumeMaxWindowPeak, resumeMaxDepth }) updates the live ledger and persists into plan.md front matter, so it survives sync and reload. Use it instead of answering cycle decisions one by one (onExhausted: \"accept\" also resolves the open ones), and instead of editing plan.md by hand.",
+			"fixModel/fixThinking apply to FRESH fix runs only (including gate fixes): a resumed fix keeps the retained child's stored model and thinking, so lower the fix thinking when the work is mechanical rather than starting a head-to-head with a big context.",
 			"maxCycles is OPERATOR-ONLY and immutable to you: never raise or lower a cycle budget on your own — not to finish a card, not to unblock the drive, not to silence a cycle decision. When the operator explicitly asks for a cycle-budget change, pass operatorApproved: true (it is written to progress.md as operator-authorized); otherwise the call is refused. The operator may also edit plan.md / card front matter by hand.",
 			"Retune one card with card set: work_program({ action: \"config\", card: \"05\", reviewProfile: \"enhanced\" }) updates the live ledger row and persists into that card file's front matter. Card models work the same way (workerModel, reviewerModel, thinking); pass an empty string to clear a card override so it inherits the program default. Never hand-edit card front matter — always use config with card.",
 			"When a work-program decision packet arrives, answer with the exact work_program call it names (for review triage use action 'triage' with one verdict per finding).",
@@ -175,6 +178,18 @@ export function registerTools(pi: ExtensionAPI, controller: WorkProgramControlle
 			workerAgent: Type.Optional(Type.String({ description: "config: worker subagent (program-level, or per-card with card set)" })),
 			workerModel: Type.Optional(Type.String({ description: "config: model for worker runs (empty string clears a card override)" })),
 			workerThinking: Type.Optional(Type.String({ description: "config: thinking level for worker runs (empty string clears a card override)" })),
+			fixModel: Type.Optional(
+				Type.String({
+					description:
+						"config: model for FRESH fix runs only (empty string clears). Resumed fixes keep the retained child's stored model, so this applies to fresh dispatches and gate fixes.",
+				}),
+			),
+			fixThinking: Type.Optional(
+				Type.String({
+					description:
+						"config: thinking level for FRESH fix runs only (empty string clears). Mechanical fix work is the cheapest place to drop a thinking level.",
+				}),
+			),
 			reviewerAgent: Type.Optional(Type.String({ description: "config: reviewer subagent (program-level, or per-card with card set)" })),
 			reviewerModel: Type.Optional(Type.String({ description: "config: model for reviewer runs (empty string clears a card override)" })),
 			reviewerThinking: Type.Optional(Type.String({ description: "config: thinking level for reviewer runs (empty string clears a card override)" })),
@@ -307,6 +322,8 @@ export function registerTools(pi: ExtensionAPI, controller: WorkProgramControlle
 					if (params.workerAgent !== undefined) patch.workerAgent = params.workerAgent;
 					if (params.workerModel !== undefined) patch.workerModel = params.workerModel;
 					if (params.workerThinking !== undefined) patch.workerThinking = params.workerThinking;
+					if (params.fixModel !== undefined) patch.fixModel = params.fixModel;
+					if (params.fixThinking !== undefined) patch.fixThinking = params.fixThinking;
 					if (params.reviewerAgent !== undefined) patch.reviewerAgent = params.reviewerAgent;
 					if (params.reviewerModel !== undefined) patch.reviewerModel = params.reviewerModel;
 					if (params.reviewerThinking !== undefined) patch.reviewerThinking = params.reviewerThinking;

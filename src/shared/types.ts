@@ -51,6 +51,15 @@ export interface RunUsage {
 	/** Cached input tokens re-read across turns (transcript-accurate when available). */
 	cacheRead?: number;
 	cacheWrite?: number;
+	/** Reasoning (thinking) tokens; providers bill these as output. Transcript-accurate only. */
+	reasoning?: number;
+	/** Cost split in USD, transcript-accurate only (status.json carries a single total).
+	 *  Cached input is ~50x cheaper per token than uncached input, so the split — not
+	 *  the total — is what tells a reader where the money went. */
+	costInputUsd?: number;
+	costOutputUsd?: number;
+	costCacheReadUsd?: number;
+	costCacheWriteUsd?: number;
 }
 
 /** One recorded run's usage, kept per card for per-pass breakdown. */
@@ -81,6 +90,13 @@ export interface CardSessionUsage {
 	windowPeak?: number;
 	turns?: number;
 	tools?: number;
+	/** Reasoning (thinking) tokens; billed as output. Transcript-accurate only. */
+	reasoning?: number;
+	/** Cost split in USD (transcript-accurate only); see {@link RunUsage}. */
+	costInputUsd?: number;
+	costOutputUsd?: number;
+	costCacheReadUsd?: number;
+	costCacheWriteUsd?: number;
 	updatedAt: number;
 }
 
@@ -144,6 +160,9 @@ export interface CardLedger {
 	workerAgent?: string;
 	workerModel?: string;
 	workerThinking?: string;
+	/** Per-card override for fresh fix dispatches (falls back to the program's fix* then the worker lane). */
+	fixModel?: string;
+	fixThinking?: string;
 	reviewerAgent?: string;
 	reviewerModel?: string;
 	reviewerThinking?: string;
@@ -249,6 +268,10 @@ export interface ProgramLedger {
 	resumeMaxDepth?: number;
 	workerModel?: string;
 	workerThinking?: string;
+	/** Fresh fix dispatches only: resumed fixes keep the retained child's stored model/thinking. */
+	fixModel?: string;
+	/** Fresh fix dispatches only; see {@link ProgramLedger.fixModel}. */
+	fixThinking?: string;
 	reviewerModel?: string;
 	reviewerThinking?: string;
 	gates: { card: string[]; program: string[] };
@@ -278,6 +301,8 @@ export interface ParsedCard {
 	workerAgent?: string;
 	workerModel?: string;
 	workerThinking?: string;
+	fixModel?: string;
+	fixThinking?: string;
 	reviewerAgent?: string;
 	reviewerModel?: string;
 	reviewerThinking?: string;
@@ -293,6 +318,8 @@ export interface CardConfigPatch {
 	workerAgent?: string;
 	workerModel?: string;
 	workerThinking?: string;
+	fixModel?: string;
+	fixThinking?: string;
 	reviewerAgent?: string;
 	reviewerModel?: string;
 	reviewerThinking?: string;
@@ -315,6 +342,8 @@ export interface ProgramConfigOverrides {
 	reviewerAgent?: string;
 	workerModel?: string;
 	workerThinking?: string;
+	fixModel?: string;
+	fixThinking?: string;
 	reviewerModel?: string;
 	reviewerThinking?: string;
 	reviewerResume?: boolean;
@@ -342,7 +371,7 @@ export interface WorkProgramSettings {
 		/** Resume the same reviewer across a card's review cycles (default true). */
 		resumeReviewer?: boolean;
 	};
-	worker: { agent: string; model?: string; thinking?: string };
+	worker: { agent: string; model?: string; thinking?: string; fixModel?: string; fixThinking?: string };
 	reviewer: { model?: string; thinking?: string };
 	/** Program atlas: scout-built orientation document injected into worker/reviewer briefs. */
 	atlas?: { enabled: boolean; agent: string; model?: string; thinking?: string };

@@ -669,6 +669,16 @@ describe("operator todos", () => {
 		expect(t.fake.files.get("/repo/.operator/todo.md")?.startsWith("# Operator todo")).toBe(true);
 	});
 
+	test("the drive keeps program machine state out of git status on older programs", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		const ignorePath = "/repo/.agents/work-programs/test-program/.runtime/.gitignore";
+		expect(t.fake.files.has(ignorePath)).toBe(false);
+		await drive(t.host);
+		// Lane notes, reviews and the ledger all live under .runtime; they must not
+		// show up as an untracked directory in the checkout they sit beside.
+		expect(t.fake.files.get(ignorePath)).toBe("*\n");
+	});
+
 	test("operator todo edits do not pause the merge queue", async () => {
 		const t = createTestHost({ cards: [{ id: "01" }] });
 		t.git.statusOutput = " M .operator/todo.md\n M src/unrelated-note.md";

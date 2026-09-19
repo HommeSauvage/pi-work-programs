@@ -1,5 +1,5 @@
 import { loadResources } from "../protocol/resources.ts";
-import { PACKET_WAKE_FORCE_AGE_MS, PACKET_WAKE_MIN_AGE_MS, SCOUT_TIMEOUT_MS } from "../constants.ts";
+import { PACKET_WAKE_FORCE_AGE_MS, PACKET_WAKE_MIN_AGE_MS, RUNTIME_DIR, RUNTIME_GITIGNORE, SCOUT_TIMEOUT_MS } from "../constants.ts";
 import {
 	captainBrief,
 	fixBrief,
@@ -15,6 +15,8 @@ import { appendHarnessEvidence, gateEvidenceLines, setCardState } from "../progr
 import {
 	atlasPath,
 	effectiveCardGates,
+	effectiveFixModel,
+	effectiveFixThinking,
 	effectiveMaxCycles,
 	effectiveResumeMaxDepth,
 	effectiveResumeMaxWindowPeak,
@@ -28,6 +30,7 @@ import {
 	effectiveWorkerModel,
 	effectiveWorkerThinking,
 	laneBranch,
+	laneNotesPath,
 	reviewPath,
 } from "../program/ledger.ts";
 import {
@@ -102,6 +105,16 @@ function mergeUsage(acc: RunUsage | undefined, usage: RunUsage): RunUsage {
 	if (cacheRead > 0) merged.cacheRead = cacheRead;
 	const cacheWrite = (acc?.cacheWrite ?? 0) + (usage.cacheWrite ?? 0);
 	if (cacheWrite > 0) merged.cacheWrite = cacheWrite;
+	const reasoning = (acc?.reasoning ?? 0) + (usage.reasoning ?? 0);
+	if (reasoning > 0) merged.reasoning = reasoning;
+	const costInputUsd = (acc?.costInputUsd ?? 0) + (usage.costInputUsd ?? 0);
+	if (costInputUsd > 0) merged.costInputUsd = costInputUsd;
+	const costOutputUsd = (acc?.costOutputUsd ?? 0) + (usage.costOutputUsd ?? 0);
+	if (costOutputUsd > 0) merged.costOutputUsd = costOutputUsd;
+	const costCacheReadUsd = (acc?.costCacheReadUsd ?? 0) + (usage.costCacheReadUsd ?? 0);
+	if (costCacheReadUsd > 0) merged.costCacheReadUsd = costCacheReadUsd;
+	const costCacheWriteUsd = (acc?.costCacheWriteUsd ?? 0) + (usage.costCacheWriteUsd ?? 0);
+	if (costCacheWriteUsd > 0) merged.costCacheWriteUsd = costCacheWriteUsd;
 	return merged;
 }
 
@@ -114,6 +127,11 @@ function aggregateSessions(sessions: CardSessionUsage[]): RunUsage | undefined {
 	let cacheWrite = 0;
 	let total = 0;
 	let costUsd = 0;
+	let costInputUsd = 0;
+	let costOutputUsd = 0;
+	let costCacheReadUsd = 0;
+	let costCacheWriteUsd = 0;
+	let reasoning = 0;
 	let turns = 0;
 	let tools = 0;
 	let peak = 0;
@@ -124,6 +142,11 @@ function aggregateSessions(sessions: CardSessionUsage[]): RunUsage | undefined {
 		cacheWrite += session.cacheWrite;
 		total += session.total;
 		costUsd += session.costUsd ?? 0;
+		costInputUsd += session.costInputUsd ?? 0;
+		costOutputUsd += session.costOutputUsd ?? 0;
+		costCacheReadUsd += session.costCacheReadUsd ?? 0;
+		costCacheWriteUsd += session.costCacheWriteUsd ?? 0;
+		reasoning += session.reasoning ?? 0;
 		turns += session.turns ?? 0;
 		tools += session.tools ?? 0;
 		peak = Math.max(peak, session.windowPeak ?? 0);
@@ -134,6 +157,11 @@ function aggregateSessions(sessions: CardSessionUsage[]): RunUsage | undefined {
 	if (turns > 0) aggregate.turns = turns;
 	if (tools > 0) aggregate.tools = tools;
 	if (costUsd > 0) aggregate.costUsd = costUsd;
+	if (reasoning > 0) aggregate.reasoning = reasoning;
+	if (costInputUsd > 0) aggregate.costInputUsd = costInputUsd;
+	if (costOutputUsd > 0) aggregate.costOutputUsd = costOutputUsd;
+	if (costCacheReadUsd > 0) aggregate.costCacheReadUsd = costCacheReadUsd;
+	if (costCacheWriteUsd > 0) aggregate.costCacheWriteUsd = costCacheWriteUsd;
 	if (peak > 0) aggregate.windowPeak = peak;
 	return aggregate;
 }
@@ -193,6 +221,11 @@ function upsertSessionUsage(
 		cacheWrite: sessionUsage.cacheWrite ?? 0,
 		total: sessionUsage.total,
 		...(sessionUsage.costUsd !== undefined ? { costUsd: sessionUsage.costUsd } : {}),
+		...(sessionUsage.reasoning !== undefined ? { reasoning: sessionUsage.reasoning } : {}),
+		...(sessionUsage.costInputUsd !== undefined ? { costInputUsd: sessionUsage.costInputUsd } : {}),
+		...(sessionUsage.costOutputUsd !== undefined ? { costOutputUsd: sessionUsage.costOutputUsd } : {}),
+		...(sessionUsage.costCacheReadUsd !== undefined ? { costCacheReadUsd: sessionUsage.costCacheReadUsd } : {}),
+		...(sessionUsage.costCacheWriteUsd !== undefined ? { costCacheWriteUsd: sessionUsage.costCacheWriteUsd } : {}),
 		...(windowPeak !== undefined ? { windowPeak } : {}),
 		...(sessionUsage.turns !== undefined ? { turns: sessionUsage.turns } : {}),
 		...(sessionUsage.tools !== undefined ? { tools: sessionUsage.tools } : {}),
@@ -235,13 +268,27 @@ function resumeDecision(host: DriverHost, card: CardLedger, kind: "worker" | "re
 	return { resume: true };
 }
 
-/** Compact usage label for progress lines and evidence: `71.0M tok (cache 68.1M) · 266 turns · $1.02`. */
+/** Compact usage label for progress lines and evidence:
+ *  `71.0M tok (cache 68.1M) · 266 turns · $1.02 (in 0.12 · out 0.20 · cache 0.21 · reason 82k)`.
+ *  The component split only appears for transcript-accurate usage — status.json
+ *  carries a single total — so it never invents numbers. */
 function formatUsage(usage: RunUsage): string {
 	const cache = usage.cacheRead !== undefined ? ` (cache ${formatTokens(usage.cacheRead)})` : "";
 	const parts = [`${formatTokens(usage.total)} tok${cache}`];
 	if (usage.turns !== undefined) parts.push(`${usage.turns} turns`);
-	if (usage.costUsd !== undefined) parts.push(`$${usage.costUsd.toFixed(2)}`);
+	if (usage.costUsd !== undefined) parts.push(`$${usage.costUsd.toFixed(2)}${formatCostSplit(usage)}`);
 	return parts.join(" · ");
+}
+
+/** `(in 0.12 · out 0.20 · cache 0.21 · reason 82k)` — only the components the transcript had. */
+function formatCostSplit(usage: RunUsage): string {
+	const parts: string[] = [];
+	if (usage.costInputUsd !== undefined) parts.push(`in ${usage.costInputUsd.toFixed(2)}`);
+	if (usage.costOutputUsd !== undefined) parts.push(`out ${usage.costOutputUsd.toFixed(2)}`);
+	if (usage.costCacheReadUsd !== undefined) parts.push(`cache ${usage.costCacheReadUsd.toFixed(2)}`);
+	if (usage.costCacheWriteUsd !== undefined) parts.push(`write ${usage.costCacheWriteUsd.toFixed(2)}`);
+	if (usage.reasoning !== undefined) parts.push(`reason ${formatTokens(usage.reasoning)}`);
+	return parts.length > 0 ? ` (${parts.join(" · ")})` : "";
 }
 
 export interface DriverHost {
@@ -374,6 +421,7 @@ export async function drive(host: DriverHost): Promise<void> {
 		// Cards whose merge was already attempted this tick: a parked failure must
 		// wait for the next tick instead of retrying immediately.
 		const gate = await syncTodoStore(host);
+		await ensureRuntimeIgnored(host);
 		const attemptedMerges = new Set<string>();
 		for (let pass = 0; pass < MAX_DRIVE_PASSES; pass += 1) {
 			const before = stateSignature(host);
@@ -640,6 +688,22 @@ async function ensureTodoStoreFile(host: DriverHost): Promise<TodoStore> {
  * Load the todo store, import new worker-inbox entries, persist when changed,
  * and park + announce for brand-new blocking todos. Once per drive tick.
  */
+export /** Machine state (`program.json`, reviews, lane notes) lives under `.runtime` and
+ *  must never show up in `git status`. Programs created by current code get a
+ *  `*` ignore file at creation; programs that predate it get it here, so the
+ *  lane handoff notes never dirty the checkout they are written beside.
+ *  Best-effort and idempotent: it never blocks a drive. */
+async function ensureRuntimeIgnored(host: DriverHost): Promise<void> {
+	const path = `${host.programDir}/${RUNTIME_DIR}/.gitignore`;
+	try {
+		const existing = await host.ports.readFile(path);
+		if (existing.trim().length > 0) return;
+		await host.ports.writeFile(path, RUNTIME_GITIGNORE);
+	} catch {
+		// Best effort: an unwritable program dir must not stop the pipeline.
+	}
+}
+
 export async function syncTodoStore(host: DriverHost): Promise<TodoGate> {
 	const store = await ensureTodoStoreFile(host);
 	let dirty = false;
@@ -1071,8 +1135,8 @@ async function startGateFix(
 		agent: effectiveWorkerAgent(host.ledger, card),
 		task,
 		cwd,
-		model: effectiveWorkerModel(host.ledger, card),
-		thinking: effectiveWorkerThinking(host.ledger, card),
+		model: effectiveFixModel(host.ledger, card),
+		thinking: effectiveFixThinking(host.ledger, card),
 		label: `wp ${host.ledger.slug} card ${card.id} gate fix`,
 	});
 	if (!dispatched.ok) {
@@ -1554,6 +1618,7 @@ export async function startWorkerFor(host: DriverHost, card: CardLedger): Promis
 		gates: effectiveCardGates(ledger, card),
 		repoRoot: host.cwd,
 		atlasPath: atlasNotePath(host),
+		laneNotesPath: laneNotesPath(host.programDir, card.id),
 	});
 	try {
 		const dispatched = await dispatchWithInfraRetry(host, card, {
@@ -1754,6 +1819,7 @@ async function dispatchFixes(host: DriverHost, gate: TodoGate): Promise<void> {
 			verdicts,
 			gates: effectiveCardGates(ledger, card),
 			repoRoot: host.cwd,
+			laneNotesPath: laneNotesPath(host.programDir, card.id),
 		});
 		const cwd = host.ports.runCwd(ledger, card);
 		if (card.workerRun) {
@@ -1795,11 +1861,11 @@ async function dispatchFixes(host: DriverHost, gate: TodoGate): Promise<void> {
 				[
 					"",
 					"This is a FRESH session continuing an existing lane: the previous session's history is unavailable to you.",
-					"Reconstruct state before changing anything: the card's `## Evidence` section, the lane's commits and diff (`git log --oneline -20`, `git diff HEAD~'<n>'`), and the program atlas named above.",
+					`Reconstruct state before changing anything: the lane notes at ${laneNotesPath(host.programDir, card.id)} FIRST (decisions, invariants, dead ends, the files this lane owns), then the card's \`## Evidence\` section, the lane's commits and diff (\`git log --oneline -20\`, \`git diff HEAD~'<n>'\`), and the program atlas named above.`,
 				].join("\n"),
 			cwd,
-			model: effectiveWorkerModel(ledger, card),
-			thinking: effectiveWorkerThinking(ledger, card),
+			model: effectiveFixModel(ledger, card),
+			thinking: effectiveFixThinking(ledger, card),
 			label: `wp ${ledger.slug} card ${card.id} review fixes`,
 		});
 		if (!dispatched.ok) {

@@ -102,8 +102,91 @@ describe("adaptive resume: context-peak threshold", () => {
 	});
 });
 
-describe("session-accurate usage", () => {
-	test("resumed runs replace their session snapshot instead of double-counting", async () => {
+describe("fix-lane model and thinking", () => {
+	test("a fresh fix run carries fixThinking/fixModel instead of the worker lane's", async () => {
+		const t = createTestHost({
+			cards: [{ id: "01" }],
+			overrides: { workerModel: "p/worker", workerThinking: "high", fixModel: "p/cheap", fixThinking: "medium" },
+		});
+		await driveToPendingFix(t, "01", BIG_PEAK); // forces a fresh fix session
+		await drive(t.host);
+
+		const fix = t.fake.dispatched.filter((entry) => entry.request.kind === "fix").at(-1)!;
+		expect(fix.request.thinking).toBe("medium");
+		expect(fix.request.model).toBe("p/cheap");
+	});
+
+	test("an unset fix lane inherits the worker lane", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }], overrides: { workerModel: "p/worker", workerThinking: "high" } });
+		await driveToPendingFix(t, "01", BIG_PEAK);
+		await drive(t.host);
+
+		const fix = t.fake.dispatched.filter((entry) => entry.request.kind === "fix").at(-1)!;
+		expect(fix.request.thinking).toBe("high");
+		expect(fix.request.model).toBe("p/worker");
+	});
+
+	test("a resumed fix keeps the retained child's stored contract — no fresh dispatch to change", async () => {
+		const t = createTestHost({
+			cards: [{ id: "01" }],
+			overrides: { workerThinking: "high", fixThinking: "low" },
+		});
+		// A small session resumes: pi-subagents revives the stored agent/model/thinking,
+		// so the fix lane knobs only ever apply to fresh fix dispatches.
+		await driveToPendingFix(t, "01", { input: 10_000, output: 2_000, total: 500_000, windowPeak: 90_000, turns: 40 });
+		await drive(t.host);
+
+		expect(t.fake.resumed).toHaveLength(1);
+		// The fake records resumed runs as synthetic `dispatched` entries labelled
+		// "resume"; a real fresh dispatch would carry the card label instead.
+		expect(t.fake.dispatched.filter((entry) => entry.request.label !== "resume")).toHaveLength(2);
+		expect(t.fake.progress.some((line) => line.includes("fix dispatched (resume 1)"))).toBe(true);
+		expect(t.fake.progress.some((line) => line.includes("fresh session"))).toBe(false);
+		expect(t.ledger.cards["01"]?.activeRun?.resumed).toBe(true);
+	});
+
+	test("per-card fixThinking overrides the program's fix lane", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }], overrides: { fixThinking: "medium" } });
+		t.ledger.cards["01"]!.fixThinking = "low";
+		await driveToPendingFix(t, "01", BIG_PEAK);
+		await drive(t.host);
+
+		const fix = t.fake.dispatched.filter((entry) => entry.request.kind === "fix").at(-1)!;
+		expect(fix.request.thinking).toBe("low");
+	});
+});
+
+describe("lane handoff notes", () => {
+	test("the worker brief names the lane note path and the rule to maintain it", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await drive(t.host);
+		const task = t.fake.dispatched[0]?.request.task ?? "";
+		expect(task).toContain("/repo/.agents/work-programs/test-program/.runtime/lanes/01.md");
+		expect(task).toContain("lane handoff note");
+	});
+
+	test("a fresh fix session reads the lane notes before doing git archaeology", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await driveToPendingFix(t, "01", BIG_PEAK);
+		await drive(t.host);
+
+		const fix = t.fake.dispatched.filter((entry) => entry.request.kind === "fix").at(-1)!;
+		expect(fix.request.task).toContain("FRESH session continuing an existing lane");
+		expect(fix.request.task).toContain("/repo/.agents/work-programs/test-program/.runtime/lanes/01.md");
+		expect(fix.request.task).toContain("FIRST");
+	})
+	test("every fix brief (resumed too) points at the lane notes", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await driveToPendingFix(t, "01", { input: 10_000, output: 2_000, total: 500_000, windowPeak: 90_000, turns: 40 });
+		await drive(t.host);
+
+		const resume = t.fake.resumed.at(-1)!;
+		expect(resume.message).toContain("/repo/.agents/work-programs/test-program/.runtime/lanes/01.md");
+		expect(resume.message).toContain("handoff note");
+	});
+});
+
+describe("session-accurate usage", () => {	test("resumed runs replace their session snapshot instead of double-counting", async () => {
 		const t = createTestHost({ cards: [{ id: "01" }] });
 		await drive(t.host);
 		const workerRun = t.fake.dispatched.find((entry) => entry.request.kind === "worker")!.runId;

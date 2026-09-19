@@ -50,6 +50,19 @@ describe("parseCard", () => {
 		expect(card.evidence).toContain("3 pass");
 	});
 
+	test("reads per-card fix-lane overrides, flat or nested under worker", () => {
+		const flat = parseCard("tasks/01.md", "01", "---\nfixThinking: low\nfixModel: p/cheap\n---\n\n# Card 01 — x\n\n## State: todo");
+		expect(flat.fixThinking).toBe("low");
+		expect(flat.fixModel).toBe("p/cheap");
+		const nested = parseCard(
+			"tasks/02.md",
+			"02",
+			"---\nworker:\n  thinking: high\n  fixThinking: medium\n---\n\n# Card 02 — x\n\n## State: todo",
+		);
+		expect(nested.workerThinking).toBe("high");
+		expect(nested.fixThinking).toBe("medium");
+	});
+
 	test("treats an explicit em-dash dependency line as a declaration", () => {
 		const card = parseCard("tasks/01.md", "01", "# Card 01 — x\n\nDepends on: —\n\n## State: todo");
 		expect(card.hasDependsDeclaration).toBe(true);

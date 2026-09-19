@@ -18,7 +18,7 @@ export const DEFAULT_SETTINGS: WorkProgramSettings = {
 	maxParallel: 2,
 	parallelExecution: "worktrees",
 	review: { agent: "work-program-reviewer", profile: "light", maxCycles: 3, onExhausted: "ask", resumeReviewer: true },
-	worker: { agent: "worker" },
+	worker: { agent: "work-program-worker" },
 	reviewer: {},
 	atlas: { enabled: true, agent: "scout" },
 	runTimeoutMs: DEFAULT_RUN_TIMEOUT_MS,
@@ -98,6 +98,10 @@ export function normalizeSettings(raw: unknown, base: WorkProgramSettings = DEFA
 		if (model) settings.worker.model = model;
 		const thinking = asString(worker.thinking);
 		if (thinking) settings.worker.thinking = thinking;
+		const fixModel = asString(worker.fixModel);
+		if (fixModel) settings.worker.fixModel = fixModel;
+		const fixThinking = asString(worker.fixThinking);
+		if (fixThinking) settings.worker.fixThinking = fixThinking;
 	}
 
 	const reviewer = isRecord(raw.reviewer) ? raw.reviewer : undefined;
@@ -188,6 +192,8 @@ export function formatPlanConfig(overrides: ProgramConfigOverrides): string {
 	if (overrides.workerAgent) worker.agent = overrides.workerAgent;
 	if (overrides.workerModel) worker.model = overrides.workerModel;
 	if (overrides.workerThinking) worker.thinking = overrides.workerThinking;
+	if (overrides.fixModel) worker.fixModel = overrides.fixModel;
+	if (overrides.fixThinking) worker.fixThinking = overrides.fixThinking;
 	if (Object.keys(worker).length > 0) clean.worker = worker;
 	const reviewer: Record<string, unknown> = {};
 	if (overrides.reviewerAgent) reviewer.agent = overrides.reviewerAgent;
@@ -218,6 +224,8 @@ export function applyOverrides(
 			agent: overrides.workerAgent ?? settings.worker.agent,
 			model: overrides.workerModel ?? settings.worker.model,
 			thinking: overrides.workerThinking ?? settings.worker.thinking,
+			fixModel: overrides.fixModel ?? settings.worker.fixModel,
+			fixThinking: overrides.fixThinking ?? settings.worker.fixThinking,
 		},
 		reviewer: {
 			model: overrides.reviewerModel ?? settings.reviewer.model,
@@ -291,6 +299,8 @@ export function overridesToPlanFrontmatter(overrides: ProgramConfigOverrides): R
 	if (overrides.workerAgent) worker.agent = overrides.workerAgent;
 	if (overrides.workerModel) worker.model = overrides.workerModel;
 	if (overrides.workerThinking) worker.thinking = overrides.workerThinking;
+	if (overrides.fixModel) worker.fixModel = overrides.fixModel;
+	if (overrides.fixThinking) worker.fixThinking = overrides.fixThinking;
 	if (Object.keys(worker).length > 0) data.worker = worker;
 	const reviewer: Record<string, unknown> = {};
 	if (overrides.reviewerAgent) reviewer.agent = overrides.reviewerAgent;
@@ -336,6 +346,10 @@ export function mergePlanConfig(planText: string, patch: ProgramConfigOverrides)
 		if (model) current.workerModel = model;
 		const thinking = asString(worker.thinking);
 		if (thinking) current.workerThinking = thinking;
+		const fixModel = asString(worker.fixModel);
+		if (fixModel) current.fixModel = fixModel;
+		const fixThinking = asString(worker.fixThinking);
+		if (fixThinking) current.fixThinking = fixThinking;
 	}
 	if (reviewer) {
 		const model = asString(reviewer.model);
@@ -367,6 +381,8 @@ export function mergePlanConfig(planText: string, patch: ProgramConfigOverrides)
 		["workerAgent", "worker", "agent"],
 		["workerModel", "worker", "model"],
 		["workerThinking", "worker", "thinking"],
+		["fixModel", "worker", "fixModel"],
+		["fixThinking", "worker", "fixThinking"],
 		["reviewerAgent", "reviewer", "agent"],
 		["reviewerModel", "reviewer", "model"],
 		["reviewerThinking", "reviewer", "thinking"],
@@ -405,6 +421,8 @@ export function cardPatchToFrontmatter(patch: CardConfigPatch): Record<string, u
 	if (patch.workerAgent) data.workerAgent = patch.workerAgent;
 	if (patch.workerModel) data.workerModel = patch.workerModel;
 	if (patch.workerThinking) data.workerThinking = patch.workerThinking;
+	if (patch.fixModel) data.fixModel = patch.fixModel;
+	if (patch.fixThinking) data.fixThinking = patch.fixThinking;
 	if (patch.reviewerAgent) data.reviewerAgent = patch.reviewerAgent;
 	if (patch.reviewerModel) data.reviewerModel = patch.reviewerModel;
 	if (patch.reviewerThinking) data.reviewerThinking = patch.reviewerThinking;
@@ -423,7 +441,7 @@ export function normalizeCardPatch(raw: Record<string, unknown>): CardConfigPatc
 		const num = typeof raw.maxCycles === "number" ? raw.maxCycles : Number(raw.maxCycles);
 		if (Number.isFinite(num)) patch.maxCycles = Math.max(0, Math.min(32, Math.floor(num)));
 	}
-	for (const key of ["workerAgent", "workerModel", "workerThinking", "reviewerAgent", "reviewerModel", "reviewerThinking"] as const) {
+	for (const key of ["workerAgent", "workerModel", "workerThinking", "fixModel", "fixThinking", "reviewerAgent", "reviewerModel", "reviewerThinking"] as const) {
 		const value = raw[key];
 		if (typeof value === "string" && value.trim().length > 0) patch[key] = value.trim();
 	}
@@ -445,6 +463,8 @@ export function mergeCardFrontmatter(cardText: string, patch: CardConfigPatch & 
 		workerAgent: "workerAgent",
 		workerModel: "workerModel",
 		workerThinking: "workerThinking",
+		fixModel: "fixModel",
+		fixThinking: "fixThinking",
 		reviewerAgent: "reviewerAgent",
 		reviewerModel: "reviewerModel",
 		reviewerThinking: "reviewerThinking",

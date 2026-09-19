@@ -306,7 +306,12 @@ export function usageFromSessionFile(path: string, maxBytes = 256 * 1024 * 1024)
 		let output = 0;
 		let cacheRead = 0;
 		let cacheWrite = 0;
+		let reasoning = 0;
 		let costUsd = 0;
+		let costInput = 0;
+		let costOutput = 0;
+		let costCacheRead = 0;
+		let costCacheWrite = 0;
 		let turns = 0;
 		let found = false;
 		for (const line of text.split("\n")) {
@@ -326,14 +331,30 @@ export function usageFromSessionFile(path: string, maxBytes = 256 * 1024 * 1024)
 			output += typeof usage.output === "number" ? usage.output : 0;
 			cacheRead += typeof usage.cacheRead === "number" ? usage.cacheRead : 0;
 			cacheWrite += typeof usage.cacheWrite === "number" ? usage.cacheWrite : 0;
+			reasoning += typeof usage.reasoning === "number" ? usage.reasoning : 0;
 			const cost = usage.cost;
-			if (typeof cost === "number") costUsd += cost;
-			else if (asRecord(cost) && typeof asRecord(cost)?.total === "number") costUsd += asRecord(cost)!.total as number;
+			if (typeof cost === "number") {
+				costUsd += cost;
+			} else {
+				const split = asRecord(cost);
+				if (split) {
+					if (typeof split.total === "number") costUsd += split.total;
+					if (typeof split.input === "number") costInput += split.input;
+					if (typeof split.output === "number") costOutput += split.output;
+					if (typeof split.cacheRead === "number") costCacheRead += split.cacheRead;
+					if (typeof split.cacheWrite === "number") costCacheWrite += split.cacheWrite;
+				}
+			}
 			turns += 1;
 		}
 		if (!found) return undefined;
 		const result: RunUsage = { input, output, total: input + cacheRead + cacheWrite + output, cacheRead, cacheWrite, turns };
+		if (reasoning > 0) result.reasoning = reasoning;
 		if (costUsd > 0) result.costUsd = costUsd;
+		if (costInput > 0) result.costInputUsd = costInput;
+		if (costOutput > 0) result.costOutputUsd = costOutput;
+		if (costCacheRead > 0) result.costCacheReadUsd = costCacheRead;
+		if (costCacheWrite > 0) result.costCacheWriteUsd = costCacheWrite;
 		return result;
 	} catch {
 		return undefined;

@@ -342,6 +342,40 @@ describe("runtime config", () => {
 	});
 });
 
+describe("fix-lane config", () => {
+	test("program-level fixThinking/fixModel persist into plan.md and survive a sync", async () => {
+		const { controller, cwd } = await setupProgram();
+		const result = await controller.setConfig({ fixThinking: "medium", fixModel: "p/cheap" });
+		expect(result.ok).toBe(true);
+		expect(result.text).toContain("fixThinking");
+		const ledger = controller.getActive()!.ledger;
+		expect(ledger.fixThinking).toBe("medium");
+		expect(ledger.fixModel).toBe("p/cheap");
+		// The worker lane itself is untouched.
+		expect(ledger.workerThinking).toBeUndefined();
+		const { readFile } = await import("node:fs/promises");
+		const plan = await readFile(join(cwd, ".agents", "work-programs", "test-program", "plan.md"), "utf8");
+		expect(plan).toContain("fixThinking: medium");
+		expect(plan).toContain("fixModel: p/cheap");
+		const synced = await controller.syncFromDisk();
+		expect(synced.ok).toBe(true);
+		expect(controller.getActive()!.ledger.fixThinking).toBe("medium");
+	});
+
+	test("a card's fixThinking persists into the card front matter", async () => {
+		const { controller, cwd } = await setupProgram();
+		const result = await controller.setConfig({ card: "01", fixThinking: "low" });
+		expect(result.ok).toBe(true);
+		expect(controller.getActive()!.ledger.cards["01"]?.fixThinking).toBe("low");
+		const { readFile } = await import("node:fs/promises");
+		const cardText = await readFile(join(cwd, ".agents", "work-programs", "test-program", "tasks", "01-card.md"), "utf8");
+		expect(cardText).toContain("fixThinking: low");
+		const synced = await controller.syncFromDisk();
+		expect(synced.ok).toBe(true);
+		expect(controller.getActive()!.ledger.cards["01"]?.fixThinking).toBe("low");
+	});
+});
+
 describe("card-scoped config", () => {
 	test("sets a card's maxCycles and review profile into ledger + front matter", async () => {
 		const { controller, cwd } = await setupProgram();

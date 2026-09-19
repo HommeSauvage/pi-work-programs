@@ -138,6 +138,8 @@ export interface ProgramConfigPatch {
 	workerAgent?: string;
 	workerModel?: string;
 	workerThinking?: string;
+	fixModel?: string;
+	fixThinking?: string;
 	reviewerAgent?: string;
 	reviewerModel?: string;
 	reviewerThinking?: string;
@@ -1016,6 +1018,14 @@ export class WorkProgramController {
 			changes.push(`workerThinking ${ledger.workerThinking ?? "(default)"}→${patch.workerThinking === "" ? "(default)" : patch.workerThinking}`);
 			overrides.workerThinking = patch.workerThinking;
 		}
+		if (patch.fixModel !== undefined) {
+			changes.push(`fixModel ${ledger.fixModel ?? "(worker lane)"}→${patch.fixModel === "" ? "(worker lane)" : patch.fixModel}`);
+			overrides.fixModel = patch.fixModel;
+		}
+		if (patch.fixThinking !== undefined) {
+			changes.push(`fixThinking ${ledger.fixThinking ?? "(worker lane)"}→${patch.fixThinking === "" ? "(worker lane)" : patch.fixThinking}`);
+			overrides.fixThinking = patch.fixThinking;
+		}
 		if (patch.reviewerAgent !== undefined) {
 			changes.push(`reviewerAgent ${ledger.reviewerAgent}→${patch.reviewerAgent}`);
 			overrides.reviewerAgent = patch.reviewerAgent;
@@ -1075,7 +1085,7 @@ export class WorkProgramController {
 			overrides.atlasThinking = patch.atlasThinking;
 		}
 		if (Object.keys(overrides).length === 0 && patch.onExhausted === undefined) {
-			return { ok: false, text: "Nothing to change; pass at least one of maxCycles, onExhausted, reviewProfile, maxParallel, parallelExecution, mode, workerAgent, workerModel, workerThinking, reviewerAgent, reviewerModel, reviewerThinking, reviewerResume, runTimeoutMs, resumeMaxWindowPeak, resumeMaxDepth, atlasEnabled, atlasAgent, atlasModel, atlasThinking." };
+			return { ok: false, text: "Nothing to change; pass at least one of maxCycles, onExhausted, reviewProfile, maxParallel, parallelExecution, mode, workerAgent, workerModel, workerThinking, fixModel, fixThinking, reviewerAgent, reviewerModel, reviewerThinking, reviewerResume, runTimeoutMs, resumeMaxWindowPeak, resumeMaxDepth, atlasEnabled, atlasAgent, atlasModel, atlasThinking." };
 		}
 
 		// Apply to the live ledger via the same normalization the plan path uses.
@@ -1089,6 +1099,8 @@ export class WorkProgramController {
 		if (patch.workerAgent !== undefined) ledger.workerAgent = settings.worker.agent;
 		if (patch.workerModel !== undefined) ledger.workerModel = patch.workerModel === "" ? undefined : patch.workerModel;
 		if (patch.workerThinking !== undefined) ledger.workerThinking = patch.workerThinking === "" ? undefined : patch.workerThinking;
+		if (patch.fixModel !== undefined) ledger.fixModel = patch.fixModel === "" ? undefined : patch.fixModel;
+		if (patch.fixThinking !== undefined) ledger.fixThinking = patch.fixThinking === "" ? undefined : patch.fixThinking;
 		if (patch.reviewerAgent !== undefined) ledger.reviewerAgent = settings.review.agent;
 		if (patch.reviewerModel !== undefined) ledger.reviewerModel = patch.reviewerModel === "" ? undefined : patch.reviewerModel;
 		if (patch.reviewerThinking !== undefined) ledger.reviewerThinking = patch.reviewerThinking === "" ? undefined : patch.reviewerThinking;
@@ -1189,7 +1201,7 @@ export class WorkProgramController {
 			card.maxCycles = cycles;
 			frontPatch.maxCycles = cycles;
 		}
-		const modelKeys = ["workerAgent", "workerModel", "workerThinking", "reviewerAgent", "reviewerModel", "reviewerThinking"] as const;
+		const modelKeys = ["workerAgent", "workerModel", "workerThinking", "fixModel", "fixThinking", "reviewerAgent", "reviewerModel", "reviewerThinking"] as const;
 		let sawModelKey = false;
 		for (const key of modelKeys) {
 			const value = patch[key];
@@ -1207,7 +1219,7 @@ export class WorkProgramController {
 			frontPatch[key] = trimmed;
 		}
 		if (changes.length === 0 && !sawModelKey && patch.reviewProfile === undefined && patch.maxCycles === undefined) {
-			return { ok: false, text: `Nothing to change for card ${cardId}; pass reviewProfile, maxCycles, workerModel, workerThinking, reviewerModel, reviewerThinking (empty string clears a model override).` };
+			return { ok: false, text: `Nothing to change for card ${cardId}; pass reviewProfile, maxCycles, workerModel, workerThinking, fixModel, fixThinking, reviewerModel, reviewerThinking (empty string clears a model override).` };
 		}
 		card.updatedAt = Date.now();
 		// Persist into the card file so sync/reload keep the change.

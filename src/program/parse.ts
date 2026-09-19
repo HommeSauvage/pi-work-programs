@@ -155,6 +155,10 @@ export function parseCardFrontmatter(data: Record<string, unknown>): CardConfigP
 	if (workerModel) out.workerModel = workerModel;
 	const workerThinking = asString(data.workerThinking) ?? (workerNested ? asString(workerNested.thinking) : undefined);
 	if (workerThinking) out.workerThinking = workerThinking;
+	const fixModel = asString(data.fixModel) ?? (workerNested ? asString(workerNested.fixModel) : undefined);
+	if (fixModel) out.fixModel = fixModel;
+	const fixThinking = asString(data.fixThinking) ?? (workerNested ? asString(workerNested.fixThinking) : undefined);
+	if (fixThinking) out.fixThinking = fixThinking;
 	const reviewerAgent =
 		asString(data.reviewerAgent) ?? (reviewerNested ? asString(reviewerNested.agent) : undefined);
 	if (reviewerAgent) out.reviewerAgent = reviewerAgent;
@@ -196,6 +200,8 @@ export function parseCard(path: string, id: string, text: string): ParsedCard {
 		...(fm.workerAgent ? { workerAgent: fm.workerAgent } : {}),
 		...(fm.workerModel ? { workerModel: fm.workerModel } : {}),
 		...(fm.workerThinking ? { workerThinking: fm.workerThinking } : {}),
+		...(fm.fixModel ? { fixModel: fm.fixModel } : {}),
+		...(fm.fixThinking ? { fixThinking: fm.fixThinking } : {}),
 		...(fm.reviewerAgent ? { reviewerAgent: fm.reviewerAgent } : {}),
 		...(fm.reviewerModel ? { reviewerModel: fm.reviewerModel } : {}),
 		...(fm.reviewerThinking ? { reviewerThinking: fm.reviewerThinking } : {}),

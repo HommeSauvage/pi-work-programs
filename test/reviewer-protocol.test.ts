@@ -95,4 +95,28 @@ describe("reviewer protocol text", () => {
 		// The reviewer stays read-only: the note is harness-owned.
 		expect(agent).toContain("tools: read, grep, find, ls, bash, contact_supervisor");
 	});
+
+	test("review briefs make the reviewer run the card gates at the end, never skip them", () => {
+		const initial = firstReviewTask(program());
+		expect(initial).toContain("the gates you run at the END of this review are the record");
+		expect(initial).not.toContain("do NOT re-run test suites or typechecks");
+
+		const ledger = program();
+		const reReview = reReviewBrief({
+			ledger,
+			card: ledger.cards["01"]!,
+			cycle: 2,
+			previousReviewPath: "/prog/.runtime/reviews/01-review-1.md",
+			reviewPath: "/prog/.runtime/reviews/01-review-2.md",
+			sinceSha: "abc",
+			fixLog: "def fix: F1",
+			fixStat: "src/x.ts | 2 +-",
+			approved: [{ finding: "F1", verdict: "approve" }],
+			gates: [{ command: "bun run check", code: 0, at: 1, tail: "" }],
+			reviewNotesPath: REVIEW_NOTES,
+		});
+		expect(reReview).toContain("the gates you run at the END of this pass are the record");
+		expect(reReview).toContain("Run the card gates yourself, now, at the end");
+		expect(reReview).not.toContain("do NOT re-run test suites or typechecks");
+	});
 });

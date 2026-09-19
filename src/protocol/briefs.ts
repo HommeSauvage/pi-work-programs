@@ -146,7 +146,7 @@ export function reviewTask(input: {
 		"Harness gate results:",
 		gates,
 		...(input.gates.length > 0
-			? ["(the harness ran these gates authoritatively — do NOT re-run test suites or typechecks; review the code)"]
+			? ["(the harness ran these gates at handoff; they may be stale — the gates you run at the END of this review are the record)"]
 			: []),
 		"",
 		"Worker summary:",
@@ -478,7 +478,7 @@ export function reReviewBrief(input: {
 		"Harness gate results:",
 		gates,
 		...(input.gates.length > 0
-			? ["(the harness ran these gates authoritatively — do NOT re-run test suites or typechecks; review the code)"]
+			? ["(the harness ran these gates at handoff; they may be stale — the gates you run at the END of this pass are the record)"]
 			: []),
 		"",
 		...(atlasNote(input.atlasPath) ? [atlasNote(input.atlasPath), ""] : []),

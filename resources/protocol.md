@@ -82,6 +82,12 @@ context — fix passes measure at 3–15% of a fresh worker's exploration tax. B
 continuation has a cost curve: a resumed session re-sends its whole history
 every turn, so past a point a fresh session is cheaper.
 
+**Never dispatch a subagent without an explicit `context`.** The packaged
+`worker`, `oracle`, and `advisor` agents default to `context: fork`, which forks
+the *caller's* session: omitting `context` hands the child the orchestrator's
+whole conversation (measured: 554k–578k-token peaks for a 5k-token brief). Card
+runs are always fresh — the harness pins `context: "fresh"` and the shipped
+`work-program-*` agents declare `defaultContext: fresh`.
 - `resumeMaxWindowPeak` (default **250k tokens**): once a session's context
   peak reaches this, the next continuation is dispatched fresh. The fresh
   agent is told it is continuing an existing lane and must reconstruct state

@@ -163,6 +163,8 @@ pi compacts a session automatically once `context tokens > contextWindow - reser
 
 Compaction is roughly dollar-neutral (the summary call is uncached input, and it invalidates the prompt cache once), so treat it as the safety and quality net rather than a saving, and do not set it aggressively. The resume threshold stays the policy for *within-task* continuity; compaction keeps a long session coherent underneath it.
 
+**Always dispatch a subagent with an explicit `context`.** pi-subagents' packaged `worker`, `oracle`, and `advisor` agents default to `context: fork`, which forks the **caller's** session — dispatching one without `context: "fresh"` hands the child the orchestrator's entire conversation as its starting context. Measured: two such dispatches peaked at 554k and 578k tokens for a ~5k-token brief. The extension pins `context: "fresh"` on every run (`src/platform/runs.ts`) and the shipped `work-program-*` agents declare `defaultContext: fresh`, so card runs never inherit the caller's history. If you add a dispatch path, keep both properties.
+
 Two review profiles, per program with per-card override (card front matter `review: enhanced`, or `work_program({ action: "config", card, reviewProfile })`):
 
 | Profile | What it is |

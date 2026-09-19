@@ -168,7 +168,7 @@ describe("run usage telemetry", () => {
 			usage: { input: 50_000, output: 2_000, total: 300_000, windowPeak: 90_000, turns: 12, tools: 20, costUsd: 0.05 },
 		});
 		await drive(t.host);
-		const applied = applyTriage(t.host, "01", []);
+		const applied = await applyTriage(t.host, "01", []);
 		expect(applied.ok).toBe(true);
 		await drive(t.host);
 
@@ -211,7 +211,7 @@ describe("run usage telemetry", () => {
 			usage: { input: 10_000, output: 2_000, total: 400_000, windowPeak: 90_000, turns: 8, tools: 9, costUsd: 0.05 },
 		});
 		await drive(t.host);
-		expect(applyTriage(t.host, "01", []).ok).toBe(true);
+		expect((await applyTriage(t.host, "01", [])).ok).toBe(true);
 		await drive(t.host);
 		const text = t.fake.files.get(programCardPath("01")) ?? "";
 		// Components come from the transcript-accurate worker snapshot only; the

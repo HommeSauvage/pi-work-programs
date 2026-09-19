@@ -13,7 +13,7 @@ lanes. The program folder holds the records; the extension holds the process.
   progress.md      dated signal log — one terse line per event, hard-bounded
   atlas.md         scout-built orientation (architecture, module map, per-card pointers)
   tasks/*.md       card files: the unit of work AND the unit of record
-  .runtime/        machine state (gitignored): ledger, review texts
+  .runtime/        machine state (gitignored): ledger, review texts, lane and review notes
 ```
 
 - `plan.md` must make sense with zero conversation history. Program defaults
@@ -103,6 +103,13 @@ runs are always fresh — the harness pins `context: "fresh"` and the shipped
   lane worktree, never committed. A fresh continuation reads it FIRST; that is
   pi's own `/handoff` pattern (extract what matters rather than replaying a
   transcript), and it is why a fresh pass does not have to be a cold one.
+- **Settled findings are recorded, not re-derived**: at triage the harness
+  appends one bounded block per review cycle to
+  `<program>/.runtime/reviews/<card>.md` — the approved, rejected, and deferred
+  findings with the operator's notes and the review path. The reviewer is
+  read-only, so the harness owns that file; every review brief points at it
+  first, and a settled finding (rejected or deferred) is not re-raised without
+  new evidence — with the evidence named.
 - **pi compacts by itself, just not for us**: compaction fires at
   `contextWindow - reserveTokens` (16k reserve, ~20k kept recent). Our model
   declares a 1M window, so nothing fires before 983k. Point the lanes at a
@@ -344,6 +351,14 @@ plan and card files stay the source of truth; `sync` reconciles.
   path then re-dispatches fresh with the full budget.
 - A card is done only when its gate is green (or no gate applies) and its
   review has been triaged.
+- **Reviewer notes are harness-written.** Reviewers are read-only, so the
+  harness records the triage outcome itself: at every triage it appends a
+  bounded block (cycle, date, approve/reject/defer counts, one line per finding
+  with the operator's note, and the review path) to
+  `<program>/.runtime/reviews/<card>.md`. That file is the record of what is
+  **settled** — a finding the operator rejected or deferred is not re-raised by
+  a later (or fresh) reviewer without new evidence, and the reviewer must name
+  that evidence when it does.
 
 ## Provider quota
 

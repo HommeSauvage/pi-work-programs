@@ -245,7 +245,7 @@ describe("per-card dispatch", () => {
 			message: "review ready",
 			expectedAction: 'work_program({ action: "triage", card: "01", verdicts: [] })',
 		});
-		const result = applyTriage(t.host, "01", [{ finding: "F1", verdict: "approve" }]);
+		const result = await applyTriage(t.host, "01", [{ finding: "F1", verdict: "approve" }]);
 		expect(result.ok).toBe(true);
 		// Program default is 3 — the card cap of 1 is what triggered the cycle decision.
 		expect(t.ledger.decisions.some((entry) => entry.kind === "cycle-exhausted")).toBe(true);

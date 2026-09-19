@@ -21,6 +21,20 @@ export function atlasNote(atlasPath: string | undefined): string {
 	].join("\n");
 }
 
+/** Shared by every review dispatch: the reviewer is read-only and verifies with
+ *  the repository's own tooling — never with scaffolding it writes itself, which
+ *  is how a review once hung 4.5 minutes on a probe script that never exited. */
+const REVIEWER_VERIFICATION_RULE =
+	"Verification discipline: you are read-only — verify with the repository's own tests and gates and with one-shot read-only commands. Write and run NO ad-hoc probe or harness scripts: no custom test scaffolding, nothing under /tmp, nothing that spawns or waits. Never run a command that can block (`--watch`, dev servers, anything waiting on stdin), and wrap a potentially slow command in an explicit `timeout`. If a command runs longer than ~2 minutes, stop it and report instead of waiting — the harness gate results are authoritative and the card gates at the END are the only long-ish command you need.";
+
+/** Shared by every review dispatch: the harness-owned note carries the findings
+ *  the operator already settled, so a fresh reviewer does not spend its budget
+ *  re-deriving — and re-raising — rejected and deferred work. */
+export function reviewNotesRule(reviewNotesPath: string | undefined): string {
+	if (!reviewNotesPath) return "";
+	return `Read the review note first at ${reviewNotesPath}: findings recorded as rejected or deferred are settled — do not re-raise them unless you have new evidence, and say what your evidence is when you do.`;
+}
+
 /** Handoff note rule: what a fresh continuation reads instead of doing git archaeology.
  *  Cheap insurance for the cases a session cannot be reused (lost session, model swap,
  *  reload) — pi's `/handoff` pattern: extract what matters, do not carry the history. */
@@ -99,6 +113,8 @@ export function reviewTask(input: {
 	workerSummary: string;
 	gates: GateResult[];
 	atlasPath?: string;
+	/** Harness-written note holding the findings the operator already settled. */
+	reviewNotesPath?: string;
 }): string {
 	const { ledger, card, profile } = input;
 	const template = input.resources.reviews[profile] ?? input.resources.reviews.light ?? "";
@@ -137,6 +153,10 @@ export function reviewTask(input: {
 		truncateTail(input.workerSummary.trim(), 6_000) || "(no summary returned)",
 		"",
 		...(atlasNote(input.atlasPath) ? [atlasNote(input.atlasPath), ""] : []),
+		"Rules:",
+		...(reviewNotesRule(input.reviewNotesPath) ? [`- ${reviewNotesRule(input.reviewNotesPath)}`] : []),
+		`- ${REVIEWER_VERIFICATION_RULE}`,
+		"",
 		`Write your findings to this exact path as well as your final reply: ${input.reviewPath}`,
 		"",
 		"Return findings as markdown. This is a read-only review: do not modify repository files. Keep your final reply under 60 lines; the complete findings live in the review file.",
@@ -426,6 +446,8 @@ export function reReviewBrief(input: {
 	approved: FindingVerdict[];
 	gates: GateResult[];
 	atlasPath?: string;
+	/** Harness-written note holding the findings the operator already settled. */
+	reviewNotesPath?: string;
 }): string {
 	const { ledger, card } = input;
 	const approved =
@@ -465,6 +487,8 @@ export function reReviewBrief(input: {
 		"2. Review the fix commits themselves for new issues, with the same standards as your first pass.",
 		"3. Regression-scan the areas your earlier findings touched. Do NOT re-audit the whole card surface.",
 		"4. Run the card gates yourself, now, at the end (commands above) — the harness results above are informational and may be stale.",
+		`5. ${REVIEWER_VERIFICATION_RULE}`,
+		...(reviewNotesRule(input.reviewNotesPath) ? [`6. ${reviewNotesRule(input.reviewNotesPath)}`] : []),
 		"",
 		`Write your findings to this exact path as well as your final reply: ${input.reviewPath}`,
 		"",

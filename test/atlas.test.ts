@@ -22,7 +22,7 @@ async function driveCardToDone(t: ReturnType<typeof createTestHost>, cardId: str
 	const review = t.fake.dispatched.find((entry) => entry.request.kind === "reviewer");
 	t.completeRun(review!.runId, { output: "No issues found." });
 	await drive(t.host);
-	const applied = applyTriage(t.host, cardId, []);
+	const applied = await applyTriage(t.host, cardId, []);
 	expect(applied.ok).toBe(true);
 	await drive(t.host);
 	expect(t.ledger.cards[cardId]?.phase).toBe("done");
@@ -120,7 +120,7 @@ describe("program atlas", () => {
 		t.ledger.atlas!.state = "refreshing";
 		t.ledger.atlas!.runId = "scout-refresh-inflight";
 		t.ledger.atlas!.startedAt = Date.now();
-		expect(applyTriage(t.host, "01", []).ok).toBe(true);
+		expect((await applyTriage(t.host, "01", [])).ok).toBe(true);
 		await drive(t.host);
 		expect(t.ledger.status).toBe("complete");
 		expect(t.ledger.atlas?.state as string).toBe("ready");

@@ -29,7 +29,7 @@ async function driveToPendingFix(
 	const reviewRun = t.fake.dispatched.find((entry) => entry.request.kind === "reviewer")!.runId;
 	t.completeRun(reviewRun, { output: "## Findings\n- F1: missing null check" });
 	await drive(t.host);
-	applyTriage(t.host, cardId, [{ finding: "F1", verdict: "approve" }]);
+	await applyTriage(t.host, cardId, [{ finding: "F1", verdict: "approve" }]);
 }
 
 describe("adaptive resume: context-peak threshold", () => {
@@ -88,7 +88,7 @@ describe("adaptive resume: context-peak threshold", () => {
 		// The reviewer's first pass already grew a huge context.
 		t.completeRun(reviewRun, { output: "## Findings\n- F1: missing null check", usage: BIG_PEAK as never });
 		await drive(t.host);
-		applyTriage(t.host, "01", [{ finding: "F1", verdict: "approve" }]);
+		await applyTriage(t.host, "01", [{ finding: "F1", verdict: "approve" }]);
 		await drive(t.host);
 		// Complete the fix (resumes the worker — small context, fine) and re-review.
 		writeLaneEvidence(t, "01", "$ bun test\n5 pass (fix)");
@@ -207,7 +207,7 @@ describe("session-accurate usage", () => {
 		const reviewRun = t.fake.dispatched.find((entry) => entry.request.kind === "reviewer")!.runId;
 		t.completeRun(reviewRun, { output: "## Findings\n- F1: x" });
 		await drive(t.host);
-		applyTriage(t.host, "01", [{ finding: "F1", verdict: "approve" }]);
+		await applyTriage(t.host, "01", [{ finding: "F1", verdict: "approve" }]);
 		await drive(t.host);
 		const fixRun = t.ledger.cards["01"]!.activeRun!.runId;
 		writeLaneEvidence(t, "01", "$ bun test\n5 pass (fix)");
@@ -246,7 +246,7 @@ describe("session-accurate usage", () => {
 			sessionUsage: { input: 50_000, output: 5_000, total: 1_000_000, cacheRead: 945_000, turns: 30, costUsd: 0.1 },
 		});
 		await drive(t.host);
-		applyTriage(t.host, "01", []);
+		await applyTriage(t.host, "01", []);
 		await drive(t.host);
 
 		const card = t.ledger.cards["01"]!;

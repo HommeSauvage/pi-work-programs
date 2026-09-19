@@ -27,7 +27,7 @@ async function driveToSecondReview(
 	t.completeRun(reviewRun, { output: "## Findings\n- F1: missing null check" });
 	await drive(t.host);
 	expect(t.ledger.cards[cardId]?.phase).toBe("triaging");
-	const applied = applyTriage(t.host, cardId, [{ finding: "F1: missing null check", verdict: "approve" }]);
+	const applied = await applyTriage(t.host, cardId, [{ finding: "F1: missing null check", verdict: "approve" }]);
 	expect(applied.ok).toBe(true);
 	await drive(t.host);
 	// The fix resumes the worker; complete it.
@@ -67,7 +67,7 @@ describe("reviewer resume across cycles", () => {
 		const reviewRun = t.fake.dispatched.find((entry) => entry.request.kind === "reviewer")!.runId;
 		t.completeRun(reviewRun, { output: "## Findings\n- F1: missing null check", sessionFile: session, usage });
 		await drive(t.host);
-		expect(applyTriage(t.host, "01", [{ finding: "F1: missing null check", verdict: "approve" }]).ok).toBe(true);
+		expect((await applyTriage(t.host, "01", [{ finding: "F1: missing null check", verdict: "approve" }])).ok).toBe(true);
 		await drive(t.host);
 		writeLaneEvidence(t, "01", "$ bun test\n5 pass (fix)");
 		t.completeRun(t.ledger.cards["01"]!.activeRun!.runId, { output: "fixed" });
@@ -105,7 +105,7 @@ describe("reviewer resume across cycles", () => {
 		const reviewRun = t.fake.dispatched.find((entry) => entry.request.kind === "reviewer")!.runId;
 		t.completeRun(reviewRun, { output: "## Findings\n- F1: missing null check" });
 		await drive(t.host);
-		applyTriage(t.host, "01", [{ finding: "F1: missing null check", verdict: "approve" }]);
+		await applyTriage(t.host, "01", [{ finding: "F1: missing null check", verdict: "approve" }]);
 		await drive(t.host);
 		writeLaneEvidence(t, "01", "$ bun test\n5 pass (fix)");
 		t.completeRun(t.ledger.cards["01"]!.activeRun!.runId, { output: "fixed" });

@@ -40,6 +40,18 @@ reviewers rubber-stamp. Gates answer "does it pass"; you answer "is it right".
 - Keep output small: pipe long output through `tail`, `--quiet`, or
   `--reporter=dot`. A full-suite log dumped raw is context waste.
 
+## Verification discipline
+
+You are read-only and you verify with the repository's own tooling. Do not
+write or run ad-hoc probe/harness scripts: no custom test scaffolding, nothing
+under `/tmp`, nothing that spawns or waits. Use the repository's tests, the
+card's gates, and one-shot read-only commands. Never run a command that can
+block — no `--watch`, no dev servers, nothing waiting on stdin — and wrap a
+potentially slow command in an explicit `timeout`. If a command runs longer
+than ~2 minutes, stop it and report instead of waiting: a probe that never exits
+costs the run its whole budget. The harness gate result is authoritative, and
+the card gates you run at the END are the only long-ish command you need.
+
 ## Findings
 
 Report only concrete, evidence-backed issues caused by (or made reachable by)

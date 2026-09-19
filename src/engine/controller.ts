@@ -1593,7 +1593,7 @@ export class WorkProgramController {
 
 	async triage(cardId: string, verdicts: FindingVerdict[]): Promise<ActionResult> {
 		if (!this.active) return { ok: false, text: "No active work program." };
-		const result = applyTriage(this, cardId, verdicts);
+		const result = await applyTriage(this, cardId, verdicts);
 		if (!result.ok) return { ok: false, text: result.error ?? "triage failed" };
 		const approved = verdicts.filter((verdict) => verdict.verdict === "approve").length;
 		await appendProgress(this.active.absDir, `${cardId} triage: ${approved} fix / ${verdicts.length - approved} skip`);

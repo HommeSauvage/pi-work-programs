@@ -48,6 +48,14 @@ export function laneNotesPath(programDir: string, cardId: string): string {
 	return join(programDir, RUNTIME_DIR, "lanes", `${cardId}.md`);
 }
 
+/** Harness-written reviewer handoff note: one block per triaged review cycle
+ *  (what the operator approved, rejected, deferred). Machine state in the
+ *  program's `.runtime` (gitignored) — the record of settled findings, so a
+ *  fresh reviewer never re-raises one without new evidence. */
+export function reviewNotesPath(programDir: string, cardId: string): string {
+	return join(programDir, RUNTIME_DIR, REVIEWS_DIR, `${cardId}.md`);
+}
+
 export function laneBranch(pattern: string, baseBranch: string, cardId: string): string {
 	if (pattern.includes("{branch}") || pattern.includes("{id}")) {
 		return pattern.replace("{branch}", baseBranch).replace("{id}", cardId);

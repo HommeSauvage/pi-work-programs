@@ -54,7 +54,7 @@ describe("managed driver loop", () => {
 		expect(decision).toBeDefined();
 		expect(decision?.reviewPath).toBeDefined();
 
-		const applied = applyTriage(t.host, "01", [{ finding: "F1", verdict: "approve" }]);
+		const applied = await applyTriage(t.host, "01", [{ finding: "F1", verdict: "approve" }]);
 		expect(applied.ok).toBe(true);
 		expect(t.ledger.cards["01"]?.phase).toBe("fixing");
 
@@ -75,7 +75,7 @@ describe("managed driver loop", () => {
 		await drive(t.host);
 		expect(t.ledger.cards["01"]?.phase).toBe("triaging");
 
-		const second = applyTriage(t.host, "01", []);
+		const second = await applyTriage(t.host, "01", []);
 		expect(second.ok).toBe(true);
 		expect(t.ledger.cards["01"]?.phase).toBe("approved");
 
@@ -142,6 +142,74 @@ describe("managed driver loop", () => {
 		expect(t.fake.files.get(notePath)).toBe("# Lane notes — card 01\n\nDecided: keep the seam.");
 	});
 
+	test("the review note is seeded before a review dispatch and never overwritten afterwards", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await drive(t.host);
+		writeLaneEvidence(t, "01", "$ bun test\n3 pass");
+		t.completeRun(t.fake.dispatched[0]!.runId, { output: "implemented" });
+		await drive(t.host);
+		const notePath = "/repo/.agents/work-programs/test-program/.runtime/reviews/01.md";
+		expect(t.fake.files.get(notePath)).toContain("# Review notes — card 01");
+		// The dispatch itself carries the note path and the settled-findings rule.
+		const review = t.fake.dispatched.find((entry) => entry.request.kind === "reviewer")!;
+		expect(review.request.task).toContain(notePath);
+		expect(review.request.task).toContain("do not re-raise them unless you have new evidence");
+		// The harness-owned note survives the next review dispatch untouched.
+		t.fake.files.set(notePath, "# Review notes — card 01\n\n## Cycle 1 — settled");
+		t.ledger.cards["01"]!.phase = "review_pending";
+		await drive(t.host);
+		expect(t.fake.files.get(notePath)).toBe("# Review notes — card 01\n\n## Cycle 1 — settled");
+	});
+
+	test("triage appends one bounded block per cycle to the review note, never twice", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await drive(t.host);
+		writeLaneEvidence(t, "01", "$ bun test\n3 pass");
+		t.completeRun(t.fake.dispatched[0]!.runId, { output: "implemented" });
+		await drive(t.host);
+		const review = t.fake.dispatched.find((entry) => entry.request.kind === "reviewer")!;
+		t.completeRun(review.runId, { output: "## Findings\n- F1" });
+		await drive(t.host);
+		expect(t.ledger.cards["01"]?.phase).toBe("triaging");
+
+		const applied = await applyTriage(t.host, "01", [
+			{ finding: `F1: ${"x".repeat(300)}`, verdict: "reject", note: "intentional" },
+			{ finding: "F2: missing test", verdict: "defer" },
+			{ finding: "F3: typo", verdict: "approve" },
+		]);
+		expect(applied.ok).toBe(true);
+		const notePath = "/repo/.agents/work-programs/test-program/.runtime/reviews/01.md";
+		const note = t.fake.files.get(notePath) ?? "";
+		expect(note).toContain("## Cycle 1 — ");
+		expect(note).toContain("1 approved / 1 rejected / 1 deferred");
+		expect(note).toContain("- approved: F3: typo");
+		expect(note).toContain("- deferred: F2: missing test");
+		expect(note).toContain("- rejected: F1: ");
+		expect(note).toContain("— intentional");
+		expect(note).toContain("Review: /repo/.agents/work-programs/test-program/.runtime/reviews/01-review-1.md");
+		// Bounded: the long finding is clipped to one line, not dumped whole.
+		const rejected = note.split("\n").find((line) => line.startsWith("- rejected:")) ?? "";
+		expect(rejected).toContain("…");
+		expect(rejected.length).toBeLessThan(200);
+		expect(note).not.toContain("x".repeat(200));
+
+		// A second triage of the same cycle records nothing new.
+		createDecision(
+			{ programDir: t.host.programDir, ledger: t.ledger },
+			{
+				kind: "review-triage",
+				card: "01",
+				reviewPath: "/repo/.agents/work-programs/test-program/.runtime/reviews/01-review-1.md",
+				message: "review ready",
+				expectedAction: 'work_program({ action: "triage", card: "01", verdicts: [] })',
+			},
+		);
+		await applyTriage(t.host, "01", [{ finding: "F4: raised again", verdict: "reject" }]);
+		const after = t.fake.files.get(notePath) ?? "";
+		expect(after.match(/## Cycle 1 —/g)).toHaveLength(1);
+		expect(after).not.toContain("F4: raised again");
+	});
+
 	test("workers default to the shipped agent and respect an explicit worker.agent", async () => {
 		const t = createTestHost({ cards: [{ id: "01" }] });
 		await drive(t.host);
@@ -189,7 +257,7 @@ describe("cycle cap", () => {
 		const review = t.ledger.cards["01"]?.activeRun;
 		t.completeRun(review!.runId, { output: "F1: bug" });
 		await drive(t.host);
-		applyTriage(t.host, "01", [{ finding: "F1", verdict: "approve" }]);
+		await applyTriage(t.host, "01", [{ finding: "F1", verdict: "approve" }]);
 		expect(t.ledger.cards["01"]?.phase).toBe("triaging");
 		const cycle = t.ledger.decisions.find((entry) => entry.kind === "cycle-exhausted");
 		expect(cycle).toBeDefined();
@@ -205,7 +273,7 @@ describe("cycle cap", () => {
 		await drive(t.host);
 		t.completeRun(t.ledger.cards["01"]!.activeRun!.runId, { output: "F1: bug" });
 		await drive(t.host);
-		applyTriage(t.host, "01", [{ finding: "F1", verdict: "approve" }]);
+		await applyTriage(t.host, "01", [{ finding: "F1", verdict: "approve" }]);
 		expect(t.ledger.cards["01"]?.phase).toBe("approved");
 	});
 
@@ -218,7 +286,7 @@ describe("cycle cap", () => {
 		await drive(t.host);
 		t.completeRun(t.ledger.cards["01"]!.activeRun!.runId, { output: "F1: bug" });
 		await drive(t.host);
-		applyTriage(t.host, "01", [{ finding: "F1", verdict: "approve" }]);
+		await applyTriage(t.host, "01", [{ finding: "F1", verdict: "approve" }]);
 		expect(t.ledger.cards["01"]?.phase).toBe("blocked");
 	});
 });
@@ -273,7 +341,7 @@ describe("merge queue and reconciliation", () => {
 		expect(review.request.kind).toBe("reviewer");
 		t.completeRun(review.runId, { output: "No issues." });
 		await drive(t.host);
-		applyTriage(t.host, cardId, []);
+		await applyTriage(t.host, cardId, []);
 		await drive(t.host);
 	}
 
@@ -320,7 +388,7 @@ describe("merge queue dirty check", () => {
 		const review = t.fake.dispatched.at(-1)!;
 		t.completeRun(review.runId, { output: "No issues." });
 		await drive(t.host);
-		applyTriage(t.host, "01", []);
+		await applyTriage(t.host, "01", []);
 	}
 
 	test("program records do not count as a dirty worktree", async () => {
@@ -363,7 +431,7 @@ async function prepareQueuedCard(t: ReturnType<typeof createTestHost>): Promise<
 	const review = t.fake.dispatched.at(-1)!;
 	t.completeRun(review.runId, { output: "No issues." });
 	await drive(t.host);
-	applyTriage(t.host, "01", []);
+	await applyTriage(t.host, "01", []);
 	// A foreign change holds the merge queue, leaving the card queued.
 	t.git.statusOutput = " M src/unrelated.ts";
 	await drive(t.host);
@@ -413,7 +481,7 @@ describe("dispatch resilience", () => {
 		t.completeRun(review.runId, { output: "F1: bug" });
 		await drive(t.host);
 		expect(t.ledger.cards["01"]?.phase).toBe("triaging");
-		const triaged = applyTriage(t.host, "01", [{ finding: "F1", verdict: "approve" }]);
+		const triaged = await applyTriage(t.host, "01", [{ finding: "F1", verdict: "approve" }]);
 		expect(triaged.ok).toBe(true);
 		expect(t.ledger.cards["01"]?.phase).toBe("fixing");
 	}
@@ -493,7 +561,7 @@ describe("dispatch resilience", () => {
 		await drive(t.host);
 		t.completeRun(t.fake.dispatched.at(-1)!.runId, { output: "No issues." });
 		await drive(t.host);
-		applyTriage(t.host, "01", []);
+		await applyTriage(t.host, "01", []);
 		const original = t.host.ports.runs.dispatch;
 		t.host.ports.runs.dispatch = async (request) => {
 			if (request.kind === "reconciler") throw new Error("agent not found");
@@ -527,7 +595,7 @@ describe("unblock fix intent", () => {
 		await drive(t.host);
 		t.completeRun(t.fake.dispatched.at(-1)!.runId, { output: "F1: bug" });
 		await drive(t.host);
-		applyTriage(t.host, "01", [{ finding: "F1", verdict: "approve" }]);
+		await applyTriage(t.host, "01", [{ finding: "F1", verdict: "approve" }]);
 		await drive(t.host);
 		const fixRun = t.ledger.cards["01"]?.activeRun?.runId;
 		expect(fixRun).toBeDefined();
@@ -595,7 +663,7 @@ describe("paused runs", () => {
 		await drive(t.host);
 		t.completeRun(t.fake.dispatched.at(-1)!.runId, { output: "No issues." });
 		await drive(t.host);
-		applyTriage(t.host, "01", []);
+		await applyTriage(t.host, "01", []);
 		await drive(t.host);
 		const card = t.ledger.cards["01"]!;
 		expect(card.phase).toBe("reconciling");
@@ -642,7 +710,7 @@ describe("program completion", () => {
 		t.completeRun(t.fake.dispatched.at(-1)!.runId, { output: "No issues." });
 		await drive(t.host);
 		expect(t.ledger.cards["01"]?.phase).toBe("triaging");
-		applyTriage(t.host, "01", []);
+		await applyTriage(t.host, "01", []);
 		await drive(t.host);
 		expect(t.ledger.cards["01"]?.phase).toBe("done");
 	}
@@ -690,7 +758,7 @@ describe("operator todos", () => {
 		await drive(t.host);
 		t.completeRun(t.fake.dispatched.at(-1)!.runId, { output: "No issues." });
 		await drive(t.host);
-		applyTriage(t.host, "01", []);
+		await applyTriage(t.host, "01", []);
 		await drive(t.host);
 		expect(t.ledger.cards["01"]?.phase).toBe("done");
 	}
@@ -724,7 +792,7 @@ describe("operator todos", () => {
 		await drive(t.host);
 		t.completeRun(t.fake.dispatched.at(-1)!.runId, { output: "No issues." });
 		await drive(t.host);
-		applyTriage(t.host, "01", []);
+		await applyTriage(t.host, "01", []);
 		t.git.statusOutput = " M .operator/todo.md";
 		await drive(t.host);
 		// Only the operator file is dirty: the merge proceeds.
@@ -830,7 +898,7 @@ describe("stale blocked decisions", () => {
 		await drive(t.host);
 		expect(t.ledger.cards["01"]?.phase).toBe("triaging");
 		staleBlock(t);
-		const applied = applyTriage(t.host, "01", [{ finding: "F1", verdict: "approve" }]);
+		const applied = await applyTriage(t.host, "01", [{ finding: "F1", verdict: "approve" }]);
 		expect(applied.ok).toBe(true);
 		expect(t.ledger.cards["01"]?.phase).toBe("fixing");
 	});
@@ -884,7 +952,7 @@ describe("fix runner-flake retries", () => {
 		await drive(t.host);
 		t.completeRun(t.fake.dispatched.at(-1)!.runId, { output: "F1: bug" });
 		await drive(t.host);
-		applyTriage(t.host, "01", [{ finding: "F1", verdict: "approve" }]);
+		await applyTriage(t.host, "01", [{ finding: "F1", verdict: "approve" }]);
 		await drive(t.host);
 		const fixRun = t.ledger.cards["01"]?.activeRun?.runId;
 		if (!fixRun) throw new Error("fix was not dispatched");
@@ -935,7 +1003,7 @@ describe("gitignored program records", () => {
 		await drive(t.host);
 		t.completeRun(t.fake.dispatched.at(-1)!.runId, { output: "No issues." });
 		await drive(t.host);
-		applyTriage(t.host, "01", []);
+		await applyTriage(t.host, "01", []);
 	}
 
 	test("a merge still completes when every record path is ignored", async () => {
@@ -1029,7 +1097,7 @@ describe("pause blocks new runs", () => {
 		await drive(t.host);
 		t.completeRun(t.fake.dispatched.at(-1)!.runId, { output: "F1: bug" });
 		await drive(t.host);
-		applyTriage(t.host, "01", [{ finding: "F1", verdict: "approve" }]);
+		await applyTriage(t.host, "01", [{ finding: "F1", verdict: "approve" }]);
 		const card = t.ledger.cards["01"]!;
 		expect(card.phase).toBe("fixing");
 		// The fix run dispatches, then dies; the operator soft-pauses before answering.
@@ -1198,7 +1266,7 @@ describe("drain (a merge cannot strand ready work)", () => {
 		await drive(t.host);
 		t.completeRun(t.fake.dispatched.at(-1)!.runId, { output: "No issues." });
 		await drive(t.host);
-		applyTriage(t.host, "01", []);
+		await applyTriage(t.host, "01", []);
 		// One tick: merge 01, and 02 becomes ready as a result of that merge.
 		await drive(t.host);
 		expect(t.ledger.cards["01"]?.phase).toBe("done");
@@ -1439,7 +1507,7 @@ describe("decision packet wake-up gating", () => {
 		await drive(t.host);
 		expect(decisionPackets(t)).toHaveLength(0);
 		// The agent answers it during its turn; the pending packet must be dropped.
-		applyTriage(t.host, "01", [{ finding: "F1", verdict: "reject" }]);
+		await applyTriage(t.host, "01", [{ finding: "F1", verdict: "reject" }]);
 		t.fake.sessionIdle = true;
 		await drive(t.host);
 		// Completion may announce itself; no *decision* packet may follow the answer.

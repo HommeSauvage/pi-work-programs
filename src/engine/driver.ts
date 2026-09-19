@@ -31,6 +31,7 @@ import {
 	effectiveWorkerThinking,
 	laneBranch,
 	laneNotesPath,
+	reviewNotesPath,
 	reviewPath,
 } from "../program/ledger.ts";
 import {
@@ -725,6 +726,65 @@ function laneNoteTemplate(card: CardLedger): string {
 		"open threads · the files this lane owns.",
 		"",
 	].join("\n");
+}
+
+/** Seed the reviewer handoff note so review briefs never point at a missing
+ *  file. Harness-owned (the reviewer is read-only, so triage is the only
+ *  writer); idempotent and best-effort — a non-empty note is never overwritten. */
+async function ensureReviewNote(host: DriverHost, card: CardLedger): Promise<void> {
+	const path = reviewNotesPath(host.programDir, card.id);
+	try {
+		const existing = await host.ports.readFile(path);
+		if (existing.trim().length > 0) return;
+		await host.ports.writeFile(path, reviewNoteTemplate(card));
+	} catch {
+		// Best effort: the brief still explains what the note is for.
+	}
+}
+
+/** Header for a reviewer note; triage appends one block per review cycle. */
+function reviewNoteTemplate(card: CardLedger): string {
+	return [
+		`# Review notes — card ${card.id}`,
+		"",
+		"Harness-written record of settled findings (one line each, never committed).",
+		"Rejected and deferred findings are settled: do not re-raise them without",
+		"new evidence — and say what that evidence is when you do.",
+		"",
+	].join("\n");
+}
+
+/** Append one triage block to the reviewer note. Harness-owned and idempotent
+ *  per cycle (keyed on the cycle number, so a re-triaged cycle cannot duplicate
+ *  a block); findings are one bounded line each. Best-effort by design: a note
+ *  that cannot be written never fails a triage. */
+async function appendReviewTriageNote(
+	host: DriverHost,
+	card: CardLedger,
+	cycle: number,
+	reviewPathText: string,
+	verdicts: FindingVerdict[],
+): Promise<void> {
+	if (cycle < 1) return;
+	const key = `## Cycle ${cycle} —`;
+	const label: Record<FindingVerdict["verdict"], string> = { approve: "approved", reject: "rejected", defer: "deferred" };
+	const count = (verdict: FindingVerdict["verdict"]): number => verdicts.filter((entry) => entry.verdict === verdict).length;
+	const block = [
+		`${key} ${new Date().toISOString().slice(0, 10)} — ${count("approve")} approved / ${count("reject")} rejected / ${count("defer")} deferred`,
+		...verdicts.map(
+			(entry) => `- ${label[entry.verdict]}: ${oneLine(entry.finding, 160)}${entry.note ? ` — ${oneLine(entry.note, 160)}` : ""}`,
+		),
+		`Review: ${reviewPathText.length > 0 ? reviewPathText : "(unrecorded)"}`,
+	].join("\n");
+	try {
+		const path = reviewNotesPath(host.programDir, card.id);
+		const existing = await host.ports.readFile(path);
+		if (existing.split("\n").some((line) => line.startsWith(key))) return;
+		const base = existing.trim().length > 0 ? `${existing.trimEnd()}\n` : reviewNoteTemplate(card);
+		await host.ports.writeFile(path, `${base}\n${block}\n`);
+	} catch {
+		// Best effort: the note is a convenience for the next reviewer.
+	}
 }
 
 /**
@@ -1711,6 +1771,7 @@ export async function startReviewFor(host: DriverHost, card: CardLedger): Promis
 	]);
 	const path = reviewPath(host.programDir, card.id, card.cycles + 1);
 	await host.ports.writeFile(path, "");
+	await ensureReviewNote(host, card);
 
 	// Cycle 2+: resume the same reviewer session. It already holds the diff
 	// understanding from cycle 1, so re-review pays only for the fix delta
@@ -1741,6 +1802,7 @@ export async function startReviewFor(host: DriverHost, card: CardLedger): Promis
 			approved,
 			gates: card.gates ?? [],
 			atlasPath: atlasNotePath(host),
+			reviewNotesPath: reviewNotesPath(host.programDir, card.id),
 		});
 		try {
 			const result = await host.ports.runs.resume(card.reviewRun, task);
@@ -1786,6 +1848,7 @@ export async function startReviewFor(host: DriverHost, card: CardLedger): Promis
 		workerSummary: card.workerSummary ?? "",
 		gates: card.gates ?? [],
 		atlasPath: atlasNotePath(host),
+		reviewNotesPath: reviewNotesPath(host.programDir, card.id),
 	});
 	try {
 		await dispatchRun(host, card, {
@@ -2479,7 +2542,7 @@ async function openOperatorTodos(host: DriverHost, stream: string): Promise<Oper
  * Tool-facing mutations
  * ------------------------------------------------------------------------- */
 
-export function applyTriage(host: DriverHost, cardId: string, verdicts: FindingVerdict[]): { ok: boolean; error?: string } {
+export async function applyTriage(host: DriverHost, cardId: string, verdicts: FindingVerdict[]): Promise<{ ok: boolean; error?: string }> {
 	const card = host.ledger.cards[cardId];
 	if (!card) return { ok: false, error: `unknown card ${cardId}` };
 	// Kind-scoped: a stale `blocked` record must never shadow the live review.
@@ -2489,6 +2552,9 @@ export function applyTriage(host: DriverHost, cardId: string, verdicts: FindingV
 	}
 	const approved = verdicts.filter((verdict) => verdict.verdict === "approve");
 	resolveDecision(host, decision.id, { verdicts });
+	// The harness — not an agent — records what was settled, so a fresh reviewer
+	// never re-derives findings the operator already rejected or deferred.
+	await appendReviewTriageNote(host, card, card.cycles, decision.reviewPath ?? "", verdicts);
 	if (approved.length === 0) {
 		card.phase = "approved";
 		return { ok: true };

@@ -174,7 +174,8 @@ describe("lane handoff notes", () => {
 		expect(fix.request.task).toContain("FRESH session continuing an existing lane");
 		expect(fix.request.task).toContain("/repo/.agents/work-programs/test-program/.runtime/lanes/01.md");
 		expect(fix.request.task).toContain("FIRST");
-	})
+	});
+
 	test("every fix brief (resumed too) points at the lane notes", async () => {
 		const t = createTestHost({ cards: [{ id: "01" }] });
 		await driveToPendingFix(t, "01", { input: 10_000, output: 2_000, total: 500_000, windowPeak: 90_000, turns: 40 });
@@ -186,7 +187,8 @@ describe("lane handoff notes", () => {
 	});
 });
 
-describe("session-accurate usage", () => {	test("resumed runs replace their session snapshot instead of double-counting", async () => {
+describe("session-accurate usage", () => {
+	test("resumed runs replace their session snapshot instead of double-counting", async () => {
 		const t = createTestHost({ cards: [{ id: "01" }] });
 		await drive(t.host);
 		const workerRun = t.fake.dispatched.find((entry) => entry.request.kind === "worker")!.runId;

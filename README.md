@@ -223,6 +223,8 @@ Defaults live in settings under `workPrograms` (user or project `settings.json`)
 | `laneBranchPattern` | `{branch}-card-{id}` | Lane branch naming |
 | `worktreeDir` | `~/.pi/agent/work-programs/worktrees/<repo>` | Base directory for lane worktrees |
 
+An empty-string per-card key counts as **unset**: `fixThinking: ""` in a card's front matter drops that card's override, so the card inherits the *program's* fix lane. To fall all the way back to the worker lane, unset the program key (`worker.fixThinking`) — as with `workerModel`, a blank card value never means "inherit the worker lane" on its own.
+
 ## If something feels off
 
 ```text

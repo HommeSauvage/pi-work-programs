@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { WorkProgramController } from "../src/engine/controller.ts";
+import { effectiveFixModel, effectiveFixThinking } from "../src/program/ledger.ts";
 import { makeCardText } from "./helpers.ts";
 import { FakePi, fakeSessionContext, installRpcResponder, type StubUi } from "./fakes.ts";
 
@@ -360,6 +361,30 @@ describe("fix-lane config", () => {
 		const synced = await controller.syncFromDisk();
 		expect(synced.ok).toBe(true);
 		expect(controller.getActive()!.ledger.fixThinking).toBe("medium");
+	});
+
+	test("a hand-edited plan front matter reaches the ledger on sync, and removing it falls back", async () => {
+		const { controller, cwd } = await setupProgram();
+		const { readFile, writeFile } = await import("node:fs/promises");
+		const path = join(cwd, ".agents", "work-programs", "test-program", "plan.md");
+		const withFixLane = `---\nworker:\n  fixThinking: medium\n  fixModel: p/hand-edited\n---\n\n${await readFile(path, "utf8")}`;
+		await writeFile(path, withFixLane, "utf8");
+		const synced = await controller.syncFromDisk();
+		expect(synced.ok).toBe(true);
+		const ledger = controller.getActive()!.ledger;
+		expect(ledger.fixThinking).toBe("medium");
+		expect(ledger.fixModel).toBe("p/hand-edited");
+		// effectiveFix* resolve from the ledger, so a dispatched fix run sees them.
+		expect(effectiveFixThinking(ledger, ledger.cards["01"]!)).toBe("medium");
+		expect(effectiveFixModel(ledger, ledger.cards["01"]!)).toBe("p/hand-edited");
+		// Dropping the keys hands the fix lane back to the worker lane.
+		const withoutFixLane = await readFile(path, "utf8");
+		await writeFile(path, withoutFixLane.replace(/worker:\n  fixThinking: medium\n  fixModel: p\/hand-edited\n/, "worker:\n  thinking: high\n"), "utf8");
+		const reSynced = await controller.syncFromDisk();
+		expect(reSynced.ok).toBe(true);
+		expect(controller.getActive()!.ledger.fixThinking).toBeUndefined();
+		expect(controller.getActive()!.ledger.fixModel).toBeUndefined();
+		expect(effectiveFixThinking(controller.getActive()!.ledger, controller.getActive()!.ledger.cards["01"]!)).toBe("high");
 	});
 
 	test("a card's fixThinking persists into the card front matter", async () => {

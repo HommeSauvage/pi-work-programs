@@ -800,6 +800,10 @@ export class WorkProgramController {
 		active.ledger.workerAgent = settings.worker.agent;
 		active.ledger.workerModel = settings.worker.model;
 		active.ledger.workerThinking = settings.worker.thinking;
+		// The fix lane is part of the plan front matter too: a hand-edit + sync must
+		// reach the ledger, and removing the keys must fall back to the worker lane.
+		active.ledger.fixModel = settings.worker.fixModel;
+		active.ledger.fixThinking = settings.worker.fixThinking;
 		active.ledger.reviewerAgent = settings.review.agent;
 		active.ledger.reviewerModel = settings.reviewer.model;
 		active.ledger.reviewerThinking = settings.reviewer.thinking;

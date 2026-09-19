@@ -259,6 +259,8 @@ export function gateFixBrief(input: {
 	failures: GateResult[];
 	origin: "implementation" | "merge" | "captain";
 	repoRoot: string;
+	/** Gate fixes are always fresh, so the lane note is the only history they have. */
+	laneNotesPath?: string;
 }): string {
 	const failures = input.failures
 		.map((gate) => `- \`${gate.command}\` → exit ${gate.code}\n\`\`\`\n${truncateTail(gate.tail, 3_000)}\n\`\`\``)
@@ -270,6 +272,11 @@ export function gateFixBrief(input: {
 		failures,
 		"",
 		"Rules:",
+		...(input.laneNotesPath
+			? [
+				`- A gate fix always starts a fresh session with no history: read the lane handoff note at ${input.laneNotesPath} first (decisions, invariants, dead ends, the files this lane owns) before touching the code. It is machine state — never commit it.`,
+			]
+			: []),
 		"- Fix the underlying code with the smallest correct change. Do not weaken or delete the gate.",
 		"- Re-run the gates until they pass.",
 		`- Update the card's \`## Evidence\` with the EXACT new output and commit SHA, keep \`State: review\`, and commit with \`wp(${input.ledger.slug}): ${input.card.id} gate fixes\`.`,

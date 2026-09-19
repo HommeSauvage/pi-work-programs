@@ -115,6 +115,42 @@ describe("managed driver loop", () => {
 		const fixRequest = t.fake.dispatched.at(-1)!;
 		expect(fixRequest.request.task).toContain("failed");
 	});
+
+	test("a gate fix is fresh, so its brief points at the lane note", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }], gates: { card: ["bun test"] } });
+		t.fake.gateResults.set("bun test", [{ command: "bun test", code: 1, at: Date.now(), tail: "1 fail" }]);
+		await drive(t.host);
+		writeLaneEvidence(t, "01", "$ bun test\n1 fail");
+		t.completeRun(t.fake.dispatched[0]!.runId, { output: "done but red" });
+		await drive(t.host);
+		const fixRequest = t.fake.dispatched.at(-1)!;
+		expect(fixRequest.request.task).toContain("/repo/.agents/work-programs/test-program/.runtime/lanes/01.md");
+		expect(fixRequest.request.task).toContain("fresh session with no history");
+	});
+
+	test("the lane note is seeded before dispatch and never overwritten afterwards", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await drive(t.host);
+		const notePath = "/repo/.agents/work-programs/test-program/.runtime/lanes/01.md";
+		expect(t.fake.files.get(notePath)).toContain("# Lane notes — card 01");
+		// A worker's own note survives the next dispatch.
+		t.fake.files.set(notePath, "# Lane notes — card 01\n\nDecided: keep the seam.");
+		t.ledger.cards["01"]!.phase = "pending";
+		t.ledger.cards["01"]!.lane = undefined;
+		t.ledger.cards["01"]!.workerRun = undefined;
+		await drive(t.host);
+		expect(t.fake.files.get(notePath)).toBe("# Lane notes — card 01\n\nDecided: keep the seam.");
+	});
+
+	test("workers default to the shipped agent and respect an explicit worker.agent", async () => {
+		const t = createTestHost({ cards: [{ id: "01" }] });
+		await drive(t.host);
+		expect(t.fake.dispatched[0]?.request.agent).toBe("work-program-worker");
+
+		const custom = createTestHost({ cards: [{ id: "01" }], overrides: { workerAgent: "worker" } });
+		await drive(custom.host);
+		expect(custom.fake.dispatched[0]?.request.agent).toBe("worker");
+	});
 });
 
 describe("dependency gating and parallelism", () => {

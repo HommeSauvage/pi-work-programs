@@ -684,11 +684,7 @@ async function ensureTodoStoreFile(host: DriverHost): Promise<TodoStore> {
 	return store;
 }
 
-/**
- * Load the todo store, import new worker-inbox entries, persist when changed,
- * and park + announce for brand-new blocking todos. Once per drive tick.
- */
-export /** Machine state (`program.json`, reviews, lane notes) lives under `.runtime` and
+/** Machine state (`program.json`, reviews, lane notes) lives under `.runtime` and
  *  must never show up in `git status`. Programs created by current code get a
  *  `*` ignore file at creation; programs that predate it get it here, so the
  *  lane handoff notes never dirty the checkout they are written beside.
@@ -704,6 +700,37 @@ async function ensureRuntimeIgnored(host: DriverHost): Promise<void> {
 	}
 }
 
+/** Seed the lane handoff note so briefs never point at a path that does not exist.
+ *  The worker owns the content from here on; this only writes a header when the
+ *  file is missing or empty (idempotent, best-effort — `writeTextAtomic` creates
+ *  the parent directory). */
+async function ensureLaneNote(host: DriverHost, card: CardLedger): Promise<void> {
+	const path = laneNotesPath(host.programDir, card.id);
+	try {
+		const existing = await host.ports.readFile(path);
+		if (existing.trim().length > 0) return;
+		await host.ports.writeFile(path, laneNoteTemplate(card));
+	} catch {
+		// Best effort: the brief still explains what the note is for.
+	}
+}
+
+/** Header for a lane note; the worker replaces/extends the body as it works. */
+function laneNoteTemplate(card: CardLedger): string {
+	return [
+		`# Lane notes — card ${card.id}`,
+		"",
+		"Machine state for whoever continues this lane next (≤60 lines, never committed).",
+		"Record here: decisions and why · invariants you discovered · dead ends ruled out ·",
+		"open threads · the files this lane owns.",
+		"",
+	].join("\n");
+}
+
+/**
+ * Load the todo store, import new worker-inbox entries, persist when changed,
+ * and park + announce for brand-new blocking todos. Once per drive tick.
+ */
 export async function syncTodoStore(host: DriverHost): Promise<TodoGate> {
 	const store = await ensureTodoStoreFile(host);
 	let dirty = false;
@@ -1128,7 +1155,15 @@ async function startGateFix(
 	}
 	card.fixReason = "gate";
 	card.lastError = undefined;
-	const task = gateFixBrief({ ledger: host.ledger, card, failures: gates, origin, repoRoot: host.cwd });
+	await ensureLaneNote(host, card);
+	const task = gateFixBrief({
+		ledger: host.ledger,
+		card,
+		failures: gates,
+		origin,
+		repoRoot: host.cwd,
+		laneNotesPath: laneNotesPath(host.programDir, card.id),
+	});
 	const cwd = card.merge?.state === "merged" ? host.cwd : host.ports.runCwd(host.ledger, card);
 	const dispatched = await dispatchWithInfraRetry(host, card, {
 		kind: "fix",
@@ -1609,6 +1644,7 @@ export async function startWorkerFor(host: DriverHost, card: CardLedger): Promis
 		}
 		return;
 	}
+	await ensureLaneNote(host, card);
 	const task = workerBrief({
 		ledger,
 		card,
@@ -1812,6 +1848,7 @@ async function dispatchFixes(host: DriverHost, gate: TodoGate): Promise<void> {
 			continue;
 		}
 		card.fixReason = "review";
+		await ensureLaneNote(host, card);
 		const task = fixBrief({
 			ledger,
 			card,

@@ -101,6 +101,7 @@ Switch any time: `work_program({ action: "mode", mode: "captain" })` or `/work-p
 | Resolve a program gate | `work_program({ action: "program_gate", choice })` — `retry` or `block` |
 | Merge a reconciled lane | `work_program({ action: "merge_resolved", card })` |
 | Operator todos | `work_program({ action: "todos" })` to list, `todo_add` to create (blocking parks the card), `todo_update` to rewrite, `todo_done`/`todo_drop` to resolve (card resumes on its own) |
+| Todos pane | `/work-program todos` in the TUI opens an interactive overlay (fleet-inspector style): `↑/↓` browse, `d` mark done, `X` drop, `u` reopen, `a` quick-add — it live-refreshes and is safe to open while the agent streams |
 | Dispatch manually (session mode) | `work_program({ action: "dispatch", card, role })` — `worker`, `reviewer`, or `reconciler` |
 | Pause / resume | `/work-program pause` (soft: let runs finish) or `--hard` (stop runs now), `/work-program resume` |
 | Sync edits you made on disk | `work_program({ action: "sync" })` |

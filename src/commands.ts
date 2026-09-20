@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { WorkProgramController } from "./engine/controller.ts";
+import { openTodosPane } from "./tui/todos-pane.ts";
 import type { Mode } from "./shared/types.ts";
 
 const ACTIONS = ["status", "list", "new", "start", "pause", "resume", "mode", "sync", "todos", "doctor", "close"] as const;
@@ -22,9 +23,10 @@ function startResumeNudge(controller: WorkProgramController, verb: string): stri
 }
 
 export function registerCommands(pi: ExtensionAPI, controller: WorkProgramController): void {
+	let todosPaneOpen = false;
 	pi.registerCommand("work-program", {
 		description:
-			"Work programs: status | list | new <title> | start <slug> | pause [--hard] | resume | mode <session|managed|captain> | sync | todos | doctor | close [--remove]",
+			"Work programs: status | list | new <title> | start <slug> | pause [--hard] | resume | mode <session|managed|captain> | sync | todos (pane) | doctor | close [--remove]",
 		getArgumentCompletions: completions,
 		handler: async (args, ctx) => {
 			const parts = args.trim().split(/\s+/).filter((part) => part.length > 0);
@@ -117,6 +119,23 @@ export function registerCommands(pi: ExtensionAPI, controller: WorkProgramContro
 					return;
 				}
 				case "todos": {
+					// In an interactive TUI, open the overlay pane instead of dumping
+					// markdown into the chat — the inline notification re-renders jankily
+					// while the agent is streaming. The pane navigates todos and can mark
+					// them done/dropped/reopened directly.
+					if (ctx.hasUI && ctx.mode === "tui") {
+						if (todosPaneOpen) {
+							ctx.ui.notify("Operator todos pane is already open.", "info");
+							return;
+						}
+						todosPaneOpen = true;
+						try {
+							await openTodosPane(ctx, controller);
+						} finally {
+							todosPaneOpen = false;
+						}
+						return;
+					}
 					const result = await controller.todoList();
 					ctx.ui.notify(result.text, result.ok ? "info" : "error");
 					return;

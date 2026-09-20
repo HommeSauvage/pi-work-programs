@@ -233,6 +233,11 @@ export function serializeTodoStore(store: TodoStore): string {
 	return `${JSON.stringify(store, null, 2)}\n`;
 }
 
+/** UI-facing read model for interactive panes: the whole store plus the stream it is viewed against. */
+export type TodoSnapshot =
+	| { ok: true; stream: string; items: TodoItem[] }
+	| { ok: false; error: string };
+
 function nextTodoId(store: TodoStore): string {
 	store.counter += 1;
 	return `op-${String(store.counter).padStart(2, "0")}`;

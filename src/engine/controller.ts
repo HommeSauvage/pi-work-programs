@@ -53,6 +53,7 @@ import {
 	serializeTodoStore,
 	summarizeTodosSync,
 	updateTodo as storeUpdateTodo,
+	type TodoSnapshot,
 	type TodoStep,
 	type TodoStore,
 	type TodoSummary,
@@ -1438,6 +1439,38 @@ export class WorkProgramController {
 
 	async todoDrop(input: { id: string; reason?: string }): Promise<ActionResult> {
 		return this.closeTodo(input.id, "dropped", "dropped", input.reason);
+	}
+
+	/** Structured read model for the interactive todos pane (no formatting). */
+	async todoSnapshot(): Promise<TodoSnapshot> {
+		if (!this.active) return { ok: false, error: "No active work program." };
+		const store = await this.readTodoStore();
+		return { ok: true, stream: this.active.slug, items: store.items };
+	}
+
+	/** Undo a done/drop: re-opens the item and re-parks its card if it is blocking. */
+	async todoReopen(id: string): Promise<ActionResult> {
+		if (!this.active) return { ok: false, text: "No active work program." };
+		const store = await this.readTodoStore();
+		const item = store.items.find((entry) => entry.id === id);
+		if (!item) return { ok: false, text: `Unknown todo ${id}. Use todos to list.` };
+		if (item.stream !== this.active.slug) {
+			return { ok: false, text: `Todo ${id} belongs to stream ${item.stream}; switch programs first.` };
+		}
+		if (item.state === "open") return { ok: true, text: `Todo ${id} is already open.` };
+		item.state = "open";
+		item.updatedAt = Date.now();
+		item.announced = true; // the operator is looking right at it; no wake-up needed
+		await this.writeTodoStore(store);
+		const card = item.card !== undefined && item.blocking ? this.liveTodoCard(item.card) : undefined;
+		if (card) {
+			await parkForTodos(this, buildTodoGate(store, this.active.slug), card, openBlockingForCard(store, this.active.slug, card.id), {});
+		}
+		await this.save();
+		await appendProgress(this.active.absDir, `${item.card ?? "—"} todo ${id} reopened`);
+		this.refreshUi();
+		this.scheduleDrive();
+		return { ok: true, text: `Todo ${id} reopened.${card ? ` Card ${card.id} waits again.` : ""}` };
 	}
 
 	async statusText(): Promise<string> {

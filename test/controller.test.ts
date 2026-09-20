@@ -724,6 +724,28 @@ describe("operator todos", () => {
 		expect(controller.getActive()!.ledger.cards["01"]?.phase).toBe("pending");
 	});
 
+	test("todoReopen re-parks a live card and validates", async () => {
+		const { controller } = await setupProgram();
+		await controller.todoAdd({ title: "Fetch the prod secret", card: "01", blocking: true });
+		expect(controller.getActive()!.ledger.cards["01"]?.phase).toBe("blocked");
+		await controller.todoDone({ id: "op-01" });
+		expect(controller.getActive()!.ledger.cards["01"]?.phase).toBe("pending");
+		const reopened = await controller.todoReopen("op-01");
+		expect(reopened.ok).toBe(true);
+		const card = controller.getActive()!.ledger.cards["01"]!;
+		expect(card.phase).toBe("blocked");
+		expect(card.waitingOn).toEqual(["op-01"]);
+		expect((await controller.todoReopen("op-01")).text).toContain("already open");
+		expect((await controller.todoReopen("op-99")).ok).toBe(false);
+	});
+
+	test("todoSnapshot returns the structured store for the pane", async () => {
+		const { controller } = await setupProgram();
+		await controller.todoAdd({ title: "Pane item", card: "01", blocking: true });
+		const snapshot = await controller.todoSnapshot();
+		expect(snapshot).toEqual({ ok: true, stream: "test-program", items: [expect.objectContaining({ id: "op-01", title: "Pane item" })] });
+	});
+
 	test("switching blocking off resumes; switching on parks", async () => {
 		const { controller } = await setupProgram();
 		await controller.todoAdd({ title: "Thing", card: "01", blocking: true });
